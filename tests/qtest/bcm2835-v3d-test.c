@@ -479,6 +479,39 @@ static void assert_bgr565_block(const uint8_t *fb, size_t offset,
     }
 }
 
+static size_t t_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
+                                   unsigned bytes_per_pixel)
+{
+    static const uint8_t even_stile_map[4] = { 0, 3, 1, 2 };
+    static const uint8_t odd_stile_map[4] = { 2, 1, 3, 0 };
+    uint32_t tiles_x = (width + 31) / 32;
+    uint32_t tile_x = x / 32;
+    uint32_t tile_y = y / 32;
+    uint32_t local_x = x % 32;
+    uint32_t local_y = y % 32;
+    uint32_t stile = ((local_y / 16) << 1) | (local_x / 16);
+    uint32_t utile = ((local_y / 4) & 3) * 4 + ((local_x / 4) & 3);
+    const uint8_t *stile_map = (tile_y & 1) ? odd_stile_map :
+                                               even_stile_map;
+
+    if (tile_y & 1) {
+        tile_x = tiles_x - tile_x - 1;
+    }
+    return ((size_t)tile_y * tiles_x + tile_x) * 32 * 32 *
+           bytes_per_pixel + stile_map[stile] * 16 * 16 * bytes_per_pixel +
+           utile * 16 * bytes_per_pixel +
+           ((local_y & 3) * 4 + (local_x & 3)) * bytes_per_pixel;
+}
+
+static size_t lt_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
+                                    unsigned bytes_per_pixel)
+{
+    uint32_t utiles_x = (width + 3) / 4;
+
+    return ((size_t)(y / 4) * utiles_x + x / 4) * 16 * bytes_per_pixel +
+           ((y & 3) * 4 + (x & 3)) * bytes_per_pixel;
+}
+
 static void test_v3d_ct1_clear_t_tiled_bgr565(void)
 {
     uint8_t cl[64];
@@ -601,6 +634,66 @@ static void test_v3d_ct1_load_store_color_tile(void)
     }
 }
 
+static void test_v3d_ct1_load_store_layout_conversion(void)
+{
+    const uint32_t src = FB_ADDR;
+    const uint32_t dst = FB_ADDR + FB_SIZE;
+    uint8_t cl[64];
+    uint8_t source[64 * 64 * sizeof(uint32_t)];
+    uint8_t destination[sizeof(source)];
+    uint8_t result[sizeof(source)];
+
+    for (unsigned y = 0; y < 64; y++) {
+        for (unsigned x = 0; x < 64; x++) {
+            uint32_t color = 0xff000000 | (y * 64 + x);
+            size_t offset = ((size_t)y * 64 + x) * sizeof(color);
+
+            source[offset] = color;
+            source[offset + 1] = color >> 8;
+            source[offset + 2] = color >> 16;
+            source[offset + 3] = color >> 24;
+        }
+    }
+    memwrite(src, source, sizeof(source));
+
+    for (unsigned memory_format = 1; memory_format <= 2; memory_format++) {
+        size_t offset = 0;
+
+        memset(destination, 0xa5, sizeof(destination));
+        memwrite(dst, destination, sizeof(destination));
+        cl[offset++] = 113;
+        append_u32(cl, &offset, dst);
+        append_u16(cl, &offset, 64);
+        append_u16(cl, &offset, 64);
+        append_u16(cl, &offset, (memory_format << 6) |
+                   (V3D_FORMAT_RGBA8888 << 2));
+        cl[offset++] = 115;
+        cl[offset++] = 0;
+        cl[offset++] = 0;
+        append_tile_buffer_packet(cl, &offset, 29, src, 0, 0);
+        append_tile_buffer_packet(cl, &offset, 28, dst, memory_format, 0);
+
+        writel(RASPI3_V3D_BASE + V3D_CT1CS, 1U << 15);
+        memwrite(CL_ADDR, cl, offset);
+        writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+        writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + offset);
+        memread(dst, result, sizeof(result));
+
+        for (unsigned y = 0; y < 64; y++) {
+            for (unsigned x = 0; x < 64; x++) {
+                size_t source_offset = ((size_t)y * 64 + x) *
+                                       sizeof(uint32_t);
+                size_t dest_offset = memory_format == 1 ?
+                    t_tiled_pixel_offset(64, x, y, sizeof(uint32_t)) :
+                    lt_tiled_pixel_offset(64, x, y, sizeof(uint32_t));
+
+                g_assert_cmphex(read_u32(result + dest_offset), ==,
+                                read_u32(source + source_offset));
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -631,6 +724,8 @@ int main(int argc, char **argv)
                    test_v3d_ct1_clear_lt_tiled_bgr565);
     qtest_add_func("/bcm2835/v3d/ct1_load_store_color_tile",
                    test_v3d_ct1_load_store_color_tile);
+    qtest_add_func("/bcm2835/v3d/ct1_load_store_layout_conversion",
+                   test_v3d_ct1_load_store_layout_conversion);
     qtest_add_func("/bcm2835/v3d/ct1_clear_single_sample_64x64_tile",
                    test_v3d_ct1_clear_single_sample_64x64_tile);
     qtest_add_func("/bcm2835/v3d/ct1_frame_done_requires_eof",
