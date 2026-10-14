@@ -50,6 +50,8 @@
 #define V3D_INT_MASK           0x0f
 
 #define V3D_BIN_FLAG_AUTO_INIT_TSDA (1U << 2)
+#define V3D_BIN_FLAG_UNSUPPORTED   ((1U << 7) | (1U << 1) | (1U << 0))
+#define V3D_BIN_ALLOC_ALIGN        256
 
 #define V3D_PACKET_HALT        0
 #define V3D_PACKET_NOP         1
@@ -87,7 +89,7 @@
 #define V3D_MAX_QPU_INSTRUCTIONS 4096
 #define V3D_QPU_INSTRUCTION_BUDGET (1U << 16)
 #define V3D_MAX_RASTER_WORK       (1U << 22)
-#define V3D_MAX_RASTER_TILES      4096
+#define V3D_MAX_RASTER_TILES      BCM2835_V3D_MAX_TILES
 #define V3D_MAX_CLIPPED_VERTICES  12
 #define V3D_TILE_SIZE          64
 #define V3D_T_MEMORY_TILE_SIZE 32
@@ -890,12 +892,17 @@ static bool bcm2835_v3d_init_tile_lists(BCM2835V3DState *s)
 {
     uint32_t tile_count = (uint32_t)s->bin_tiles_x * s->bin_tiles_y;
     uint64_t state_size = (uint64_t)tile_count * 48;
-    uint64_t initial_size = (uint64_t)tile_count * 32;
-    uint32_t extra_size;
-    uint32_t tile_list_stride;
+    uint64_t initial_size = (uint64_t)tile_count *
+                            s->bin_alloc_initial_block_size;
+    uint64_t pool_address = ((uint64_t)s->bin_alloc_base + initial_size +
+                             V3D_BIN_ALLOC_ALIGN - 1) &
+                            ~(uint64_t)(V3D_BIN_ALLOC_ALIGN - 1);
+    uint64_t pool_offset = pool_address - s->bin_alloc_base;
+    uint64_t alloc_end = (uint64_t)s->bin_alloc_base + s->bin_alloc_size;
 
     if (!tile_count || tile_count > V3D_MAX_RASTER_TILES ||
-        initial_size > s->bin_alloc_size ||
+        !s->bin_alloc_block_size || !s->bin_alloc_initial_block_size ||
+        pool_offset > s->bin_alloc_size ||
         (uint64_t)s->bin_state_base + state_size > UINT32_MAX + 1ULL) {
         return false;
     }
@@ -905,50 +912,27 @@ static bool bcm2835_v3d_init_tile_lists(BCM2835V3DState *s)
         return false;
     }
 
-    /* Reserve the first 32-byte PTB list slot per tile for the RCL branch. */
-    extra_size = s->bin_alloc_size - initial_size;
-    tile_list_stride = (extra_size / tile_count) & ~15U;
-    s->bin_list_indirect = tile_list_stride >= 48;
-    s->bin_list_stride = s->bin_list_indirect ? tile_list_stride : 0;
+    /* The PTB starts each tile in its initial block, then shares the rest. */
+    s->bin_alloc_next = pool_address;
+    s->bin_list_stride = 0;
+    s->bin_list_indirect = false;
 
     for (uint32_t tile = 0; tile < tile_count; tile++) {
-        uint32_t tile_cl = s->bin_alloc_base + tile * 32;
-        uint32_t list_cl = s->bin_list_indirect ?
-            s->bin_alloc_base + initial_size + tile * s->bin_list_stride + 4 :
-            tile_cl;
-        uint8_t tile_start[6];
+        uint64_t tile_cl = (uint64_t)s->bin_alloc_base + tile *
+                           s->bin_alloc_initial_block_size;
         uint8_t empty_list = V3D_PACKET_RETURN;
-        uint8_t empty_length[4] = { 0 };
 
-        if ((s->bin_list_indirect &&
-             (uint64_t)list_cl + s->bin_list_stride - 4 >
-                (uint64_t)s->bin_alloc_base + s->bin_alloc_size) ||
-            (uint64_t)tile_cl + sizeof(tile_start) > UINT32_MAX + 1ULL ||
-            (uint64_t)list_cl + 1 > UINT32_MAX + 1ULL) {
+        if (tile_cl + s->bin_alloc_initial_block_size > alloc_end ||
+            tile_cl + s->bin_alloc_initial_block_size > UINT32_MAX + 1ULL) {
             return false;
         }
-        if (s->bin_list_indirect) {
-            tile_start[0] = V3D_PACKET_BRANCH_SUB;
-            stl_le_p(tile_start + 1, list_cl);
-            tile_start[5] = V3D_PACKET_RETURN;
-        } else {
-            tile_start[0] = V3D_PACKET_RETURN;
-        }
-        if (dma_memory_write(&s->dma_as, tile_cl, tile_start,
-                             s->bin_list_indirect ? sizeof(tile_start) : 1,
-                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
-            dma_memory_write(&s->dma_as, list_cl, &empty_list,
+        if (dma_memory_write(&s->dma_as, tile_cl, &empty_list,
                              sizeof(empty_list),
                              MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             return false;
         }
-        /* The length word is model bookkeeping in the allocated list pool. */
-        if (s->bin_list_indirect &&
-            dma_memory_write(&s->dma_as, list_cl - 4, empty_length,
-                             sizeof(empty_length),
-                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-            return false;
-        }
+        s->bin_tile_list_addr[tile] = tile_cl;
+        s->bin_tile_list_used[tile] = 1;
     }
     return true;
 }
@@ -959,43 +943,62 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
                                              const uint32_t *screen_xy)
 {
     uint32_t tile_index = tile_y * s->bin_tiles_x + tile_x;
-    uint64_t tile_count = (uint64_t)s->bin_tiles_x * s->bin_tiles_y;
-    uint64_t initial_size = tile_count * 32;
     uint8_t commands[23];
     uint32_t list_address;
     uint32_t used;
-    uint32_t meta_address = 0;
     uint32_t list_capacity;
+    uint64_t pool_start;
     size_t offset = 0;
 
     if (tile_x >= s->bin_tiles_x || tile_y >= s->bin_tiles_y ||
-        initial_size > s->bin_alloc_size) {
+        tile_index >= V3D_MAX_RASTER_TILES) {
         return false;
     }
-    if (s->bin_list_indirect) {
-        meta_address = s->bin_alloc_base + initial_size +
-                       tile_index * s->bin_list_stride;
-        list_address = meta_address + 4;
-        list_capacity = s->bin_list_stride - 4;
-        uint8_t length[4];
-
-        if (!bcm2835_v3d_dma_read(s, meta_address, length, sizeof(length))) {
-            return false;
-        }
-        used = ldl_le_p(length);
-    } else {
-        uint8_t first;
-
-        list_address = s->bin_alloc_base + tile_index * 32;
-        list_capacity = 32;
-        if (!bcm2835_v3d_dma_read(s, list_address, &first, sizeof(first)) ||
-            first != V3D_PACKET_RETURN) {
-            return false;
-        }
-        used = 0;
+    list_address = s->bin_tile_list_addr[tile_index];
+    used = s->bin_tile_list_used[tile_index];
+    pool_start = ((uint64_t)s->bin_alloc_base +
+                  (uint64_t)s->bin_tiles_x * s->bin_tiles_y *
+                  s->bin_alloc_initial_block_size + V3D_BIN_ALLOC_ALIGN - 1) &
+                 ~(uint64_t)(V3D_BIN_ALLOC_ALIGN - 1);
+    list_capacity = list_address < pool_start ?
+                    s->bin_alloc_initial_block_size :
+                    s->bin_alloc_block_size;
+    if (!used || used > list_capacity) {
+        return false;
     }
-    if (used > list_capacity || 23 > list_capacity - used ||
-        (uint64_t)list_address + used + 23 > UINT32_MAX + 1ULL) {
+
+    if (sizeof(commands) - 1 > list_capacity - used) {
+        uint64_t alloc_end = (uint64_t)s->bin_alloc_base +
+                             s->bin_alloc_size;
+        uint64_t next_block = s->bin_alloc_next;
+        uint8_t branch[5] = { V3D_PACKET_BRANCH };
+        uint8_t empty_list = V3D_PACKET_RETURN;
+
+        if (used - 1 + sizeof(branch) > list_capacity ||
+            (uint64_t)next_block + s->bin_alloc_block_size > alloc_end ||
+            (uint64_t)next_block + s->bin_alloc_block_size >
+                UINT32_MAX + 1ULL) {
+            return false;
+        }
+        stl_le_p(branch + 1, (uint32_t)next_block);
+        if (dma_memory_write(&s->dma_as, next_block, &empty_list,
+                             sizeof(empty_list),
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
+            dma_memory_write(&s->dma_as, list_address + used - 1, branch,
+                             sizeof(branch),
+                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            return false;
+        }
+        s->bin_alloc_next += s->bin_alloc_block_size;
+        s->bin_tile_list_addr[tile_index] = next_block;
+        s->bin_tile_list_used[tile_index] = 1;
+        list_address = next_block;
+        used = 1;
+        list_capacity = s->bin_alloc_block_size;
+    }
+    if (sizeof(commands) - 1 > list_capacity - used ||
+        (uint64_t)list_address + used + sizeof(commands) - 1 >
+            UINT32_MAX + 1ULL) {
         return false;
     }
 
@@ -1014,19 +1017,12 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
     commands[offset++] = V3D_PACKET_RETURN;
     g_assert(offset == sizeof(commands));
 
-    if (dma_memory_write(&s->dma_as, list_address + used, commands,
+    if (dma_memory_write(&s->dma_as, list_address + used - 1, commands,
                          sizeof(commands),
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return false;
     }
-    if (s->bin_list_indirect) {
-        uint8_t length[4];
-
-        stl_le_p(length, used + sizeof(commands) - 1);
-        return dma_memory_write(&s->dma_as, meta_address, length,
-                                sizeof(length), MEMTXATTRS_UNSPECIFIED) ==
-               MEMTX_OK;
-    }
+    s->bin_tile_list_used[tile_index] = used + sizeof(commands) - 1;
     return true;
 }
 
@@ -1629,11 +1625,17 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             uint32_t state_base = ldl_le_p(packet + 9);
             uint8_t tiles_x = packet[13];
             uint8_t tiles_y = packet[14];
+            uint8_t flags = packet[15];
+            uint16_t initial_block_size =
+                32U << ((flags >> 3) & 3);
+            uint16_t block_size = 32U << ((flags >> 5) & 3);
             uint64_t alloc_end = (uint64_t)alloc_base + alloc_size;
             uint64_t state_size = (uint64_t)tiles_x * tiles_y * 48;
             uint64_t state_end = (uint64_t)state_base + state_size;
 
             if (thread != 0 || !tiles_x || !tiles_y || !alloc_size ||
+                (alloc_base & 15) || (state_base & 15) ||
+                (flags & V3D_BIN_FLAG_UNSUPPORTED) ||
                 alloc_end > UINT32_MAX + 1ULL ||
                 state_end > UINT32_MAX + 1ULL) {
                 bcm2835_v3d_thread_error(s, thread, *ca,
@@ -1646,7 +1648,14 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             s->bin_state_base = state_base;
             s->bin_tiles_x = tiles_x;
             s->bin_tiles_y = tiles_y;
-            s->bin_flags = packet[15];
+            s->bin_flags = flags;
+            s->bin_alloc_next = 0;
+            s->bin_alloc_block_size = block_size;
+            s->bin_alloc_initial_block_size = initial_block_size;
+            memset(s->bin_tile_list_addr, 0,
+                   sizeof(s->bin_tile_list_addr));
+            memset(s->bin_tile_list_used, 0,
+                   sizeof(s->bin_tile_list_used));
             s->bin_list_stride = 0;
             s->bin_list_indirect = false;
             s->bin_config_valid = true;
@@ -2019,6 +2028,11 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->bin_tiles_x = 0;
     s->bin_tiles_y = 0;
     s->bin_flags = 0;
+    s->bin_alloc_next = 0;
+    s->bin_alloc_block_size = 0;
+    s->bin_alloc_initial_block_size = 0;
+    memset(s->bin_tile_list_addr, 0, sizeof(s->bin_tile_list_addr));
+    memset(s->bin_tile_list_used, 0, sizeof(s->bin_tile_list_used));
     s->bin_list_stride = 0;
     s->bin_list_indirect = false;
     s->bin_config_valid = false;
@@ -2095,13 +2109,20 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
         s->viewport_center_y = 0;
         s->viewport_offset_valid = false;
     }
+    if (version_id < 10) {
+        s->bin_alloc_next = 0;
+        s->bin_alloc_block_size = 0;
+        s->bin_alloc_initial_block_size = 0;
+        memset(s->bin_tile_list_addr, 0, sizeof(s->bin_tile_list_addr));
+        memset(s->bin_tile_list_used, 0, sizeof(s->bin_tile_list_used));
+    }
     bcm2835_v3d_update_irq(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 9,
+    .version_id = 10,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -2134,6 +2155,13 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_UINT8_V(bin_tiles_x, BCM2835V3DState, 3),
         VMSTATE_UINT8_V(bin_tiles_y, BCM2835V3DState, 3),
         VMSTATE_UINT8_V(bin_flags, BCM2835V3DState, 3),
+        VMSTATE_UINT64_V(bin_alloc_next, BCM2835V3DState, 10),
+        VMSTATE_UINT16_V(bin_alloc_block_size, BCM2835V3DState, 10),
+        VMSTATE_UINT16_V(bin_alloc_initial_block_size, BCM2835V3DState, 10),
+        VMSTATE_UINT32_ARRAY_V(bin_tile_list_addr, BCM2835V3DState,
+                               BCM2835_V3D_MAX_TILES, 10),
+        VMSTATE_UINT16_ARRAY_V(bin_tile_list_used, BCM2835V3DState,
+                               BCM2835_V3D_MAX_TILES, 10),
         VMSTATE_UINT32_V(bin_list_stride, BCM2835V3DState, 7),
         VMSTATE_BOOL_V(bin_list_indirect, BCM2835V3DState, 7),
         VMSTATE_BOOL_V(bin_config_valid, BCM2835V3DState, 3),

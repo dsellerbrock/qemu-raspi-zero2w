@@ -451,8 +451,8 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     uint8_t render_cl[32];
     uint8_t bin_cl[64];
     uint8_t draw_cl[32];
-    uint8_t tile_head[6];
-    uint8_t tile_list[45];
+    uint8_t tile_head[32];
+    uint8_t tile_list[32];
     uint8_t record[44] = { 0 };
     uint8_t code[17 * sizeof(uint64_t)];
     uint8_t fragment_code[3 * sizeof(uint64_t)];
@@ -575,29 +575,26 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
     memread(0x30000, tile_head, sizeof(tile_head));
-    memread(0x30024, tile_list, sizeof(tile_list));
-    g_assert_cmphex(tile_head[0], ==, 17);
-    g_assert_cmphex(read_u32(tile_head + 1), ==, 0x30024);
-    {
-        uint8_t list_length[4];
-
-        memread(0x30020, list_length, sizeof(list_length));
-        g_assert_cmpuint(read_u32(list_length), ==, 44);
-    }
+    memread(0x30100, tile_list, sizeof(tile_list));
+    g_assert_cmphex(tile_head[0], ==, 56);
+    g_assert_cmphex(tile_head[1], ==, 0x32);
+    g_assert_cmphex(tile_head[7], ==, 48);
+    g_assert_cmphex(tile_head[8], ==, 129);
+    g_assert_cmphex(read_u32(tile_head + 9), ==, 0xff00ff00);
+    g_assert_cmphex(read_u32(tile_head + 13), ==, 0xff000200);
+    g_assert_cmphex(read_u32(tile_head + 17), ==, 0x00000200);
+    g_assert_cmphex(tile_head[21], ==, 128);
+    g_assert_cmphex(tile_head[22], ==, 16);
+    g_assert_cmphex(read_u32(tile_head + 23), ==, 0x30100);
     g_assert_cmphex(tile_list[0], ==, 56);
     g_assert_cmphex(tile_list[1], ==, 0x32);
     g_assert_cmphex(tile_list[7], ==, 48);
     g_assert_cmphex(tile_list[8], ==, 129);
     g_assert_cmphex(read_u32(tile_list + 9), ==, 0xff00ff00);
-    g_assert_cmphex(read_u32(tile_list + 13), ==, 0xff000200);
-    g_assert_cmphex(read_u32(tile_list + 17), ==, 0x00000200);
+    g_assert_cmphex(read_u32(tile_list + 13), ==, 0x00000200);
+    g_assert_cmphex(read_u32(tile_list + 17), ==, 0x01000000);
     g_assert_cmphex(tile_list[21], ==, 128);
-    g_assert_cmphex(tile_list[22], ==, 56);
-    g_assert_cmphex(read_u32(tile_list + 22 + 9), ==, 0xff00ff00);
-    g_assert_cmphex(read_u32(tile_list + 22 + 13), ==, 0x00000200);
-    g_assert_cmphex(read_u32(tile_list + 22 + 17), ==, 0x01000000);
-    g_assert_cmphex(tile_list[43], ==, 128);
-    g_assert_cmphex(tile_list[44], ==, 18);
+    g_assert_cmphex(tile_list[22], ==, 18);
 
     /* CT1 loads the tile, follows the binner's tile sublist, and stores it. */
     draw_cl[draw_size++] = 29;

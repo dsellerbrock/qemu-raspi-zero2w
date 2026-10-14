@@ -17,6 +17,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835V3DState, BCM2835_V3D)
 #define BCM2835_V3D_INTCTL 0x030
 #define BCM2835_V3D_INTENA 0x034
 #define BCM2835_V3D_INTDIS 0x038
+#define BCM2835_V3D_MAX_TILES 4096
 
 struct BCM2835V3DState {
     SysBusDevice parent_obj;
@@ -58,6 +59,11 @@ struct BCM2835V3DState {
     uint8_t bin_tiles_x;
     uint8_t bin_tiles_y;
     uint8_t bin_flags;
+    uint64_t bin_alloc_next;
+    uint16_t bin_alloc_block_size;
+    uint16_t bin_alloc_initial_block_size;
+    uint32_t bin_tile_list_addr[BCM2835_V3D_MAX_TILES];
+    uint16_t bin_tile_list_used[BCM2835_V3D_MAX_TILES];
     uint32_t bin_list_stride;
     bool bin_list_indirect;
     bool bin_config_valid;
