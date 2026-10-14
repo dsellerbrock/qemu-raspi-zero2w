@@ -74,6 +74,7 @@
 #define V3D_PACKET_TILE_COORDS 115
 
 #define V3D_MAX_CL_COMMANDS    (1U << 16)
+#define V3D_MAX_PRIMITIVE_INDICES (1U << 20)
 #define V3D_TILE_SIZE          64
 #define V3D_T_MEMORY_TILE_SIZE 32
 #define V3D_UTILE_PIXELS       16
@@ -502,6 +503,115 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
 
 static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread);
 
+static bool bcm2835_v3d_validate_vertex_arrays(BCM2835V3DState *s,
+                                               uint32_t max_index)
+{
+    unsigned attributes = s->shader_attribute_count;
+    uint8_t selected = s->shader_record[14] | s->shader_record[26];
+
+    if (attributes < 8 && (selected >> attributes)) {
+        return false;
+    }
+
+    for (unsigned i = 0; i < attributes; i++) {
+        uint32_t offset = 36 + i * 8;
+        uint32_t base;
+        uint32_t stride;
+        uint32_t attr_size;
+        uint64_t last_offset;
+        uint64_t end;
+        uint8_t data[256];
+
+        if (!(selected & (1U << i))) {
+            continue;
+        }
+
+        base = ldl_le_p(s->shader_record + offset);
+        attr_size = s->shader_record[offset + 4] + 1;
+        stride = s->shader_record[offset + 5];
+        if (s->shader_record_extended) {
+            stride |= ldl_le_p(s->shader_record + 100 + i * 4) & ~0xffU;
+        }
+
+        last_offset = stride ? (uint64_t)max_index * stride : 0;
+        end = (uint64_t)base + last_offset + attr_size;
+        if (end > UINT32_MAX + 1ULL ||
+            !bcm2835_v3d_dma_read(s, base, data, attr_size) ||
+            (last_offset &&
+             !bcm2835_v3d_dma_read(s, base + last_offset, data,
+                                    attr_size))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool bcm2835_v3d_validate_draw(BCM2835V3DState *s,
+                                      const uint8_t *packet,
+                                      uint8_t opcode)
+{
+    unsigned mode = packet[1] & 0xf;
+    uint32_t count = ldl_le_p(packet + 2);
+    uint32_t max_index;
+
+    if (mode > 6) {
+        return false;
+    }
+    if (!count) {
+        return true;
+    }
+    if (!s->shader_state_valid) {
+        return false;
+    }
+
+    if (opcode == V3D_PACKET_ARRAY_PRIM) {
+        uint32_t base_index = ldl_le_p(packet + 6);
+
+        if ((uint64_t)base_index + count - 1 > UINT32_MAX) {
+            return false;
+        }
+        max_index = base_index + count - 1;
+    } else {
+        unsigned index_size = (packet[1] >> 4) + 1;
+        uint32_t index_addr = ldl_le_p(packet + 6);
+        uint32_t declared_max = ldl_le_p(packet + 10);
+        uint64_t index_end = (uint64_t)index_addr +
+                             (uint64_t)count * index_size;
+        uint8_t indices[512];
+        uint32_t index = 0;
+
+        /* Keep malformed guest lists from monopolizing the QEMU main loop. */
+        if (index_size > 2 || count > V3D_MAX_PRIMITIVE_INDICES ||
+            index_end > UINT32_MAX + 1ULL) {
+            return false;
+        }
+
+        while (index < count) {
+            uint32_t batch = MIN(count - index,
+                                 sizeof(indices) / index_size);
+            size_t bytes = batch * index_size;
+
+            if (!bcm2835_v3d_dma_read(s, index_addr + index * index_size,
+                                      indices, bytes)) {
+                return false;
+            }
+            for (uint32_t i = 0; i < batch; i++) {
+                uint32_t value = index_size == 1 ? indices[i] :
+                                 lduw_le_p(indices + i * index_size);
+
+                if (value > declared_max) {
+                    return false;
+                }
+            }
+            index += batch;
+        }
+        max_index = declared_max;
+    }
+
+    return bcm2835_v3d_validate_vertex_arrays(s, max_index);
+}
+
 static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 {
     uint32_t *ca = &s->ct_ca[thread];
@@ -728,6 +838,15 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             break;
         case V3D_PACKET_INDEX_PRIM:
         case V3D_PACKET_ARRAY_PRIM:
+            if (thread != 0 || !s->binning_started ||
+                !bcm2835_v3d_validate_draw(s, packet, opcode)) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "invalid primitive or vertex input");
+                return;
+            }
+            bcm2835_v3d_thread_error(s, thread, *ca,
+                                     "QPU shader execution and rasterization are not implemented");
+            return;
         case V3D_PACKET_COMPRESSED:
         case V3D_PACKET_CLIPPED:
             bcm2835_v3d_thread_error(s, thread, *ca,
