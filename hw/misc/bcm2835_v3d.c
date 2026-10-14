@@ -754,6 +754,7 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
         case V3D_PACKET_FLUSH:
         case V3D_PACKET_FLUSH_ALL:
             if (thread == 0) {
+                s->regs[V3D_BFC >> 2]++;
                 bcm2835_v3d_raise_irq(s, V3D_INT_FLDONE);
             }
             break;
@@ -807,10 +808,7 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 
     s->ct_cs[thread] &= ~(V3D_CS_CTRUN | V3D_CS_CTSUBS);
     s->ct_waiting[thread] = false;
-    if (thread == 0) {
-        s->regs[V3D_BFC >> 2]++;
-        bcm2835_v3d_raise_irq(s, V3D_INT_FLDONE);
-    } else {
+    if (thread == 1) {
         s->regs[V3D_RFC >> 2]++;
         bcm2835_v3d_raise_irq(s, V3D_INT_FRDONE);
     }

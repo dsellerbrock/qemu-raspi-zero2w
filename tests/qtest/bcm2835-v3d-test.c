@@ -108,6 +108,41 @@ static void test_v3d_ct0_binning_setup(void)
     }
 }
 
+static void test_v3d_ct0_flush_count(void)
+{
+    uint8_t cl[32];
+    size_t cl_size = 0;
+
+    cl[cl_size++] = 112;
+    append_u32(cl, &cl_size, 0x30000);
+    append_u32(cl, &cl_size, 0x2000);
+    append_u32(cl, &cl_size, 0x32000);
+    cl[cl_size++] = 2;
+    cl[cl_size++] = 2;
+    cl[cl_size++] = 0x04;
+    cl[cl_size++] = 6;
+
+    writel(RASPI3_V3D_BASE + V3D_BFC, 1);
+    writel(RASPI3_V3D_BASE + V3D_INTCTL, V3D_FLDONE);
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + cl_size);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BFC), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_FLDONE,
+                    ==, 0);
+
+    cl[cl_size++] = 4;
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_INTCTL, V3D_FLDONE);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + cl_size);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BFC), ==, 1);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_FLDONE,
+                    ==, V3D_FLDONE);
+}
+
 static void append_u16(uint8_t *buffer, size_t *offset, uint16_t value)
 {
     buffer[(*offset)++] = value;
@@ -484,6 +519,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/v3d/irq_masks", test_v3d_irq_masks);
     qtest_add_func("/bcm2835/v3d/ct0_binning_setup",
                    test_v3d_ct0_binning_setup);
+    qtest_add_func("/bcm2835/v3d/ct0_flush_count",
+                   test_v3d_ct0_flush_count);
     qtest_add_func("/bcm2835/v3d/ct1_clear_linear",
                    test_v3d_ct1_clear_linear);
     qtest_add_func("/bcm2835/v3d/ct1_clear_t_tiled",
