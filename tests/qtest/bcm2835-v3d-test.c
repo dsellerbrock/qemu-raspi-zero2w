@@ -161,25 +161,33 @@ static void test_v3d_qpu_vpm_vector_io(void)
 
 static void test_v3d_qpu_vpm_setup_and_write(void)
 {
-    uint8_t code[3 * sizeof(uint64_t)];
+    uint8_t code[9 * sizeof(uint64_t)];
     BCM2835V3DQPUState qpu;
     uint32_t executed;
     uint32_t setup = (1U << 12) | (1U << 11) | (2U << 8) | 4;
 
     stq_le_p(code, qpu_test_load_imm(49, setup) | (1ULL << 44));
-    stq_le_p(code + 8, qpu_test_add_imm(0, 48, 0));
-    stq_le_p(code + 16, 3ULL << 60);
+    for (unsigned i = 0; i < 7; i++) {
+        stq_le_p(code + (i + 1) * 8,
+                 qpu_test_add_imm(0, 48, 0) | (1ULL << 44));
+    }
+    stq_le_p(code + 8 * 8, 3ULL << 60);
     bcm2835_v3d_qpu_init(&qpu);
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.rf[0][0][lane] = 0x100 + lane;
     }
 
-    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 16, &qpu,
                                          &executed),
                     ==, BCM2835_V3D_QPU_END);
-    g_assert_cmpuint(qpu.vpm_write_address, ==, 5);
-    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
-        g_assert_cmphex(qpu.vpm[4][lane], ==, 0x100 + lane);
+    g_assert_cmpuint(qpu.vpm_write_address, ==, 11);
+    g_assert_cmpuint(qpu.vpm_write_history_count, ==,
+                     BCM2835_V3D_QPU_VPM_WRITE_HISTORY);
+    for (unsigned row = 0; row < 7; row++) {
+        g_assert_cmpuint(qpu.vpm_write_history[row], ==, row + 4);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            g_assert_cmphex(qpu.vpm[row + 4][lane], ==, 0x100 + lane);
+        }
     }
 }
 
