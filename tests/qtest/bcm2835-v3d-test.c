@@ -19,18 +19,27 @@
 #define V3D_INTENA  0x034
 #define V3D_INTDIS  0x038
 #define V3D_CT0CS   0x100
+#define V3D_PCS     0x130
 #define V3D_RFC     0x138
 #define V3D_CT0EA   0x108
 #define V3D_CT0CA   0x110
 #define V3D_BFC     0x134
+#define V3D_BPCA    0x300
+#define V3D_BPCS    0x304
+#define V3D_BPOA    0x308
+#define V3D_BPOS    0x30c
 #define V3D_CT1CS   0x104
 #define V3D_CT1EA   0x10c
 #define V3D_CT1CA   0x114
 
 #define V3D_FRDONE  (1U << 0)
 #define V3D_FLDONE  (1U << 1)
+#define V3D_INT_SPILLUSE (1U << 3)
+#define V3D_INT_OUTOMEM (1U << 2)
 #define V3D_CTERR   (1U << 3)
 #define V3D_CTRUN   (1U << 5)
+#define V3D_CTSUBS  (1U << 4)
+#define V3D_BMOOM   (1U << 8)
 #define CL_ADDR     0x10000
 #define FB_ADDR     0x20000
 #define FB_SIZE     (64 * 64 * sizeof(uint32_t))
@@ -434,7 +443,7 @@ static uint32_t read_u32(const uint8_t *buffer)
 
 static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
 {
-    static const uint32_t vertices[6][7] = {
+    static const uint32_t vertices[9][7] = {
         { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
           0xff00ff00, 0x00000000, 0x3f800000 },
         { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
@@ -447,12 +456,19 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
           0xff000400, 0x00000000, 0x3f800000 },
         { 0x40000000, 0x3f000000, 0x00000000, 0x3f800000,
           0x01000000, 0x00000000, 0x3f800000 },
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
+          0xff00ff00, 0x00000000, 0x3f800000 },
+        { 0x3f000000, 0xbf000000, 0x00000000, 0x3f800000,
+          0xff000400, 0x00000000, 0x3f800000 },
+        { 0x00000000, 0x3f000000, 0x00000000, 0x3f800000,
+          0x01000000, 0x00000000, 0x3f800000 },
     };
     uint8_t render_cl[32];
     uint8_t bin_cl[64];
     uint8_t draw_cl[32];
     uint8_t tile_head[32];
     uint8_t tile_list[32];
+    uint8_t tile_overflow[32];
     uint8_t record[44] = { 0 };
     uint8_t code[17 * sizeof(uint64_t)];
     uint8_t fragment_code[3 * sizeof(uint64_t)];
@@ -542,7 +558,7 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
 
     bin_cl[bin_size++] = 112;
     append_u32(bin_cl, &bin_size, 0x30000);
-    append_u32(bin_cl, &bin_size, 0x2000);
+    append_u32(bin_cl, &bin_size, 0x120);
     append_u32(bin_cl, &bin_size, 0x32000);
     bin_cl[bin_size++] = 1;
     bin_cl[bin_size++] = 1;
@@ -568,7 +584,23 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
     writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
 
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
+                    ==, V3D_CTRUN | V3D_CTSUBS);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM,
+                    ==, V3D_BMOOM);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_OUTOMEM,
+                    ==, V3D_INT_OUTOMEM);
+    writel(RASPI3_V3D_BASE + V3D_BPOA, 0x35000);
+    writel(RASPI3_V3D_BASE + V3D_BPOS, 0x80);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR, ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOA), ==, 0x35020);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOS), ==, 0x60);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCA), ==, 0x30120);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCS), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_SPILLUSE,
+                    ==, V3D_INT_SPILLUSE);
     memread(FB_ADDR, fb, sizeof(fb));
     g_assert_cmphex(read_u32(fb + (30 * 64 + 32) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
@@ -576,6 +608,7 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
                     ==, 0x5a5a5a5a);
     memread(0x30000, tile_head, sizeof(tile_head));
     memread(0x30100, tile_list, sizeof(tile_list));
+    memread(0x35000, tile_overflow, sizeof(tile_overflow));
     g_assert_cmphex(tile_head[0], ==, 56);
     g_assert_cmphex(tile_head[1], ==, 0x32);
     g_assert_cmphex(tile_head[7], ==, 48);
@@ -594,7 +627,12 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     g_assert_cmphex(read_u32(tile_list + 13), ==, 0x00000200);
     g_assert_cmphex(read_u32(tile_list + 17), ==, 0x01000000);
     g_assert_cmphex(tile_list[21], ==, 128);
-    g_assert_cmphex(tile_list[22], ==, 18);
+    g_assert_cmphex(tile_list[22], ==, 16);
+    g_assert_cmphex(read_u32(tile_list + 23), ==, 0x35000);
+    g_assert_cmphex(tile_overflow[0], ==, 56);
+    g_assert_cmphex(tile_overflow[1], ==, 0x32);
+    g_assert_cmphex(tile_overflow[21], ==, 128);
+    g_assert_cmphex(tile_overflow[22], ==, 18);
 
     /* CT1 loads the tile, follows the binner's tile sublist, and stores it. */
     draw_cl[draw_size++] = 29;

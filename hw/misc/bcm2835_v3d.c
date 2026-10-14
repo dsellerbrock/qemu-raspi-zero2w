@@ -34,6 +34,11 @@
 #define V3D_PCS                0x130
 #define V3D_BFC                0x134
 #define V3D_RFC                0x138
+#define V3D_BPCA               0x300
+#define V3D_BPCS               0x304
+#define V3D_BPOA               0x308
+#define V3D_BPOS               0x30c
+#define V3D_PCS_BMOOM          (1U << 8)
 
 #define V3D_CS_CTRSTA          (1U << 15)
 #define V3D_CS_CTRUN           (1U << 5)
@@ -484,6 +489,11 @@ static void bcm2835_v3d_thread_error(BCM2835V3DState *s, unsigned thread,
     s->ct_cs[thread] &= ~V3D_CS_CTRUN;
     s->ct_cs[thread] |= V3D_CS_CTSUBS | V3D_CS_CTERR;
     s->ct_waiting[thread] = false;
+    if (thread == 0) {
+        s->bin_draw_append_count = 0;
+        s->bin_draw_resume = false;
+        s->bin_oom_waiting = false;
+    }
 }
 
 static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
@@ -914,6 +924,11 @@ static bool bcm2835_v3d_init_tile_lists(BCM2835V3DState *s)
 
     /* The PTB starts each tile in its initial block, then shares the rest. */
     s->bin_alloc_next = pool_address;
+    s->bin_draw_append_count = 0;
+    s->bin_draw_resume = false;
+    s->bin_oom_waiting = false;
+    s->bin_spilluse = false;
+    s->regs[V3D_PCS >> 2] &= ~V3D_PCS_BMOOM;
     s->bin_list_stride = 0;
     s->bin_list_indirect = false;
 
@@ -935,6 +950,44 @@ static bool bcm2835_v3d_init_tile_lists(BCM2835V3DState *s)
         s->bin_tile_list_used[tile] = 1;
     }
     return true;
+}
+
+static bool bcm2835_v3d_alloc_tile_block(BCM2835V3DState *s,
+                                         uint32_t *address)
+{
+    uint64_t alloc_end = (uint64_t)s->bin_alloc_base + s->bin_alloc_size;
+
+    if (s->bin_alloc_next + s->bin_alloc_block_size <= alloc_end) {
+        *address = s->bin_alloc_next;
+        s->bin_alloc_next += s->bin_alloc_block_size;
+        return true;
+    }
+
+    {
+        uint32_t overflow_base = s->regs[V3D_BPOA >> 2];
+        uint32_t overflow_size = s->regs[V3D_BPOS >> 2];
+        uint64_t overflow_end = (uint64_t)overflow_base + overflow_size;
+        uint32_t memory_window = s->bin_alloc_base & 0xf0000000;
+
+        if (overflow_base && overflow_size >= s->bin_alloc_block_size &&
+            !(overflow_base & 15) && overflow_end <= UINT32_MAX + 1ULL &&
+            (overflow_base & 0xf0000000) == memory_window &&
+            ((overflow_end - 1) & 0xf0000000) == memory_window) {
+            *address = overflow_base;
+            s->regs[V3D_BPOA >> 2] += s->bin_alloc_block_size;
+            s->regs[V3D_BPOS >> 2] -= s->bin_alloc_block_size;
+            if (!s->bin_spilluse) {
+                s->bin_spilluse = true;
+                bcm2835_v3d_raise_irq(s, V3D_INT_SPILLUSE);
+            }
+            return true;
+        }
+    }
+
+    s->bin_oom_waiting = true;
+    s->regs[V3D_PCS >> 2] |= V3D_PCS_BMOOM;
+    bcm2835_v3d_raise_irq(s, V3D_INT_OUTOMEM);
+    return false;
 }
 
 static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
@@ -968,19 +1021,15 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
     }
 
     if (sizeof(commands) - 1 > list_capacity - used) {
-        uint64_t alloc_end = (uint64_t)s->bin_alloc_base +
-                             s->bin_alloc_size;
-        uint64_t next_block = s->bin_alloc_next;
+        uint32_t next_block;
         uint8_t branch[5] = { V3D_PACKET_BRANCH };
         uint8_t empty_list = V3D_PACKET_RETURN;
 
         if (used - 1 + sizeof(branch) > list_capacity ||
-            (uint64_t)next_block + s->bin_alloc_block_size > alloc_end ||
-            (uint64_t)next_block + s->bin_alloc_block_size >
-                UINT32_MAX + 1ULL) {
+            !bcm2835_v3d_alloc_tile_block(s, &next_block)) {
             return false;
         }
-        stl_le_p(branch + 1, (uint32_t)next_block);
+        stl_le_p(branch + 1, next_block);
         if (dma_memory_write(&s->dma_as, next_block, &empty_list,
                              sizeof(empty_list),
                              MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
@@ -989,7 +1038,6 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
                              MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
             return false;
         }
-        s->bin_alloc_next += s->bin_alloc_block_size;
         s->bin_tile_list_addr[tile_index] = next_block;
         s->bin_tile_list_used[tile_index] = 1;
         list_address = next_block;
@@ -1218,7 +1266,8 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
 
 static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
                                              const BCM2835V3DVertex *triangle,
-                                             uint64_t *binned_tiles)
+                                             uint64_t *binned_tiles,
+                                             uint32_t *append_index)
 {
     int32_t center_x = s->viewport_offset_valid ? s->viewport_center_x :
                                                  s->render_width / 2;
@@ -1259,11 +1308,18 @@ static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
          tile_y <= (uint32_t)pixel_max_y / V3D_TILE_SIZE; tile_y++) {
         for (uint32_t tile_x = pixel_min_x / V3D_TILE_SIZE;
              tile_x <= (uint32_t)pixel_max_x / V3D_TILE_SIZE; tile_x++) {
-            if (++*binned_tiles > V3D_MAX_RASTER_TILES ||
-                !bcm2835_v3d_append_tile_triangle(s, tile_x, tile_y,
-                                                 screen_xy)) {
+            if (++*binned_tiles > V3D_MAX_RASTER_TILES) {
                 return false;
             }
+            if ((*append_index)++ < s->bin_draw_append_count) {
+                continue;
+            }
+            if (!bcm2835_v3d_append_tile_triangle(s, tile_x, tile_y,
+                                                  screen_xy)) {
+                s->bin_draw_resume = s->bin_oom_waiting;
+                return false;
+            }
+            s->bin_draw_append_count++;
         }
     }
     return true;
@@ -1277,6 +1333,11 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
     unsigned format = (s->render_config >> 2) & 3;
     unsigned memory_format = (s->render_config >> 6) & 3;
     uint64_t binned_tiles = 0;
+    uint32_t append_index = 0;
+
+    if (!s->bin_draw_resume) {
+        s->bin_draw_append_count = 0;
+    }
 
     if (!s->render_config_valid || !s->bin_config_valid ||
         !s->binning_started || !s->render_width || !s->render_height ||
@@ -1302,15 +1363,19 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
                 };
 
                 if (!bcm2835_v3d_bin_screen_triangle(s, triangle,
-                                                     &binned_tiles)) {
+                                                     &binned_tiles,
+                                                     &append_index)) {
                     return false;
                 }
             }
         } else if (!bcm2835_v3d_bin_screen_triangle(s, vertices + vertex,
-                                                    &binned_tiles)) {
+                                                    &binned_tiles,
+                                                    &append_index)) {
             return false;
         }
     }
+    s->bin_draw_append_count = 0;
+    s->bin_draw_resume = false;
     return true;
 }
 
@@ -1515,6 +1580,7 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
         uint8_t opcode;
         unsigned packet_size;
         uint32_t next;
+        uint32_t packet_address = *ca;
 
         if (commands >= V3D_MAX_CL_COMMANDS) {
             bcm2835_v3d_thread_error(s, thread, *ca,
@@ -1779,6 +1845,11 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                 return;
             }
             if (!bcm2835_v3d_execute_coordinate_shader(s, packet, opcode)) {
+                if (s->bin_oom_waiting) {
+                    *ca = packet_address;
+                    s->ct_cs[thread] |= V3D_CS_CTRUN | V3D_CS_CTSUBS;
+                    return;
+                }
                 bcm2835_v3d_thread_error(s, thread, *ca,
                                          "unsupported QPU shader, triangle mode, or render target");
                 return;
@@ -1796,6 +1867,22 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 
     s->ct_cs[thread] &= ~(V3D_CS_CTRUN | V3D_CS_CTSUBS);
     s->ct_waiting[thread] = false;
+}
+
+static void bcm2835_v3d_resume_binner_if_ready(BCM2835V3DState *s)
+{
+    if (!s->bin_oom_waiting || !s->regs[V3D_BPOA >> 2] ||
+        !s->regs[V3D_BPOS >> 2]) {
+        return;
+    }
+
+    s->bin_oom_waiting = false;
+    s->regs[V3D_PCS >> 2] &= ~V3D_PCS_BMOOM;
+    s->ct_cs[0] &= ~V3D_CS_CTSUBS;
+    if (s->ct_ca[0] != s->ct_ea[0]) {
+        s->ct_cs[0] |= V3D_CS_CTRUN;
+        bcm2835_v3d_run_thread(s, 0);
+    }
 }
 
 static uint32_t bcm2835_v3d_read_thread_reg(BCM2835V3DState *s,
@@ -1845,6 +1932,15 @@ static uint64_t bcm2835_v3d_read(void *opaque, hwaddr offset, unsigned size)
         return s->irq_enable;
     case BCM2835_V3D_INTDIS:
         return 0;
+    case V3D_BPCA:
+        return s->bin_alloc_next <= UINT32_MAX ? s->bin_alloc_next : 0;
+    case V3D_BPCS: {
+        uint64_t alloc_end = (uint64_t)s->bin_alloc_base +
+                             s->bin_alloc_size;
+
+        return alloc_end > s->bin_alloc_next ?
+               alloc_end - s->bin_alloc_next : 0;
+    }
     case V3D_CT0CS: case V3D_CT0EA: case V3D_CT0CA:
     case V3D_CT00RA0: case V3D_CT0LC: case V3D_CT0PC:
         thread = 0;
@@ -1867,6 +1963,12 @@ static void bcm2835_v3d_write_thread_cs(BCM2835V3DState *s,
         s->ct_cs[thread] = 0;
         s->ct_return_depth[thread] = 0;
         s->ct_waiting[thread] = false;
+        if (thread == 0) {
+            s->bin_draw_append_count = 0;
+            s->bin_draw_resume = false;
+            s->bin_oom_waiting = false;
+            s->regs[V3D_PCS >> 2] &= ~V3D_PCS_BMOOM;
+        }
         return;
     }
     if (value & V3D_CS_CTRUN) {
@@ -1975,6 +2077,14 @@ static void bcm2835_v3d_write(void *opaque, hwaddr offset, uint64_t value,
         break;
     case V3D_PCS:
         break;
+    case V3D_BPCA:
+    case V3D_BPCS:
+        break;
+    case V3D_BPOA:
+    case V3D_BPOS:
+        s->regs[offset >> 2] = value32;
+        bcm2835_v3d_resume_binner_if_ready(s);
+        break;
     default:
         s->regs[offset >> 2] = value32;
         break;
@@ -2031,6 +2141,10 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->bin_alloc_next = 0;
     s->bin_alloc_block_size = 0;
     s->bin_alloc_initial_block_size = 0;
+    s->bin_draw_append_count = 0;
+    s->bin_draw_resume = false;
+    s->bin_oom_waiting = false;
+    s->bin_spilluse = false;
     memset(s->bin_tile_list_addr, 0, sizeof(s->bin_tile_list_addr));
     memset(s->bin_tile_list_used, 0, sizeof(s->bin_tile_list_used));
     s->bin_list_stride = 0;
@@ -2116,13 +2230,19 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
         memset(s->bin_tile_list_addr, 0, sizeof(s->bin_tile_list_addr));
         memset(s->bin_tile_list_used, 0, sizeof(s->bin_tile_list_used));
     }
+    if (version_id < 11) {
+        s->bin_draw_append_count = 0;
+        s->bin_draw_resume = false;
+        s->bin_oom_waiting = false;
+        s->bin_spilluse = false;
+    }
     bcm2835_v3d_update_irq(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 10,
+    .version_id = 11,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -2162,6 +2282,10 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
                                BCM2835_V3D_MAX_TILES, 10),
         VMSTATE_UINT16_ARRAY_V(bin_tile_list_used, BCM2835V3DState,
                                BCM2835_V3D_MAX_TILES, 10),
+        VMSTATE_UINT32_V(bin_draw_append_count, BCM2835V3DState, 11),
+        VMSTATE_BOOL_V(bin_draw_resume, BCM2835V3DState, 11),
+        VMSTATE_BOOL_V(bin_oom_waiting, BCM2835V3DState, 11),
+        VMSTATE_BOOL_V(bin_spilluse, BCM2835V3DState, 11),
         VMSTATE_UINT32_V(bin_list_stride, BCM2835V3DState, 7),
         VMSTATE_BOOL_V(bin_list_indirect, BCM2835V3DState, 7),
         VMSTATE_BOOL_V(bin_config_valid, BCM2835V3DState, 3),

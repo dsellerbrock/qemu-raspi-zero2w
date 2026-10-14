@@ -62,6 +62,10 @@ struct BCM2835V3DState {
     uint64_t bin_alloc_next;
     uint16_t bin_alloc_block_size;
     uint16_t bin_alloc_initial_block_size;
+    uint32_t bin_draw_append_count;
+    bool bin_draw_resume;
+    bool bin_oom_waiting;
+    bool bin_spilluse;
     uint32_t bin_tile_list_addr[BCM2835_V3D_MAX_TILES];
     uint16_t bin_tile_list_used[BCM2835_V3D_MAX_TILES];
     uint32_t bin_list_stride;
