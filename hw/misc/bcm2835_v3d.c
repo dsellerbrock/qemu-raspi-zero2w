@@ -47,6 +47,8 @@
 #define V3D_INT_FRDONE         (1U << 0)
 #define V3D_INT_MASK           0x0f
 
+#define V3D_BIN_FLAG_AUTO_INIT_TSDA (1U << 2)
+
 #define V3D_PACKET_HALT        0
 #define V3D_PACKET_NOP         1
 #define V3D_PACKET_FLUSH       4
@@ -643,9 +645,21 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             return;
         case V3D_PACKET_START_BIN:
             if (thread == 0) {
+                uint64_t state_size;
+
                 if (!s->bin_config_valid) {
                     bcm2835_v3d_thread_error(s, thread, *ca,
                                              "tile binning started without configuration");
+                    return;
+                }
+                state_size = (uint64_t)s->bin_tiles_x *
+                             s->bin_tiles_y * 48;
+                if ((s->bin_flags & V3D_BIN_FLAG_AUTO_INIT_TSDA) &&
+                    dma_memory_set(&s->dma_as, s->bin_state_base, 0,
+                                   state_size,
+                                   MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                    bcm2835_v3d_thread_error(s, thread, *ca,
+                                             "tile state initialization DMA failed");
                     return;
                 }
                 s->binning_started = true;

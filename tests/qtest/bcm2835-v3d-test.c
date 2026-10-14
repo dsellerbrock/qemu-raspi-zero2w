@@ -71,7 +71,11 @@ static void test_v3d_irq_masks(void)
 static void test_v3d_ct0_binning_setup(void)
 {
     uint8_t cl[32];
+    uint8_t state[4096];
     size_t cl_size = 0;
+
+    memset(state, 0xa5, sizeof(state));
+    memwrite(0x32000, state, sizeof(state));
 
     /* TILE_BINNING_MODE_CONFIG, START_TILE_BINNING, and FLUSH. */
     cl[cl_size++] = 112;
@@ -80,7 +84,7 @@ static void test_v3d_ct0_binning_setup(void)
     append_u32(cl, &cl_size, 0x32000);
     cl[cl_size++] = 2;
     cl[cl_size++] = 2;
-    cl[cl_size++] = 0;
+    cl[cl_size++] = 0x04; /* Auto-initialize tile state data. */
     cl[cl_size++] = 6;
     cl[cl_size++] = 4;
 
@@ -94,6 +98,14 @@ static void test_v3d_ct0_binning_setup(void)
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BFC), ==, 1);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_FLDONE,
                     ==, V3D_FLDONE);
+
+    memread(0x32000, state, sizeof(state));
+    for (unsigned i = 0; i < 4 * 48; i++) {
+        g_assert_cmphex(state[i], ==, 0);
+    }
+    for (unsigned i = 4 * 48; i < sizeof(state); i++) {
+        g_assert_cmphex(state[i], ==, 0xa5);
+    }
 }
 
 static void append_u16(uint8_t *buffer, size_t *offset, uint16_t value)
