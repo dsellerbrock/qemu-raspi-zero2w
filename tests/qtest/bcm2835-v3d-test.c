@@ -42,6 +42,7 @@
 #define V3D_EXPECTED_IDENT1 0xc0101432
 
 static void append_u32(uint8_t *buffer, size_t *offset, uint32_t value);
+static void append_u16(uint8_t *buffer, size_t *offset, uint16_t value);
 static uint32_t read_u32(const uint8_t *buffer);
 
 typedef struct QPUTestUniform {
@@ -182,6 +183,8 @@ static void test_v3d_qpu_vpm_setup_and_write(void)
                     ==, BCM2835_V3D_QPU_END);
     g_assert_cmpuint(qpu.vpm_write_address, ==, 11);
     g_assert_cmpuint(qpu.vpm_write_history_count, ==,
+                     BCM2835_V3D_QPU_VPM_WRITE_HISTORY);
+    g_assert_cmpuint(qpu.vpm_write_total, ==,
                      BCM2835_V3D_QPU_VPM_WRITE_HISTORY);
     for (unsigned row = 0; row < 7; row++) {
         g_assert_cmpuint(qpu.vpm_write_history[row], ==, row + 4);
@@ -397,7 +400,7 @@ static void test_v3d_ct0_primitive_packet_lengths(void)
         writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + cl_size);
 
         g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR,
-                        ==, V3D_CTERR);
+                        ==, 0);
         g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA),
                         ==, CL_ADDR + cl_size);
     }
@@ -427,6 +430,99 @@ static uint32_t read_u32(const uint8_t *buffer)
 {
     return (uint32_t)buffer[0] | ((uint32_t)buffer[1] << 8) |
            ((uint32_t)buffer[2] << 16) | ((uint32_t)buffer[3] << 24);
+}
+
+static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
+{
+    static const uint32_t screen_xy[] = {
+        (352U << 16) | (uint16_t)-352,
+        (352U << 16) | 352,
+        ((uint16_t)-352 << 16),
+    };
+    uint8_t render_cl[32];
+    uint8_t bin_cl[64];
+    uint8_t record[44] = { 0 };
+    uint8_t code[13 * sizeof(uint64_t)];
+    uint8_t vertices[sizeof(screen_xy)];
+    uint8_t initial[FB_SIZE];
+    uint8_t fb[FB_SIZE];
+    size_t render_size = 0;
+    size_t bin_size = 0;
+    uint32_t draw_color = 0xff00ff00;
+    uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8) | 8;
+    uint32_t setup_read = (1U << 20) | (1U << 11) | (2U << 8);
+    uint64_t instructions[] = {
+        qpu_test_load_imm(49, setup_write) | (1ULL << 44),
+        qpu_test_load_imm(0, 0),
+        qpu_test_load_imm(1, 0x3f800000),
+        qpu_test_load_imm(49, setup_read),
+        qpu_test_add_imm(48, 2, 0),
+        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(1, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(1, 48, 0) | (1ULL << 44),
+        3ULL << 60,
+    };
+
+    memset(initial, 0x5a, sizeof(initial));
+    memwrite(FB_ADDR, initial, sizeof(initial));
+    for (unsigned i = 0; i < G_N_ELEMENTS(screen_xy); i++) {
+        stl_le_p(vertices + i * sizeof(uint32_t), screen_xy[i]);
+    }
+    stl_le_p(record + 28, 0x6200);
+    record[26] = 1;
+    stl_le_p(record + 36, 0x7000);
+    record[40] = sizeof(uint32_t) - 1;
+    record[41] = sizeof(uint32_t);
+    memwrite(0x34000, record, sizeof(record));
+    memwrite(0x7000, vertices, sizeof(vertices));
+    for (unsigned i = 0; i < G_N_ELEMENTS(instructions); i++) {
+        stq_le_p(code + i * sizeof(uint64_t), instructions[i]);
+    }
+    memwrite(0x6200, code, sizeof(code));
+
+    render_cl[render_size++] = 113;
+    append_u32(render_cl, &render_size, FB_ADDR);
+    append_u16(render_cl, &render_size, 64);
+    append_u16(render_cl, &render_size, 64);
+    append_u16(render_cl, &render_size, 1U << 2);
+    render_cl[render_size++] = 114;
+    append_u32(render_cl, &render_size, draw_color);
+    append_u32(render_cl, &render_size, 0);
+    append_u32(render_cl, &render_size, 0);
+    render_cl[render_size++] = 0;
+    memwrite(CL_ADDR, render_cl, render_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + render_size);
+
+    bin_cl[bin_size++] = 112;
+    append_u32(bin_cl, &bin_size, 0x30000);
+    append_u32(bin_cl, &bin_size, 0x2000);
+    append_u32(bin_cl, &bin_size, 0x32000);
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 0x04;
+    bin_cl[bin_size++] = 6;
+    bin_cl[bin_size++] = 64;
+    append_u32(bin_cl, &bin_size, 0x34001);
+    bin_cl[bin_size++] = 33;
+    bin_cl[bin_size++] = 4;
+    append_u32(bin_cl, &bin_size, 3);
+    append_u32(bin_cl, &bin_size, 0);
+    bin_cl[bin_size++] = 4;
+    memwrite(CL_ADDR, bin_cl, bin_size);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR, ==, 0);
+    memread(FB_ADDR, fb, sizeof(fb));
+    g_assert_cmphex(read_u32(fb + (30 * 64 + 32) * sizeof(uint32_t)),
+                    ==, draw_color);
+    g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
+                    ==, 0x5a5a5a5a);
 }
 
 static void append_tile_buffer_packet(uint8_t *buffer, size_t *offset,
@@ -891,6 +987,8 @@ int main(int argc, char **argv)
                    test_v3d_ct0_flush_count);
     qtest_add_func("/bcm2835/v3d/ct0_shader_state_dma",
                    test_v3d_ct0_shader_state_dma);
+    qtest_add_func("/bcm2835/v3d/ct0_rasterizes_coordinate_triangle",
+                   test_v3d_ct0_rasterizes_coordinate_triangle);
     qtest_add_func("/bcm2835/v3d/ct0_primitive_packet_lengths",
                    test_v3d_ct0_primitive_packet_lengths);
     qtest_add_func("/bcm2835/v3d/ct1_clear_linear",

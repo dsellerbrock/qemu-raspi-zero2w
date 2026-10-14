@@ -35,6 +35,7 @@ typedef struct BCM2835V3DQPUState {
     uint32_t vpm_write_pending[BCM2835_V3D_QPU_LANES];
     uint8_t vpm_write_history[BCM2835_V3D_QPU_VPM_WRITE_HISTORY];
     uint8_t vpm_write_history_count;
+    uint8_t vpm_write_total;
     bool vpm_read_setup;
     bool vpm_write_setup;
     bool io_fault;

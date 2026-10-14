@@ -79,6 +79,8 @@
 #define V3D_MAX_SHADER_VERTICES 4096
 #define V3D_MAX_QPU_INSTRUCTIONS 4096
 #define V3D_QPU_INSTRUCTION_BUDGET (1U << 16)
+#define V3D_MAX_RASTER_WORK       (1U << 22)
+#define V3D_MAX_RASTER_TILES      4096
 #define V3D_TILE_SIZE          64
 #define V3D_T_MEMORY_TILE_SIZE 32
 #define V3D_UTILE_PIXELS       16
@@ -718,7 +720,8 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                                        unsigned count, unsigned code_offset,
                                        unsigned uniforms_offset,
                                        unsigned attributes_offset,
-                                       unsigned vpm_offset_byte)
+                                       unsigned vpm_offset_byte,
+                                       uint32_t *screen_xy)
 {
     uint32_t code_address = ldl_le_p(s->shader_record + code_offset) & ~7U;
     uint32_t uniforms_address = ldl_le_p(s->shader_record + uniforms_offset);
@@ -726,7 +729,7 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
     uint32_t code_size;
 
     if (!code_address) {
-        return true;
+        return screen_xy == NULL;
     }
     if (count > V3D_MAX_SHADER_VERTICES) {
         return false;
@@ -758,9 +761,164 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
             g_free(code);
             return false;
         }
+        if (screen_xy) {
+            uint8_t coordinate_row;
+
+            if (qpu.vpm_write_total !=
+                    BCM2835_V3D_QPU_VPM_WRITE_HISTORY ||
+                qpu.vpm_write_history_count !=
+                    BCM2835_V3D_QPU_VPM_WRITE_HISTORY) {
+                g_free(code);
+                return false;
+            }
+            coordinate_row = qpu.vpm_write_history[4];
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                if (first + lane < count) {
+                    screen_xy[first + lane] = qpu.vpm[coordinate_row][lane];
+                }
+            }
+        }
     }
     g_free(code);
     return true;
+}
+
+static int32_t bcm2835_v3d_floor_12_4(int32_t value)
+{
+    return value < 0 ? -((-value + 15) / 16) : value / 16;
+}
+
+static int64_t bcm2835_v3d_edge(int32_t ax, int32_t ay,
+                                int32_t bx, int32_t by,
+                                int32_t px, int32_t py)
+{
+    return (int64_t)(px - ax) * (by - ay) -
+           (int64_t)(py - ay) * (bx - ax);
+}
+
+/*
+ * shortcut: flat-color software triangle fill after coordinate shading;
+ * replace with PTB-generated tile lists and CT1 fragment execution.
+ */
+static bool bcm2835_v3d_rasterize_triangles(BCM2835V3DState *s,
+                                             const uint32_t *screen_xy,
+                                             unsigned count)
+{
+    uint32_t saved_tile_x = s->tile_x;
+    uint32_t saved_tile_y = s->tile_y;
+    unsigned format = (s->render_config >> 2) & 3;
+    unsigned memory_format = (s->render_config >> 6) & 3;
+    unsigned color_format = format == 1 ? 0 : 2;
+    uint32_t color = s->clear_color_valid ? s->clear_color[0] : UINT32_MAX;
+    uint64_t raster_work = 0;
+    uint64_t raster_tiles = 0;
+    bool success = false;
+
+    if (!s->render_config_valid || !s->bin_config_valid ||
+        !s->render_width || !s->render_height ||
+        (format != 1 && format != 2) || memory_format > 2) {
+        return false;
+    }
+
+    for (unsigned vertex = 0; vertex < count; vertex += 3) {
+        int32_t x[3];
+        int32_t y[3];
+        int32_t min_x, min_y, max_x, max_y;
+        int32_t pixel_min_x, pixel_min_y, pixel_max_x, pixel_max_y;
+        int64_t area;
+
+        for (unsigned i = 0; i < 3; i++) {
+            uint32_t packed = screen_xy[vertex + i];
+
+            x[i] = (int32_t)s->render_width * 8 + (int16_t)packed;
+            y[i] = (int32_t)s->render_height * 8 - (int16_t)(packed >> 16);
+        }
+        area = bcm2835_v3d_edge(x[0], y[0], x[1], y[1], x[2], y[2]);
+        if (!area) {
+            continue;
+        }
+        min_x = MIN(x[0], MIN(x[1], x[2]));
+        max_x = MAX(x[0], MAX(x[1], x[2]));
+        min_y = MIN(y[0], MIN(y[1], y[2]));
+        max_y = MAX(y[0], MAX(y[1], y[2]));
+        pixel_min_x = MAX(0, bcm2835_v3d_floor_12_4(min_x));
+        pixel_min_y = MAX(0, bcm2835_v3d_floor_12_4(min_y));
+        pixel_max_x = MIN((int32_t)s->render_width - 1,
+                          bcm2835_v3d_floor_12_4(max_x));
+        pixel_max_y = MIN((int32_t)s->render_height - 1,
+                          bcm2835_v3d_floor_12_4(max_y));
+        if (pixel_min_x > pixel_max_x || pixel_min_y > pixel_max_y) {
+            continue;
+        }
+
+        for (uint32_t tile_y = pixel_min_y / V3D_TILE_SIZE;
+             tile_y <= (uint32_t)pixel_max_y / V3D_TILE_SIZE; tile_y++) {
+            for (uint32_t tile_x = pixel_min_x / V3D_TILE_SIZE;
+                 tile_x <= (uint32_t)pixel_max_x / V3D_TILE_SIZE; tile_x++) {
+                uint32_t x0 = tile_x * V3D_TILE_SIZE;
+                uint32_t y0 = tile_y * V3D_TILE_SIZE;
+                int32_t x_start = MAX(pixel_min_x, (int32_t)x0);
+                int32_t y_start = MAX(pixel_min_y, (int32_t)y0);
+                int32_t x_end = MIN(pixel_max_x,
+                                    (int32_t)(x0 + V3D_TILE_SIZE - 1));
+                int32_t y_end = MIN(pixel_max_y,
+                                    (int32_t)(y0 + V3D_TILE_SIZE - 1));
+                uint64_t tile_work = (uint64_t)(x_end - x_start + 1) *
+                                     (y_end - y_start + 1);
+                bool covered = false;
+
+                raster_work += tile_work;
+                if (tile_x > UINT8_MAX || tile_y > UINT8_MAX ||
+                    tile_x >= s->bin_tiles_x || tile_y >= s->bin_tiles_y ||
+                    raster_work > V3D_MAX_RASTER_WORK ||
+                    ++raster_tiles > V3D_MAX_RASTER_TILES) {
+                    goto out;
+                }
+                s->tile_x = tile_x;
+                s->tile_y = tile_y;
+                if (!bcm2835_v3d_copy_tile(s, s->render_base,
+                                            memory_format, color_format,
+                                            false)) {
+                    goto out;
+                }
+
+                for (int32_t py = y_start; py <= y_end; py++) {
+                    for (int32_t px = x_start; px <= x_end; px++) {
+                        int32_t px_fixed = px * 16 + 8;
+                        int32_t py_fixed = py * 16 + 8;
+                        int64_t e0 = bcm2835_v3d_edge(
+                            x[0], y[0], x[1], y[1], px_fixed, py_fixed);
+                        int64_t e1 = bcm2835_v3d_edge(
+                            x[1], y[1], x[2], y[2], px_fixed, py_fixed);
+                        int64_t e2 = bcm2835_v3d_edge(
+                            x[2], y[2], x[0], y[0], px_fixed, py_fixed);
+
+                        if ((area > 0 && e0 >= 0 && e1 >= 0 && e2 >= 0) ||
+                            (area < 0 && e0 <= 0 && e1 <= 0 && e2 <= 0)) {
+                            unsigned tile_index =
+                                (py - y0) * V3D_TILE_SIZE + (px - x0);
+
+                            s->tile_color[tile_index] = color;
+                            covered = true;
+                        }
+                    }
+                }
+                if (covered &&
+                    !bcm2835_v3d_copy_tile(s, s->render_base,
+                                            memory_format, color_format,
+                                            true)) {
+                    goto out;
+                }
+            }
+        }
+    }
+    success = true;
+
+out:
+    s->tile_x = saved_tile_x;
+    s->tile_y = saved_tile_y;
+    s->tile_color_valid = false;
+    return success;
 }
 
 static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
@@ -769,6 +927,7 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
 {
     uint32_t count = ldl_le_p(packet + 2);
     uint32_t *indices;
+    uint32_t *screen_xy;
     bool success;
 
     if (!count) {
@@ -777,7 +936,14 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
     if (count > V3D_MAX_SHADER_VERTICES) {
         return false;
     }
+    if ((packet[1] & 0xf) != 4 || count % 3) {
+        return false;
+    }
+    if (ldl_le_p(s->shader_record + 4) || s->shader_record[3]) {
+        return false;
+    }
     indices = g_new(uint32_t, count);
+    screen_xy = g_new(uint32_t, count);
     if (opcode == V3D_PACKET_ARRAY_PRIM) {
         uint32_t first = ldl_le_p(packet + 6);
 
@@ -797,6 +963,7 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
             if (!bcm2835_v3d_dma_read(s, address + first * index_size,
                                       indices_bytes, bytes)) {
                 g_free(indices);
+                g_free(screen_xy);
                 return false;
             }
             for (uint32_t i = 0; i < batch; i++) {
@@ -808,8 +975,13 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
     }
 
     /* CT0 runs the coordinate transform used by the tile binner. */
-    success = bcm2835_v3d_run_qpu_stage(s, indices, count, 28, 32, 26, 7);
+    success = bcm2835_v3d_run_qpu_stage(s, indices, count, 28, 32, 26, 7,
+                                         screen_xy);
     g_free(indices);
+    if (success) {
+        success = bcm2835_v3d_rasterize_triangles(s, screen_xy, count);
+    }
+    g_free(screen_xy);
     return success;
 }
 
@@ -1047,12 +1219,10 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             }
             if (!bcm2835_v3d_execute_coordinate_shader(s, packet, opcode)) {
                 bcm2835_v3d_thread_error(s, thread, *ca,
-                                         "unsupported QPU coordinate shader or input format");
+                                         "unsupported QPU shader, triangle mode, or render target");
                 return;
             }
-            bcm2835_v3d_thread_error(s, thread, *ca,
-                                     "coordinate QPU completed; PTB clipping, binning, and rasterization are not implemented");
-            return;
+            break;
         case V3D_PACKET_COMPRESSED:
         case V3D_PACKET_CLIPPED:
             bcm2835_v3d_thread_error(s, thread, *ca,

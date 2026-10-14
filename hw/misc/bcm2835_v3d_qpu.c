@@ -427,6 +427,7 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
             qpu->vpm_write_stride = stride;
             qpu->vpm_write_setup = true;
             qpu->vpm_write_history_count = 0;
+            qpu->vpm_write_total = 0;
         } else {
             qpu->vpm_read_address = address;
             qpu->vpm_read_stride = stride;
@@ -696,6 +697,9 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             return BCM2835_V3D_QPU_CODE_FAULT;
         }
         if (writes_vpm) {
+            if (qpu->vpm_write_total < UINT8_MAX) {
+                qpu->vpm_write_total++;
+            }
             if (qpu->vpm_write_history_count <
                 BCM2835_V3D_QPU_VPM_WRITE_HISTORY) {
                 qpu->vpm_write_history[qpu->vpm_write_history_count++] =
