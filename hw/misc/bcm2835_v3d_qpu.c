@@ -219,6 +219,39 @@ static uint32_t qpu_v8_minmax(uint32_t a, uint32_t b, bool maximum)
     return result;
 }
 
+static uint32_t qpu_unpack_r4(uint32_t value, unsigned unpack)
+{
+    unsigned shift;
+
+    if (unpack == 0) {
+        return value;
+    }
+    if (unpack == 3) {
+        value = (value >> 24) & 0xff;
+        return value * UINT32_C(0x01010101);
+    }
+    shift = (unpack - 4) * 8;
+    return qpu_float_bits(((value >> shift) & 0xff) / 255.0f);
+}
+
+static uint32_t qpu_pack_mul_color(uint32_t value, unsigned pack)
+{
+    float channel = qpu_bits_float(value);
+    uint32_t packed;
+
+    if (isnan(channel) || channel <= 0.0f) {
+        packed = 0;
+    } else if (channel >= 1.0f) {
+        packed = 0xff;
+    } else {
+        packed = floorf(channel * 255.0f + 0.5f);
+    }
+    if (pack == 3) {
+        return packed * UINT32_C(0x01010101);
+    }
+    return packed << ((pack - 4) * 8);
+}
+
 static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
                               unsigned address,
                               uint32_t value[BCM2835_V3D_QPU_LANES])
@@ -299,9 +332,12 @@ static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
 static uint32_t qpu_read_mux(BCM2835V3DQPUState *qpu, unsigned mux,
                              unsigned lane, const uint32_t reg_a[16],
                              const uint32_t reg_b[16], bool small_imm,
-                             unsigned imm)
+                             unsigned imm, bool pm, unsigned unpack)
 {
     if (mux <= QPU_MUX_R5) {
+        if (pm && mux == 4) {
+            return qpu_unpack_r4(qpu->acc[mux][lane], unpack);
+        }
         return qpu->acc[mux][lane];
     }
     if (mux == QPU_MUX_A) {
@@ -535,9 +571,9 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms, and
- * horizontal 32-bit VPM access. shortcut: no register-file timing, pack /
- * unpack, V8MULD, vertical VPM, TMU, or SFU; add each as guest shader coverage
- * requires it.
+ * horizontal 32-bit VPM access. shortcut: no register-file timing, A-file
+ * pack/unpack, r4 half-float unpack, V8MULD, vertical VPM, TMU, or SFU; add
+ * each as guest shader coverage requires it.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -570,8 +606,11 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         bool ws;
         bool set_flags;
         bool small_imm;
+        bool pm;
         bool end;
         uint32_t imm;
+        unsigned unpack;
+        unsigned pack;
         uint32_t add_result[BCM2835_V3D_QPU_LANES];
         uint32_t mul_result[BCM2835_V3D_QPU_LANES];
         uint32_t reg_a[BCM2835_V3D_QPU_LANES] = { 0 };
@@ -652,12 +691,6 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             sig != QPU_SIG_SMALL_IMM && sig != QPU_SIG_LOAD_IMM) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
-        if (QPU_FIELD(inst, QPU_UNPACK_SHIFT, 7) ||
-            QPU_FIELD(inst, QPU_PM_SHIFT, 1) ||
-            QPU_FIELD(inst, QPU_PACK_SHIFT, 0xf)) {
-            return BCM2835_V3D_QPU_UNSUPPORTED;
-        }
-
         op_add = QPU_FIELD(inst, QPU_OP_ADD_SHIFT, 0x1f);
         op_mul = QPU_FIELD(inst, QPU_OP_MUL_SHIFT, 7);
         cond_add = QPU_FIELD(inst, QPU_COND_ADD_SHIFT, 7);
@@ -674,6 +707,15 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         set_flags = inst & QPU_SF;
         small_imm = sig == QPU_SIG_SMALL_IMM;
         imm = QPU_FIELD(inst, QPU_SMALL_IMM_SHIFT, 0x3f);
+        unpack = QPU_FIELD(inst, QPU_UNPACK_SHIFT, 7);
+        pm = inst & (1ULL << QPU_PM_SHIFT);
+        pack = QPU_FIELD(inst, QPU_PACK_SHIFT, 0xf);
+
+        if ((pm && (unpack == 1 || unpack == 2 || pack == 1 || pack == 2 ||
+                    unpack > 7 || pack > 7)) ||
+            (!pm && (unpack || pack))) {
+            return BCM2835_V3D_QPU_UNSUPPORTED;
+        }
 
         if (sig == QPU_SIG_SMALL_IMM && imm >= 48) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
@@ -712,13 +754,13 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             }
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
                 uint32_t aa = qpu_read_mux(qpu, add_a, lane, reg_a,
-                                           reg_b, small_imm, imm);
+                                           reg_b, small_imm, imm, pm, unpack);
                 uint32_t ab = qpu_read_mux(qpu, add_b, lane, reg_a,
-                                           reg_b, small_imm, imm);
+                                           reg_b, small_imm, imm, pm, unpack);
                 uint32_t ma = qpu_read_mux(qpu, mul_a, lane, reg_a,
-                                           reg_b, small_imm, imm);
+                                           reg_b, small_imm, imm, pm, unpack);
                 uint32_t mb = qpu_read_mux(qpu, mul_b, lane, reg_a,
-                                           reg_b, small_imm, imm);
+                                           reg_b, small_imm, imm, pm, unpack);
                 uint16_t bit = 1U << lane;
 
                 if (!qpu_execute_add(op_add, aa, ab, &add_result[lane],
@@ -732,6 +774,12 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                 if (qpu_condition(qpu, cond_mul, lane)) {
                     active_mul |= bit;
                 }
+            }
+        }
+
+        if (pm && pack) {
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                mul_result[lane] = qpu_pack_mul_color(mul_result[lane], pack);
             }
         }
 
