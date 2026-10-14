@@ -58,6 +58,8 @@ struct BCM2835V3DState {
     uint8_t bin_tiles_x;
     uint8_t bin_tiles_y;
     uint8_t bin_flags;
+    uint32_t bin_list_stride;
+    bool bin_list_indirect;
     bool bin_config_valid;
     bool binning_started;
     uint32_t shader_state;
@@ -66,6 +68,12 @@ struct BCM2835V3DState {
     uint16_t shader_record_size;
     uint8_t shader_attribute_count;
     bool shader_record_extended;
+    uint8_t tile_primitive_format;
+    bool tile_primitive_format_valid;
+    uint32_t pending_tile_load_base;
+    uint8_t pending_tile_load_memory_format;
+    uint8_t pending_tile_load_color_format;
+    bool pending_tile_load;
 };
 
 #endif /* HW_MISC_BCM2835_V3D_H */

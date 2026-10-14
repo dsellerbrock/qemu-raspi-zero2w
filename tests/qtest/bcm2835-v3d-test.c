@@ -441,6 +441,9 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     };
     uint8_t render_cl[32];
     uint8_t bin_cl[64];
+    uint8_t draw_cl[32];
+    uint8_t tile_head[6];
+    uint8_t tile_list[23];
     uint8_t record[44] = { 0 };
     uint8_t code[13 * sizeof(uint64_t)];
     uint8_t vertices[sizeof(screen_xy)];
@@ -448,6 +451,7 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     uint8_t fb[FB_SIZE];
     size_t render_size = 0;
     size_t bin_size = 0;
+    size_t draw_size = 0;
     uint32_t draw_color = 0xff00ff00;
     uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8) | 8;
     uint32_t setup_read = (1U << 20) | (1U << 11) | (2U << 8);
@@ -518,6 +522,43 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
 
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR, ==, 0);
+    memread(FB_ADDR, fb, sizeof(fb));
+    g_assert_cmphex(read_u32(fb + (30 * 64 + 32) * sizeof(uint32_t)),
+                    ==, 0x5a5a5a5a);
+    g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
+                    ==, 0x5a5a5a5a);
+    memread(0x30000, tile_head, sizeof(tile_head));
+    memread(0x30024, tile_list, sizeof(tile_list));
+    g_assert_cmphex(tile_head[0], ==, 17);
+    g_assert_cmphex(read_u32(tile_head + 1), ==, 0x30024);
+    g_assert_cmphex(tile_list[0], ==, 56);
+    g_assert_cmphex(tile_list[1], ==, 0x32);
+    g_assert_cmphex(tile_list[7], ==, 48);
+    g_assert_cmphex(tile_list[8], ==, 129);
+    for (unsigned i = 0; i < G_N_ELEMENTS(screen_xy); i++) {
+        g_assert_cmphex(read_u32(tile_list + 9 + i * sizeof(uint32_t)),
+                        ==, screen_xy[i]);
+    }
+    g_assert_cmphex(tile_list[21], ==, 128);
+    g_assert_cmphex(tile_list[22], ==, 18);
+
+    /* CT1 loads the tile, follows the binner's tile sublist, and stores it. */
+    draw_cl[draw_size++] = 29;
+    append_u48(draw_cl, &draw_size,
+               ((uint64_t)(FB_ADDR >> 4) << 20) | 1);
+    draw_cl[draw_size++] = 115;
+    draw_cl[draw_size++] = 0;
+    draw_cl[draw_size++] = 0;
+    draw_cl[draw_size++] = 17;
+    append_u32(draw_cl, &draw_size, 0x30000);
+    draw_cl[draw_size++] = 28;
+    append_u48(draw_cl, &draw_size,
+               ((uint64_t)(FB_ADDR >> 4) << 20) | 1 | (1ULL << 19));
+    memwrite(CL_ADDR, draw_cl, draw_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + draw_size);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTERR, ==, 0);
+
     memread(FB_ADDR, fb, sizeof(fb));
     g_assert_cmphex(read_u32(fb + (30 * 64 + 32) * sizeof(uint32_t)),
                     ==, draw_color);
@@ -866,11 +907,11 @@ static void test_v3d_ct1_load_store_color_tile(void)
             append_u16(cl, &offset, 64);
             append_u16(cl, &offset, 64);
             append_u16(cl, &offset, 0);
+            append_tile_buffer_packet(cl, &offset, 29, src,
+                                      memory_format, color_format);
             cl[offset++] = 115;
             cl[offset++] = 0;
             cl[offset++] = 0;
-            append_tile_buffer_packet(cl, &offset, 29, src,
-                                      memory_format, color_format);
             append_tile_buffer_packet(cl, &offset, 28, dst,
                                       memory_format, color_format);
 
@@ -890,11 +931,11 @@ static void test_v3d_ct1_load_store_color_tile(void)
             append_u16(cl, &offset, 64);
             append_u16(cl, &offset, (memory_format << 6) |
                        ((color_format == 0 ? 1 : 2) << 2));
+            append_tile_buffer_packet(cl, &offset, 29, src,
+                                      memory_format, color_format);
             cl[offset++] = 115;
             cl[offset++] = 0;
             cl[offset++] = 0;
-            append_tile_buffer_packet(cl, &offset, 29, src,
-                                      memory_format, color_format);
             cl[offset++] = 25;
             memwrite(CL_ADDR, cl, offset);
             writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
@@ -938,10 +979,10 @@ static void test_v3d_ct1_load_store_layout_conversion(void)
         append_u16(cl, &offset, 64);
         append_u16(cl, &offset, (memory_format << 6) |
                    (V3D_FORMAT_RGBA8888 << 2));
+        append_tile_buffer_packet(cl, &offset, 29, src, 0, 0);
         cl[offset++] = 115;
         cl[offset++] = 0;
         cl[offset++] = 0;
-        append_tile_buffer_packet(cl, &offset, 29, src, 0, 0);
         append_tile_buffer_packet(cl, &offset, 28, dst, memory_format, 0);
 
         writel(RASPI3_V3D_BASE + V3D_CT1CS, 1U << 15);
