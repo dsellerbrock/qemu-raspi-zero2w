@@ -394,6 +394,7 @@ qtests = {
   'ast2700-hace-test': files('aspeed-hace-utils.c', 'ast2700-hace-test.c'),
   'ast2700-smc-test': files('aspeed-smc-utils.c', 'ast2700-smc-test.c'),
   'bios-tables-test': [io, 'boot-sector.c', 'acpi-utils.c', 'tpm-emu.c'],
+  'bcm2835-v3d-test': files('../../hw/misc/bcm2835_v3d_qpu.c'),
   'cdrom-test': files('boot-sector.c'),
   'dbus-vmstate-test': files('migration/migration-qmp.c',
                              'migration/migration-util.c') + dbus_vmstate1 +

@@ -5,7 +5,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest-single.h"
+#include "hw/misc/bcm2835_v3d_qpu.h"
 
 #define RASPI3_V3D_BASE 0x3fc00000
 
@@ -41,6 +43,147 @@
 
 static void append_u32(uint8_t *buffer, size_t *offset, uint32_t value);
 static uint32_t read_u32(const uint8_t *buffer);
+
+typedef struct QPUTestUniform {
+    uint32_t expected_address;
+    uint32_t value;
+    unsigned reads;
+} QPUTestUniform;
+
+static bool qpu_test_read_uniform(void *opaque, uint32_t address,
+                                  uint32_t *value)
+{
+    QPUTestUniform *uniform = opaque;
+
+    if (address != uniform->expected_address) {
+        return false;
+    }
+    *value = uniform->value;
+    uniform->reads++;
+    return true;
+}
+
+static uint64_t qpu_test_add_imm(unsigned raddr_a, unsigned waddr_add,
+                                unsigned imm)
+{
+    return (13ULL << 60) | (1ULL << 49) | (uint64_t)waddr_add << 38 |
+           (39ULL << 32) | (12ULL << 24) | (uint64_t)raddr_a << 18 |
+           (uint64_t)imm << 12 | (6ULL << 9) | (7ULL << 6) | 7ULL;
+}
+
+static uint64_t qpu_test_load_imm(unsigned waddr_add, uint32_t value)
+{
+    return (14ULL << 60) | (1ULL << 49) | (uint64_t)waddr_add << 38 |
+           (39ULL << 32) | value;
+}
+
+static uint64_t qpu_test_branch(unsigned cond, bool relative, int32_t offset)
+{
+    return (15ULL << 60) | (uint64_t)cond << 56 |
+           (uint64_t)relative << 55 | (39ULL << 42) | (39ULL << 36) |
+           (uint32_t)offset;
+}
+
+static void qpu_test_store_code(uint8_t code[16], uint64_t instruction)
+{
+    stq_le_p(code, instruction);
+    stq_le_p(code + 8, 3ULL << 60); /* Program End. */
+}
+
+static void test_v3d_qpu_uniform_read(void)
+{
+    uint8_t code[16];
+    BCM2835V3DQPUState qpu;
+    QPUTestUniform uniform = {
+        .expected_address = 0x1000,
+        .value = 0x12345678,
+    };
+    uint32_t executed;
+
+    qpu_test_store_code(code, qpu_test_add_imm(32, 0, 1));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.uniform_address = uniform.expected_address;
+    qpu.read_uniform = qpu_test_read_uniform;
+    qpu.uniform_opaque = &uniform;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(executed, ==, 2);
+    g_assert_cmpuint(uniform.reads, ==, 1);
+    g_assert_cmphex(qpu.uniform_address, ==, 0x1004);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.rf[0][0][lane], ==, uniform.value + 1);
+    }
+}
+
+static void test_v3d_qpu_vpm_vector_io(void)
+{
+    uint8_t code[16];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+
+    qpu_test_store_code(code, qpu_test_add_imm(48, 0, 0));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.vpm_read_setup = true;
+    qpu.vpm_read_address = 2;
+    qpu.vpm_read_stride = 1;
+    qpu.vpm_read_remaining = 1;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.vpm[2][lane] = lane + 0x100;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.rf[0][0][lane], ==, lane + 0x100);
+    }
+    g_assert_cmpuint(qpu.vpm_read_remaining, ==, 0);
+
+    qpu_test_store_code(code, qpu_test_add_imm(0, 48, 0));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.vpm_write_setup = true;
+    qpu.vpm_write_address = 3;
+    qpu.vpm_write_stride = 1;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = lane * 17;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(qpu.vpm_write_address, ==, 4);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.vpm[3][lane], ==, lane * 17);
+    }
+}
+
+static void test_v3d_qpu_branch_delay_slots(void)
+{
+    uint8_t code[7 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+
+    stq_le_p(code, qpu_test_branch(15, true, 8));
+    stq_le_p(code + 8, qpu_test_load_imm(0, 0x11));
+    stq_le_p(code + 16, qpu_test_load_imm(1, 0x22));
+    stq_le_p(code + 24, qpu_test_load_imm(2, 0x33));
+    stq_le_p(code + 32, qpu_test_load_imm(3, 0x44));
+    stq_le_p(code + 40, qpu_test_load_imm(4, 0x55));
+    stq_le_p(code + 48, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 16, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(executed, ==, 6);
+    g_assert_cmphex(qpu.rf[0][0][0], ==, 0x11);
+    g_assert_cmphex(qpu.rf[0][1][0], ==, 0x22);
+    g_assert_cmphex(qpu.rf[0][2][0], ==, 0x33);
+    g_assert_cmphex(qpu.rf[0][3][0], ==, 0);
+    g_assert_cmphex(qpu.rf[0][4][0], ==, 0x55);
+}
 
 static void test_v3d_identity_and_scratch(void)
 {
@@ -699,6 +842,12 @@ int main(int argc, char **argv)
     int ret;
 
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/bcm2835/v3d/qpu_uniform_read",
+                   test_v3d_qpu_uniform_read);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
+                   test_v3d_qpu_vpm_vector_io);
+    qtest_add_func("/bcm2835/v3d/qpu_branch_delay_slots",
+                   test_v3d_qpu_branch_delay_slots);
     qtest_add_func("/bcm2835/v3d/identity_and_scratch",
                    test_v3d_identity_and_scratch);
     qtest_add_func("/bcm2835/v3d/irq_masks", test_v3d_irq_masks);

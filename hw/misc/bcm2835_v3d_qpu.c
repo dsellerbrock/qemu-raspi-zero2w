@@ -31,6 +31,13 @@
 #define QPU_ADD_B_SHIFT     6
 #define QPU_MUL_A_SHIFT     3
 #define QPU_MUL_B_SHIFT     0
+#define QPU_BRANCH_COND_SHIFT 56
+#define QPU_BRANCH_REL_SHIFT 55
+#define QPU_BRANCH_REG_SHIFT 54
+#define QPU_BRANCH_RADDR_A_SHIFT 49
+#define QPU_BRANCH_WS_SHIFT 48
+#define QPU_BRANCH_WADDR_ADD_SHIFT 42
+#define QPU_BRANCH_WADDR_MUL_SHIFT 36
 
 #define QPU_SIG_NONE        1
 #define QPU_SIG_PROG_END    3
@@ -81,6 +88,10 @@
 #define QPU_W_ACC0          32
 #define QPU_W_NOP           39
 #define QPU_R_NOP           39
+#define QPU_R_UNIFORM       32
+#define QPU_R_VPM           48
+#define QPU_W_VPM           48
+#define QPU_W_VPM_SETUP     49
 
 static uint32_t qpu_float_bits(float value)
 {
@@ -125,6 +136,40 @@ static bool qpu_condition(BCM2835V3DQPUState *qpu, unsigned cond,
     }
 }
 
+static bool qpu_branch_condition(BCM2835V3DQPUState *qpu, unsigned cond)
+{
+    switch (cond) {
+    case 0:
+        return qpu->z == UINT16_MAX;
+    case 1:
+        return qpu->z == 0;
+    case 2:
+        return qpu->z != 0;
+    case 3:
+        return qpu->z != UINT16_MAX;
+    case 4:
+        return qpu->n == UINT16_MAX;
+    case 5:
+        return qpu->n == 0;
+    case 6:
+        return qpu->n != 0;
+    case 7:
+        return qpu->n != UINT16_MAX;
+    case 8:
+        return qpu->c == UINT16_MAX;
+    case 9:
+        return qpu->c == 0;
+    case 10:
+        return qpu->c != 0;
+    case 11:
+        return qpu->c != UINT16_MAX;
+    case 15:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint32_t qpu_small_immediate(unsigned imm)
 {
     if (imm < 16) {
@@ -139,24 +184,82 @@ static uint32_t qpu_small_immediate(unsigned imm)
     return qpu_float_bits(1.0f / (float)(1U << (48 - imm)));
 }
 
+static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
+                              unsigned address,
+                              uint32_t value[BCM2835_V3D_QPU_LANES])
+{
+    if (address < 32) {
+        memcpy(value, qpu->rf[regfile_b][address], sizeof(qpu->rf[0][0]));
+        return true;
+    }
+
+    if (address == QPU_R_UNIFORM) {
+        uint32_t uniform;
+
+        if (!qpu->read_uniform ||
+            !qpu->read_uniform(qpu->uniform_opaque,
+                               qpu->uniform_address, &uniform) ||
+            qpu->uniform_address > UINT32_MAX - sizeof(uint32_t)) {
+            qpu->io_fault = true;
+            return false;
+        }
+        qpu->uniform_address += sizeof(uint32_t);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            value[lane] = uniform;
+        }
+        return true;
+    }
+    if (address == 40) {
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            value[lane] = qpu->uniform_address;
+        }
+        return true;
+    }
+
+    if (address == QPU_R_VPM) {
+        if (!qpu->vpm_read_setup || !qpu->vpm_read_remaining) {
+            qpu->io_fault = true;
+            return false;
+        }
+        memcpy(value, qpu->vpm[qpu->vpm_read_address],
+               sizeof(qpu->vpm[0]));
+        qpu->vpm_read_address = (qpu->vpm_read_address +
+                                 qpu->vpm_read_stride) &
+                                (BCM2835_V3D_QPU_VPM_ROWS - 1);
+        qpu->vpm_read_remaining--;
+        return true;
+    }
+
+    if (address == QPU_R_NOP) {
+        memset(value, 0, sizeof(qpu->vpm[0]));
+        return true;
+    }
+
+    if (address < G_N_ELEMENTS(qpu->io)) {
+        memcpy(value, qpu->io[address], sizeof(qpu->io[0]));
+        return true;
+    }
+
+    qpu->io_fault = true;
+    return false;
+}
+
 static uint32_t qpu_read_mux(BCM2835V3DQPUState *qpu, unsigned mux,
-                             unsigned lane, unsigned raddr_a,
-                             unsigned raddr_b, bool small_imm,
+                             unsigned lane, const uint32_t reg_a[16],
+                             const uint32_t reg_b[16], bool small_imm,
                              unsigned imm)
 {
     if (mux <= QPU_MUX_R5) {
         return qpu->acc[mux][lane];
     }
-    if (mux == QPU_MUX_A && raddr_a < 32) {
-        return qpu->rf[0][raddr_a][lane];
+    if (mux == QPU_MUX_A) {
+        return reg_a[lane];
     }
     if (mux == QPU_MUX_B) {
         if (small_imm) {
             return qpu_small_immediate(imm);
         }
-        if (raddr_b < 32) {
-            return qpu->rf[1][raddr_b][lane];
-        }
+        return reg_b[lane];
     }
     return 0;
 }
@@ -168,10 +271,10 @@ static bool qpu_mux_supported(unsigned mux, unsigned raddr, bool small_imm,
         return true;
     }
     if (mux == QPU_MUX_A) {
-        return raddr < 32 || raddr == QPU_R_NOP;
+        return raddr < 64;
     }
     if (mux == QPU_MUX_B) {
-        return (small_imm && regfile_b) || raddr < 32 || raddr == QPU_R_NOP;
+        return (small_imm && regfile_b) || raddr < 64;
     }
     return false;
 }
@@ -295,7 +398,57 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
         qpu->acc[waddr - QPU_W_ACC0][lane] = value;
         return true;
     }
-    return waddr == QPU_W_NOP;
+    if (waddr == QPU_W_VPM) {
+        qpu->vpm_write_pending[lane] = value;
+        return true;
+    }
+    if (waddr == QPU_W_VPM_SETUP) {
+        unsigned size;
+        unsigned stride;
+        unsigned address;
+
+        if (lane != 0 || (value >> 30) != 0 ||
+            !(value & (1U << 11))) {
+            qpu->io_fault = true;
+            return false;
+        }
+        size = (value >> 8) & 3;
+        stride = (value >> 12) & 0x3f;
+        address = value & 0x3f;
+        if (size != 2) {
+            qpu->io_fault = true;
+            return false;
+        }
+        stride = stride ? stride : 64;
+        if (regfile ^ ws) {
+            qpu->vpm_write_address = address;
+            qpu->vpm_write_stride = stride;
+            qpu->vpm_write_setup = true;
+        } else {
+            qpu->vpm_read_address = address;
+            qpu->vpm_read_stride = stride;
+            qpu->vpm_read_remaining = (value >> 20) & 0xf;
+            if (!qpu->vpm_read_remaining) {
+                qpu->vpm_read_remaining = BCM2835_V3D_QPU_LANES;
+            }
+            qpu->vpm_read_setup = true;
+        }
+        return true;
+    }
+    if (waddr == QPU_W_NOP) {
+        return true;
+    }
+    if (waddr == 40) {
+        if (lane == 0) {
+            qpu->uniform_address = value;
+        }
+        return true;
+    }
+    if (waddr >= 38 && waddr < 64) {
+        qpu->io[waddr][lane] = value;
+        return true;
+    }
+    return false;
 }
 
 void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
@@ -304,9 +457,9 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 }
 
 /*
- * This first execution slice covers the scalar/vector ALUs only.
- * shortcut: no RF pipeline delay or special-register I/O, add both before
- * wiring this core into VPM-fed vertex execution.
+ * This bounded slice covers part of the QPU ALUs, branches, uniforms, and
+ * horizontal 32-bit VPM access. shortcut: no register-file timing, packed or
+ * vertical VPM, TMU, or SFU; add each as guest shader coverage requires it.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -318,6 +471,9 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         return BCM2835_V3D_QPU_CODE_FAULT;
     }
     *executed = 0;
+    bool branch_pending = false;
+    uint32_t branch_target = 0;
+    unsigned branch_delay = 0;
     while (*executed < instruction_budget) {
         uint64_t inst;
         unsigned sig;
@@ -340,7 +496,12 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         uint32_t imm;
         uint32_t add_result[BCM2835_V3D_QPU_LANES];
         uint32_t mul_result[BCM2835_V3D_QPU_LANES];
+        uint32_t reg_a[BCM2835_V3D_QPU_LANES] = { 0 };
+        uint32_t reg_b[BCM2835_V3D_QPU_LANES] = { 0 };
         bool carry[BCM2835_V3D_QPU_LANES];
+        bool reads_a;
+        bool reads_b;
+        bool writes_vpm;
         uint16_t active_add = 0;
         uint16_t active_mul = 0;
 
@@ -352,6 +513,61 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         (*executed)++;
         end = QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf) == QPU_SIG_PROG_END;
         sig = QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf);
+        if (sig == 15) {
+            unsigned branch_cond = QPU_FIELD(inst,
+                                              QPU_BRANCH_COND_SHIFT, 0xf);
+            bool relative = inst & (1ULL << QPU_BRANCH_REL_SHIFT);
+            bool use_reg = inst & (1ULL << QPU_BRANCH_REG_SHIFT);
+            unsigned branch_raddr = QPU_FIELD(
+                inst, QPU_BRANCH_RADDR_A_SHIFT, 0x1f);
+            bool branch_ws = inst & (1ULL << QPU_BRANCH_WS_SHIFT);
+            unsigned branch_waddr_add = QPU_FIELD(
+                inst, QPU_BRANCH_WADDR_ADD_SHIFT, 0x3f);
+            unsigned branch_waddr_mul = QPU_FIELD(
+                inst, QPU_BRANCH_WADDR_MUL_SHIFT, 0x3f);
+            int64_t target = (int32_t)(uint32_t)inst;
+            uint32_t link = (qpu->pc + 4) * sizeof(uint64_t);
+            bool taken;
+
+            if (branch_pending ||
+                (branch_cond > 11 && branch_cond != 15) ||
+                (branch_waddr_add >= 38 && branch_waddr_add != QPU_W_NOP) ||
+                (branch_waddr_mul >= 38 && branch_waddr_mul != QPU_W_NOP) ||
+                (branch_waddr_add == branch_waddr_mul &&
+                 branch_waddr_add >= QPU_W_ACC0 &&
+                 branch_waddr_add < QPU_W_ACC0 + 6)) {
+                return BCM2835_V3D_QPU_UNSUPPORTED;
+            }
+            if (relative) {
+                target += (int64_t)(qpu->pc + 4) * sizeof(uint64_t);
+            }
+            if (use_reg) {
+                target += qpu->rf[0][branch_raddr][0];
+            }
+            taken = qpu_branch_condition(qpu, branch_cond);
+            if (taken && (target < 0 || target > UINT32_MAX ||
+                          (target & (sizeof(uint64_t) - 1)))) {
+                return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                if (!qpu_write(qpu, branch_waddr_add, false, branch_ws,
+                               lane, link) ||
+                    !qpu_write(qpu, branch_waddr_mul, true, branch_ws,
+                               lane, link)) {
+                    return BCM2835_V3D_QPU_UNSUPPORTED;
+                }
+            }
+            if (qpu->io_fault) {
+                return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+            qpu->pc++;
+            if (taken) {
+                branch_pending = true;
+                branch_target = target / sizeof(uint64_t);
+                branch_delay = 3;
+            }
+            continue;
+        }
         if (sig != QPU_SIG_NONE && sig != QPU_SIG_PROG_END &&
             sig != QPU_SIG_SMALL_IMM && sig != QPU_SIG_LOAD_IMM) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
@@ -382,6 +598,17 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         if (sig == QPU_SIG_SMALL_IMM && imm >= 48) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
+        reads_a = sig != QPU_SIG_LOAD_IMM &&
+                  (add_a == QPU_MUX_A || mul_a == QPU_MUX_A);
+        reads_b = sig != QPU_SIG_LOAD_IMM && !small_imm &&
+                  (add_b == QPU_MUX_B || mul_b == QPU_MUX_B);
+        if ((reads_a && !qpu_read_register(qpu, false, raddr_a, reg_a)) ||
+            (reads_b && !qpu_read_register(qpu, true, raddr_b, reg_b))) {
+            return BCM2835_V3D_QPU_CODE_FAULT;
+        }
+        if (qpu->io_fault) {
+            return BCM2835_V3D_QPU_CODE_FAULT;
+        }
         if (sig == QPU_SIG_LOAD_IMM) {
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
                 uint16_t bit = 1U << lane;
@@ -404,14 +631,14 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                 return BCM2835_V3D_QPU_UNSUPPORTED;
             }
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
-                uint32_t aa = qpu_read_mux(qpu, add_a, lane, raddr_a,
-                                           raddr_b, small_imm, imm);
-                uint32_t ab = qpu_read_mux(qpu, add_b, lane, raddr_a,
-                                           raddr_b, small_imm, imm);
-                uint32_t ma = qpu_read_mux(qpu, mul_a, lane, raddr_a,
-                                           raddr_b, small_imm, imm);
-                uint32_t mb = qpu_read_mux(qpu, mul_b, lane, raddr_a,
-                                           raddr_b, small_imm, imm);
+                uint32_t aa = qpu_read_mux(qpu, add_a, lane, reg_a,
+                                           reg_b, small_imm, imm);
+                uint32_t ab = qpu_read_mux(qpu, add_b, lane, reg_a,
+                                           reg_b, small_imm, imm);
+                uint32_t ma = qpu_read_mux(qpu, mul_a, lane, reg_a,
+                                           reg_b, small_imm, imm);
+                uint32_t mb = qpu_read_mux(qpu, mul_b, lane, reg_a,
+                                           reg_b, small_imm, imm);
                 uint16_t bit = 1U << lane;
 
                 if (!qpu_execute_add(op_add, aa, ab, &add_result[lane],
@@ -433,6 +660,22 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             (active_add & active_mul)) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
+        if (waddr_add == QPU_W_VPM && waddr_mul == QPU_W_VPM &&
+            (active_add & active_mul)) {
+            return BCM2835_V3D_QPU_UNSUPPORTED;
+        }
+
+        writes_vpm = (waddr_add == QPU_W_VPM && active_add) ||
+                     (waddr_mul == QPU_W_VPM && active_mul);
+        if (writes_vpm) {
+            if (!qpu->vpm_write_setup ||
+                qpu->vpm_write_address >= BCM2835_V3D_QPU_VPM_ROWS) {
+                return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+            memcpy(qpu->vpm_write_pending,
+                   qpu->vpm[qpu->vpm_write_address],
+                   sizeof(qpu->vpm_write_pending));
+        }
 
         for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
             uint16_t bit = 1U << lane;
@@ -445,6 +688,17 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                             mul_result[lane]))) {
                 return BCM2835_V3D_QPU_UNSUPPORTED;
             }
+        }
+        if (qpu->io_fault) {
+            return BCM2835_V3D_QPU_CODE_FAULT;
+        }
+        if (writes_vpm) {
+            memcpy(qpu->vpm[qpu->vpm_write_address],
+                   qpu->vpm_write_pending,
+                   sizeof(qpu->vpm_write_pending));
+            qpu->vpm_write_address = (qpu->vpm_write_address +
+                                      qpu->vpm_write_stride) &
+                                     (BCM2835_V3D_QPU_VPM_ROWS - 1);
         }
 
         if (set_flags) {
@@ -462,6 +716,10 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             }
         }
         qpu->pc++;
+        if (branch_pending && !--branch_delay) {
+            qpu->pc = branch_target;
+            branch_pending = false;
+        }
         if (end) {
             return BCM2835_V3D_QPU_END;
         }

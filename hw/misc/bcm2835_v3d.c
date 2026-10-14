@@ -9,6 +9,7 @@
 #include "qapi/error.h"
 #include "hw/core/irq.h"
 #include "hw/misc/bcm2835_v3d.h"
+#include "bcm2835_v3d_qpu.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -75,6 +76,9 @@
 
 #define V3D_MAX_CL_COMMANDS    (1U << 16)
 #define V3D_MAX_PRIMITIVE_INDICES (1U << 20)
+#define V3D_MAX_SHADER_VERTICES 4096
+#define V3D_MAX_QPU_INSTRUCTIONS 4096
+#define V3D_QPU_INSTRUCTION_BUDGET (1U << 16)
 #define V3D_TILE_SIZE          64
 #define V3D_T_MEMORY_TILE_SIZE 32
 #define V3D_UTILE_PIXELS       16
@@ -612,6 +616,203 @@ static bool bcm2835_v3d_validate_draw(BCM2835V3DState *s,
     return bcm2835_v3d_validate_vertex_arrays(s, max_index);
 }
 
+static bool bcm2835_v3d_qpu_read_uniform(void *opaque, uint32_t address,
+                                          uint32_t *value)
+{
+    BCM2835V3DState *s = opaque;
+    uint8_t bytes[sizeof(uint32_t)];
+
+    if ((uint64_t)address + sizeof(bytes) > UINT32_MAX + 1ULL ||
+        !bcm2835_v3d_dma_read(s, address, bytes, sizeof(bytes))) {
+        return false;
+    }
+    *value = ldl_le_p(bytes);
+    return true;
+}
+
+static bool bcm2835_v3d_load_qpu_program(BCM2835V3DState *s,
+                                         uint32_t address,
+                                         uint8_t **code, uint32_t *code_size)
+{
+    uint8_t *program = g_malloc(V3D_MAX_QPU_INSTRUCTIONS * sizeof(uint64_t));
+
+    address &= ~7U;
+    for (uint32_t i = 0; i < V3D_MAX_QPU_INSTRUCTIONS; i++) {
+        uint8_t *instruction = program + i * sizeof(uint64_t);
+        uint64_t guest_address = (uint64_t)address +
+                                (uint64_t)i * sizeof(uint64_t);
+
+        if (guest_address + sizeof(uint64_t) > UINT32_MAX + 1ULL ||
+            !bcm2835_v3d_dma_read(s, guest_address, instruction,
+                                   sizeof(uint64_t))) {
+            g_free(program);
+            return false;
+        }
+        if ((ldq_le_p(instruction) >> 60) == 3) {
+            *code = program;
+            *code_size = (i + 1) * sizeof(uint64_t);
+            return true;
+        }
+    }
+
+    g_free(program);
+    return false;
+}
+
+static bool bcm2835_v3d_load_qpu_attributes(BCM2835V3DState *s,
+                                            BCM2835V3DQPUState *qpu,
+                                            const uint32_t *indices,
+                                            unsigned count, unsigned first,
+                                            uint8_t selected,
+                                            unsigned vpm_offset_byte)
+{
+    for (unsigned attr = 0; attr < s->shader_attribute_count; attr++) {
+        uint32_t record_offset = 36 + attr * 8;
+        uint32_t base;
+        uint32_t stride;
+        unsigned attr_size;
+        unsigned vpm_offset;
+
+        if (!(selected & (1U << attr))) {
+            continue;
+        }
+        base = ldl_le_p(s->shader_record + record_offset);
+        attr_size = s->shader_record[record_offset + 4] + 1;
+        stride = s->shader_record[record_offset + 5];
+        if (s->shader_record_extended) {
+            stride |= ldl_le_p(s->shader_record + 100 + attr * 4) & ~0xffU;
+        }
+        vpm_offset = s->shader_record[record_offset + vpm_offset_byte];
+        if ((attr_size & 3) || attr_size > 64 || (vpm_offset & 3) ||
+            vpm_offset + attr_size > BCM2835_V3D_QPU_VPM_ROWS * 4) {
+            return false;
+        }
+
+        for (unsigned component = 0; component < attr_size / 4; component++) {
+            unsigned row = vpm_offset / 4 + component;
+
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                uint8_t value[sizeof(uint32_t)] = { 0 };
+                uint64_t address;
+
+                if (first + lane >= count) {
+                    qpu->vpm[row][lane] = 0;
+                    continue;
+                }
+                address = (uint64_t)base +
+                          (uint64_t)indices[first + lane] * stride +
+                          component * sizeof(uint32_t);
+                if (address + sizeof(value) > UINT32_MAX + 1ULL ||
+                    !bcm2835_v3d_dma_read(s, address, value, sizeof(value))) {
+                    return false;
+                }
+                qpu->vpm[row][lane] = ldl_le_p(value);
+            }
+        }
+    }
+    return true;
+}
+
+static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
+                                       const uint32_t *indices,
+                                       unsigned count, unsigned code_offset,
+                                       unsigned uniforms_offset,
+                                       unsigned attributes_offset,
+                                       unsigned vpm_offset_byte)
+{
+    uint32_t code_address = ldl_le_p(s->shader_record + code_offset) & ~7U;
+    uint32_t uniforms_address = ldl_le_p(s->shader_record + uniforms_offset);
+    uint8_t *code;
+    uint32_t code_size;
+
+    if (!code_address) {
+        return true;
+    }
+    if (count > V3D_MAX_SHADER_VERTICES) {
+        return false;
+    }
+    if (!bcm2835_v3d_load_qpu_program(s, code_address, &code, &code_size)) {
+        return false;
+    }
+
+    for (unsigned first = 0; first < count;
+         first += BCM2835_V3D_QPU_LANES) {
+        BCM2835V3DQPUState qpu;
+        uint32_t executed;
+        BCM2835V3DQPUResult result;
+
+        bcm2835_v3d_qpu_init(&qpu);
+        qpu.uniform_address = uniforms_address;
+        qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
+        qpu.uniform_opaque = s;
+        if (!bcm2835_v3d_load_qpu_attributes(
+                s, &qpu, indices, count, first,
+                s->shader_record[attributes_offset], vpm_offset_byte)) {
+            g_free(code);
+            return false;
+        }
+        result = bcm2835_v3d_qpu_run(code, code_size,
+                                      V3D_QPU_INSTRUCTION_BUDGET, &qpu,
+                                      &executed);
+        if (result != BCM2835_V3D_QPU_END) {
+            g_free(code);
+            return false;
+        }
+    }
+    g_free(code);
+    return true;
+}
+
+static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
+                                                   const uint8_t *packet,
+                                                   uint8_t opcode)
+{
+    uint32_t count = ldl_le_p(packet + 2);
+    uint32_t *indices;
+    bool success;
+
+    if (!count) {
+        return true;
+    }
+    if (count > V3D_MAX_SHADER_VERTICES) {
+        return false;
+    }
+    indices = g_new(uint32_t, count);
+    if (opcode == V3D_PACKET_ARRAY_PRIM) {
+        uint32_t first = ldl_le_p(packet + 6);
+
+        for (uint32_t i = 0; i < count; i++) {
+            indices[i] = first + i;
+        }
+    } else {
+        unsigned index_size = (packet[1] >> 4) + 1;
+        uint32_t address = ldl_le_p(packet + 6);
+        uint8_t indices_bytes[512];
+
+        for (uint32_t first = 0; first < count;) {
+            uint32_t batch = MIN(count - first,
+                                 sizeof(indices_bytes) / index_size);
+            size_t bytes = batch * index_size;
+
+            if (!bcm2835_v3d_dma_read(s, address + first * index_size,
+                                      indices_bytes, bytes)) {
+                g_free(indices);
+                return false;
+            }
+            for (uint32_t i = 0; i < batch; i++) {
+                indices[first + i] = index_size == 1 ? indices_bytes[i] :
+                    lduw_le_p(indices_bytes + i * index_size);
+            }
+            first += batch;
+        }
+    }
+
+    /* CT0 runs the coordinate transform used by the tile binner. */
+    success = bcm2835_v3d_run_qpu_stage(s, indices, count, 28, 32, 26, 7);
+    g_free(indices);
+    return success;
+}
+
 static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 {
     uint32_t *ca = &s->ct_ca[thread];
@@ -844,8 +1045,13 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                                          "invalid primitive or vertex input");
                 return;
             }
+            if (!bcm2835_v3d_execute_coordinate_shader(s, packet, opcode)) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "unsupported QPU coordinate shader or input format");
+                return;
+            }
             bcm2835_v3d_thread_error(s, thread, *ca,
-                                     "QPU shader execution and rasterization are not implemented");
+                                     "coordinate QPU completed; PTB clipping, binning, and rasterization are not implemented");
             return;
         case V3D_PACKET_COMPRESSED:
         case V3D_PACKET_CLIPPED:
