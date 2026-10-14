@@ -23,6 +23,7 @@
 #include "hw/misc/bcm2835_rng.h"
 #include "hw/misc/bcm2835_mbox.h"
 #include "hw/misc/bcm2835_mphi.h"
+#include "hw/misc/bcm2835_v3d.h"
 #include "hw/misc/bcm2835_thermal.h"
 #include "hw/misc/bcm2835_cprman.h"
 #include "hw/misc/bcm2835_powermgt.h"
@@ -77,7 +78,9 @@ struct BCMSocPeripheralBaseState {
     BCM2835OTPState otp;
     UnimplementedDeviceState dbus;
     UnimplementedDeviceState ave0;
-    UnimplementedDeviceState v3d;
+    UnimplementedDeviceState hvs;
+    UnimplementedDeviceState pixv[3];
+    BCM2835V3DState v3d;
     UnimplementedDeviceState bscsl;
     UnimplementedDeviceState smi;
     DWC2State dwc2;

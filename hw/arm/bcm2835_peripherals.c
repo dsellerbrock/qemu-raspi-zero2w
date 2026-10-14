@@ -163,6 +163,9 @@ static void raspi_peripherals_base_init(Object *obj)
     object_initialize_child(obj, "powermgt", &s->powermgt,
                             TYPE_BCM2835_POWERMGT);
 
+    /* VideoCore IV 3D engine */
+    object_initialize_child(obj, "v3d", &s->v3d, TYPE_BCM2835_V3D);
+
     /* SPI */
     object_initialize_child(obj, "bcm2835-spi0", &s->spi[0],
                             TYPE_BCM2835_SPI);
@@ -532,7 +535,24 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
     create_unimp(s, &s->bscsl, "bcm2835-spis", BSC_SL_OFFSET, 0x100);
     create_unimp(s, &s->dbus, "bcm2835-dbus", DBUS_OFFSET, 0x8000);
     create_unimp(s, &s->ave0, "bcm2835-ave0", AVE0_OFFSET, 0x8000);
-    create_unimp(s, &s->v3d, "bcm2835-v3d", V3D_OFFSET, 0x1000);
+    /* Keep unsupported VC4 display blocks mapped so Linux fails cleanly
+     * instead of taking an external abort while probing the DRM master.
+    */
+    create_unimp(s, &s->hvs, "bcm2835-hvs", HVS_OFFSET, 0x6000);
+    create_unimp(s, &s->pixv[0], "bcm2835-pixelvalve0",
+                 PIXV0_OFFSET, 0x100);
+    create_unimp(s, &s->pixv[1], "bcm2835-pixelvalve1",
+                 PIXV1_OFFSET, 0x100);
+    create_unimp(s, &s->pixv[2], "bcm2835-pixelvalve2",
+                 PIXV2_OFFSET, 0x100);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->v3d), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_mr, V3D_OFFSET,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->v3d), 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->v3d), 0,
+        qdev_get_gpio_in_named(DEVICE(&s->ic), BCM2835_IC_GPU_IRQ,
+                               INTERRUPT_3D));
     create_unimp(s, &s->sdramc, "bcm2835-sdramc", SDRAMC_OFFSET, 0x100);
 }
 
