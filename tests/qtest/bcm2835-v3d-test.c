@@ -17,6 +17,7 @@
 #define V3D_INTENA  0x034
 #define V3D_INTDIS  0x038
 #define V3D_CT0CS   0x100
+#define V3D_RFC     0x138
 #define V3D_CT0EA   0x108
 #define V3D_CT0CA   0x110
 #define V3D_BFC     0x134
@@ -261,6 +262,38 @@ static size_t make_clear_list(uint8_t *buffer, uint32_t target,
     buffer[offset++] = 25;
 
     return offset;
+}
+
+static void test_v3d_ct1_frame_done_requires_eof(void)
+{
+    uint8_t cl[64];
+    uint8_t fb[32 * 32 * sizeof(uint32_t)];
+    size_t cl_size = make_clear_list(cl, FB_ADDR, 32, 32, 0,
+                                    V3D_FORMAT_RGBA8888, 0, 0,
+                                    0xff123456);
+
+    writel(RASPI3_V3D_BASE + V3D_RFC, 1);
+    writel(RASPI3_V3D_BASE + V3D_INTCTL, V3D_FRDONE);
+    cl[cl_size - 1] = 24; /* Store the tile without ending the frame. */
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_RFC), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_FRDONE,
+                    ==, 0);
+
+    cl[cl_size - 1] = 25;
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_INTCTL, V3D_FRDONE);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_RFC), ==, 1);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_FRDONE,
+                    ==, V3D_FRDONE);
+    memread(FB_ADDR, fb, sizeof(fb));
+    g_assert_cmphex(read_u32(fb), ==, 0xff123456);
 }
 
 static void submit_clear(unsigned memory_format, uint8_t tile_x,
@@ -575,6 +608,8 @@ int main(int argc, char **argv)
                    test_v3d_ct1_clear_lt_tiled_bgr565);
     qtest_add_func("/bcm2835/v3d/ct1_load_store_color_tile",
                    test_v3d_ct1_load_store_color_tile);
+    qtest_add_func("/bcm2835/v3d/ct1_frame_done_requires_eof",
+                   test_v3d_ct1_frame_done_requires_eof);
     qtest_start("-machine raspi3ap -smp 4");
     ret = g_test_run();
     qtest_end();

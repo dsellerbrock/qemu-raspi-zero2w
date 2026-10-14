@@ -794,6 +794,10 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                                          "unsupported render target or DMA write failed");
                 return;
             }
+            if (opcode == V3D_PACKET_STORE_MS_EOF) {
+                s->regs[V3D_RFC >> 2]++;
+                bcm2835_v3d_raise_irq(s, V3D_INT_FRDONE);
+            }
             break;
         case V3D_PACKET_INDEX_PRIM:
         case V3D_PACKET_ARRAY_PRIM:
@@ -809,10 +813,6 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 
     s->ct_cs[thread] &= ~(V3D_CS_CTRUN | V3D_CS_CTSUBS);
     s->ct_waiting[thread] = false;
-    if (thread == 1) {
-        s->regs[V3D_RFC >> 2]++;
-        bcm2835_v3d_raise_irq(s, V3D_INT_FRDONE);
-    }
 }
 
 static uint32_t bcm2835_v3d_read_thread_reg(BCM2835V3DState *s,
