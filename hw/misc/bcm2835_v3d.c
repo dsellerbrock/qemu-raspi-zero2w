@@ -62,6 +62,7 @@
 #define V3D_PACKET_STORE_TILE  28
 #define V3D_PACKET_ARRAY_PRIM  33
 #define V3D_PACKET_INDEX_PRIM  32
+#define V3D_PACKET_GL_SHADER_STATE 64
 #define V3D_PACKET_COMPRESSED  48
 #define V3D_PACKET_CLIPPED     49
 #define V3D_PACKET_BIN_CONFIG  112
@@ -93,7 +94,7 @@ static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
     case 26: /* Store Full Resolution Tile Buffer */
     case 27: /* Load Full Resolution Tile Buffer */
     case V3D_PACKET_INDEX_PRIM:
-    case 64: /* GL Shader State */
+    case V3D_PACKET_GL_SHADER_STATE:
     case 65: /* NV Shader State */
     case 66: /* VG Shader State */
     case 97: /* Flat Shade Flags */
@@ -365,6 +366,13 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             return;
         case V3D_PACKET_START_BIN:
             if (thread == 0) {
+                if (!s->bin_config_valid) {
+                    bcm2835_v3d_thread_error(s, thread, *ca,
+                                             "tile binning started without configuration");
+                    return;
+                }
+                s->binning_started = true;
+                s->shader_state_valid = false;
                 s->ct_cs[thread] &= ~V3D_CS_CTMODE;
             }
             break;
@@ -414,6 +422,44 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                                       s->ct_return_depth[thread] - 1] : 0;
             }
             break;
+        case V3D_PACKET_BIN_CONFIG: {
+            uint32_t alloc_base = ldl_le_p(packet + 1);
+            uint32_t alloc_size = ldl_le_p(packet + 5);
+            uint32_t state_base = ldl_le_p(packet + 9);
+            uint8_t tiles_x = packet[13];
+            uint8_t tiles_y = packet[14];
+            uint64_t alloc_end = (uint64_t)alloc_base + alloc_size;
+            uint64_t state_size = (uint64_t)tiles_x * tiles_y * 48;
+            uint64_t state_end = (uint64_t)state_base + state_size;
+
+            if (thread != 0 || !tiles_x || !tiles_y || !alloc_size ||
+                alloc_end > UINT32_MAX + 1ULL ||
+                state_end > UINT32_MAX + 1ULL) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "invalid tile binning configuration");
+                return;
+            }
+
+            s->bin_alloc_base = alloc_base;
+            s->bin_alloc_size = alloc_size;
+            s->bin_state_base = state_base;
+            s->bin_tiles_x = tiles_x;
+            s->bin_tiles_y = tiles_y;
+            s->bin_flags = packet[15];
+            s->bin_config_valid = true;
+            s->binning_started = false;
+            s->shader_state_valid = false;
+            break;
+        }
+        case V3D_PACKET_GL_SHADER_STATE:
+            if (thread != 0 || !s->binning_started) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "shader state outside tile binning");
+                return;
+            }
+            s->shader_state = ldl_le_p(packet + 1);
+            s->shader_state_valid = true;
+            break;
         case V3D_PACKET_FLUSH:
         case V3D_PACKET_FLUSH_ALL:
             if (thread == 0) {
@@ -449,7 +495,7 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
         case V3D_PACKET_COMPRESSED:
         case V3D_PACKET_CLIPPED:
             bcm2835_v3d_thread_error(s, thread, *ca,
-                                     "triangle and shader execution is not implemented");
+                                     "triangle rasterization and QPU execution are not implemented");
             return;
         default:
             break;
@@ -688,6 +734,16 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->tile_y = 0;
     s->render_config_valid = false;
     s->clear_color_valid = false;
+    s->bin_alloc_base = 0;
+    s->bin_alloc_size = 0;
+    s->bin_state_base = 0;
+    s->bin_tiles_x = 0;
+    s->bin_tiles_y = 0;
+    s->bin_flags = 0;
+    s->bin_config_valid = false;
+    s->binning_started = false;
+    s->shader_state = 0;
+    s->shader_state_valid = false;
     s->irq_status = 0;
     s->irq_enable = 0;
     bcm2835_v3d_update_irq(s);
@@ -714,7 +770,7 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -741,6 +797,16 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_UINT32_ARRAY_V(clear_color, BCM2835V3DState, 2, 2),
         VMSTATE_BOOL_V(render_config_valid, BCM2835V3DState, 2),
         VMSTATE_BOOL_V(clear_color_valid, BCM2835V3DState, 2),
+        VMSTATE_UINT32_V(bin_alloc_base, BCM2835V3DState, 3),
+        VMSTATE_UINT32_V(bin_alloc_size, BCM2835V3DState, 3),
+        VMSTATE_UINT32_V(bin_state_base, BCM2835V3DState, 3),
+        VMSTATE_UINT8_V(bin_tiles_x, BCM2835V3DState, 3),
+        VMSTATE_UINT8_V(bin_tiles_y, BCM2835V3DState, 3),
+        VMSTATE_UINT8_V(bin_flags, BCM2835V3DState, 3),
+        VMSTATE_BOOL_V(bin_config_valid, BCM2835V3DState, 3),
+        VMSTATE_BOOL_V(binning_started, BCM2835V3DState, 3),
+        VMSTATE_UINT32_V(shader_state, BCM2835V3DState, 3),
+        VMSTATE_BOOL_V(shader_state_valid, BCM2835V3DState, 3),
         VMSTATE_END_OF_LIST()
     },
 };

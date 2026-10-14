@@ -49,6 +49,17 @@ struct BCM2835V3DState {
     uint32_t clear_color[2];
     bool render_config_valid;
     bool clear_color_valid;
+
+    uint32_t bin_alloc_base;
+    uint32_t bin_alloc_size;
+    uint32_t bin_state_base;
+    uint8_t bin_tiles_x;
+    uint8_t bin_tiles_y;
+    uint8_t bin_flags;
+    bool bin_config_valid;
+    bool binning_started;
+    uint32_t shader_state;
+    bool shader_state_valid;
 };
 
 #endif /* HW_MISC_BCM2835_V3D_H */

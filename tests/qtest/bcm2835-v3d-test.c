@@ -16,11 +16,18 @@
 #define V3D_INTCTL  0x030
 #define V3D_INTENA  0x034
 #define V3D_INTDIS  0x038
+#define V3D_CT0CS   0x100
+#define V3D_CT0EA   0x108
+#define V3D_CT0CA   0x110
+#define V3D_BFC     0x134
 #define V3D_CT1CS   0x104
 #define V3D_CT1EA   0x10c
 #define V3D_CT1CA   0x114
 
 #define V3D_FRDONE  (1U << 0)
+#define V3D_FLDONE  (1U << 1)
+#define V3D_CTERR   (1U << 3)
+#define V3D_CTRUN   (1U << 5)
 #define CL_ADDR     0x10000
 #define FB_ADDR     0x20000
 #define FB_SIZE     (64 * 64 * sizeof(uint32_t))
@@ -30,6 +37,8 @@
 
 #define V3D_EXPECTED_IDENT0 0x02443356
 #define V3D_EXPECTED_IDENT1 0xc0101432
+
+static void append_u32(uint8_t *buffer, size_t *offset, uint32_t value);
 
 static void test_v3d_identity_and_scratch(void)
 {
@@ -57,6 +66,34 @@ static void test_v3d_irq_masks(void)
 
     writel(RASPI3_V3D_BASE + V3D_INTCTL, UINT32_MAX);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL), ==, 0);
+}
+
+static void test_v3d_ct0_binning_setup(void)
+{
+    uint8_t cl[32];
+    size_t cl_size = 0;
+
+    /* TILE_BINNING_MODE_CONFIG, START_TILE_BINNING, and FLUSH. */
+    cl[cl_size++] = 112;
+    append_u32(cl, &cl_size, 0x30000);
+    append_u32(cl, &cl_size, 0x2000);
+    append_u32(cl, &cl_size, 0x32000);
+    cl[cl_size++] = 2;
+    cl[cl_size++] = 2;
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 6;
+    cl[cl_size++] = 4;
+
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_INTCTL, V3D_FLDONE);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + cl_size);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                    (V3D_CTRUN | V3D_CTERR), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BFC), ==, 1);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_FLDONE,
+                    ==, V3D_FLDONE);
 }
 
 static void append_u16(uint8_t *buffer, size_t *offset, uint16_t value)
@@ -324,6 +361,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/v3d/identity_and_scratch",
                    test_v3d_identity_and_scratch);
     qtest_add_func("/bcm2835/v3d/irq_masks", test_v3d_irq_masks);
+    qtest_add_func("/bcm2835/v3d/ct0_binning_setup",
+                   test_v3d_ct0_binning_setup);
     qtest_add_func("/bcm2835/v3d/ct1_clear_linear",
                    test_v3d_ct1_clear_linear);
     qtest_add_func("/bcm2835/v3d/ct1_clear_t_tiled",
