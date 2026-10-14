@@ -407,8 +407,10 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
         unsigned stride;
         unsigned address;
 
-        if (lane != 0 || (value >> 30) != 0 ||
-            !(value & (1U << 11))) {
+        if (lane != 0) {
+            return true;
+        }
+        if ((value >> 30) != 0 || !(value & (1U << 11))) {
             qpu->io_fault = true;
             return false;
         }

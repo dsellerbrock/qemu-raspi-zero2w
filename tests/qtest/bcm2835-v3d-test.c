@@ -159,6 +159,30 @@ static void test_v3d_qpu_vpm_vector_io(void)
     }
 }
 
+static void test_v3d_qpu_vpm_setup_and_write(void)
+{
+    uint8_t code[3 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t setup = (1U << 12) | (1U << 11) | (2U << 8) | 4;
+
+    stq_le_p(code, qpu_test_load_imm(49, setup) | (1ULL << 44));
+    stq_le_p(code + 8, qpu_test_add_imm(0, 48, 0));
+    stq_le_p(code + 16, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = 0x100 + lane;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(qpu.vpm_write_address, ==, 5);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.vpm[4][lane], ==, 0x100 + lane);
+    }
+}
+
 static void test_v3d_qpu_branch_delay_slots(void)
 {
     uint8_t code[7 * sizeof(uint64_t)];
@@ -846,6 +870,8 @@ int main(int argc, char **argv)
                    test_v3d_qpu_uniform_read);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
                    test_v3d_qpu_vpm_vector_io);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_setup_and_write",
+                   test_v3d_qpu_vpm_setup_and_write);
     qtest_add_func("/bcm2835/v3d/qpu_branch_delay_slots",
                    test_v3d_qpu_branch_delay_slots);
     qtest_add_func("/bcm2835/v3d/identity_and_scratch",
