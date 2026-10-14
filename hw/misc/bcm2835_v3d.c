@@ -171,6 +171,7 @@ static void bcm2835_v3d_thread_error(BCM2835V3DState *s, unsigned thread,
 static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
 {
     uint8_t row[V3D_TILE_SIZE * sizeof(uint32_t)];
+    uint8_t utile[64];
     uint32_t x0 = s->tile_x * V3D_TILE_SIZE;
     uint32_t y0 = s->tile_y * V3D_TILE_SIZE;
     uint32_t width = MIN(V3D_TILE_SIZE, s->render_width -
@@ -186,32 +187,105 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
         return true;
     }
 
-    /* shortcut: only linear RGBA8888 clears render; add T/LT and 565 support
-     * when implementing tiled surfaces.
-     */
-    if (memory_format != 0 || format != 1) {
+    if (format != 1 || memory_format > 2) {
         qemu_log_mask(LOG_UNIMP,
                       "bcm2835_v3d: clear skipped for render format %u/%u\n",
                       memory_format, format);
         return false;
     }
 
-    for (unsigned x = 0; x < width; x++) {
-        stl_le_p(row + x * sizeof(uint32_t), color);
+    if (memory_format == 0) {
+        for (unsigned x = 0; x < width; x++) {
+            stl_le_p(row + x * sizeof(uint32_t), color);
+        }
+
+        for (y = 0; y < height; y++) {
+            uint64_t addr = (uint64_t)s->render_base +
+                            ((uint64_t)(y0 + y) * s->render_width + x0) *
+                            sizeof(uint32_t);
+
+            if (addr + width * sizeof(uint32_t) > UINT32_MAX + 1ULL ||
+                dma_memory_write(&s->dma_as, addr, row,
+                                 width * sizeof(uint32_t),
+                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return false;
+            }
+        }
+        return true;
     }
 
-    for (y = 0; y < height; y++) {
-        uint64_t addr = (uint64_t)s->render_base +
-                        ((uint64_t)(y0 + y) * s->render_width + x0) *
-                        sizeof(uint32_t);
+    for (unsigned i = 0; i < sizeof(utile); i += sizeof(uint32_t)) {
+        stl_le_p(utile + i, color);
+    }
 
-        if (addr + width * sizeof(uint32_t) > UINT32_MAX + 1ULL) {
-            return false;
+    if (memory_format == 2) {
+        uint32_t stride = DIV_ROUND_UP(s->render_width, 4) * 4 *
+                          sizeof(uint32_t);
+
+        for (unsigned uy = 0; uy < V3D_TILE_SIZE / 4; uy++) {
+            uint32_t py = y0 + uy * 4;
+
+            if (py >= s->render_height) {
+                break;
+            }
+            for (unsigned ux = 0; ux < V3D_TILE_SIZE / 4; ux++) {
+                uint32_t px = x0 + ux * 4;
+                uint64_t addr;
+
+                if (px >= s->render_width) {
+                    break;
+                }
+                addr = (uint64_t)s->render_base +
+                       (uint64_t)py * stride + (uint64_t)px * 16;
+                if (addr + sizeof(utile) > UINT32_MAX + 1ULL ||
+                    dma_memory_write(&s->dma_as, addr, utile, sizeof(utile),
+                                     MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                    return false;
+                }
+            }
         }
-        if (dma_memory_write(&s->dma_as, addr, row,
-                            width * sizeof(uint32_t),
-                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-            return false;
+        return true;
+    }
+
+    /* VC4 T-format uses 32x32 pixel, 4 KiB tiles with serpentine rows. */
+    {
+        static const uint8_t even_stile_map[4] = { 0, 3, 1, 2 };
+        static const uint8_t odd_stile_map[4] = { 2, 1, 3, 0 };
+        uint32_t tile_stride = DIV_ROUND_UP(s->render_width, V3D_TILE_SIZE);
+        bool odd_tile_y = s->tile_y & 1;
+        uint32_t tile_x = odd_tile_y ? tile_stride - s->tile_x - 1 : s->tile_x;
+        uint64_t tile_base = (uint64_t)s->render_base +
+                             ((uint64_t)s->tile_y * tile_stride + tile_x) * 4096;
+
+        for (unsigned uy = 0; uy < V3D_TILE_SIZE / 4; uy++) {
+            uint32_t utile_y = (uint32_t)s->tile_y * 8 + uy;
+            uint32_t py = y0 + uy * 4;
+            uint32_t stile_y = (utile_y >> 2) & 1;
+
+            if (py >= s->render_height) {
+                break;
+            }
+            for (unsigned ux = 0; ux < V3D_TILE_SIZE / 4; ux++) {
+                uint32_t utile_x = (uint32_t)s->tile_x * 8 + ux;
+                uint32_t px = x0 + ux * 4;
+                uint32_t stile_x = (utile_x >> 2) & 1;
+                uint32_t stile_index = (stile_y << 1) + stile_x;
+                uint32_t utile_in_stile = (utile_y & 3) * 4 + (utile_x & 3);
+                const uint8_t *stile_map = odd_tile_y ? odd_stile_map :
+                                                          even_stile_map;
+                uint64_t addr;
+
+                if (px >= s->render_width) {
+                    break;
+                }
+                addr = tile_base + stile_map[stile_index] * 1024 +
+                       utile_in_stile * sizeof(utile);
+                if (addr + sizeof(utile) > UINT32_MAX + 1ULL ||
+                    dma_memory_write(&s->dma_as, addr, utile, sizeof(utile),
+                                     MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                    return false;
+                }
+            }
         }
     }
     return true;
