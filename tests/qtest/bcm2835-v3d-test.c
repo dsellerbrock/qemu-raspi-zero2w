@@ -81,6 +81,16 @@ static uint64_t qpu_test_add_imm(unsigned raddr_a, unsigned waddr_add,
            (uint64_t)imm << 12 | (6ULL << 9) | (7ULL << 6) | 7ULL;
 }
 
+static uint64_t qpu_test_add(unsigned raddr_a, unsigned raddr_b,
+                            unsigned waddr_add, bool ws)
+{
+    return (1ULL << 60) | (1ULL << 49) | (uint64_t)waddr_add << 38 |
+           (uint64_t)ws << 44 | (39ULL << 32) | (12ULL << 24) |
+           (uint64_t)raddr_a << 18 |
+           (uint64_t)raddr_b << 12 | (6ULL << 9) | (7ULL << 6) |
+           (7ULL << 3) | 7ULL;
+}
+
 static uint64_t qpu_test_load_imm(unsigned waddr_add, uint32_t value)
 {
     return (14ULL << 60) | (1ULL << 49) | (uint64_t)waddr_add << 38 |
@@ -471,7 +481,7 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     uint8_t tile_overflow[32];
     uint8_t record[44] = { 0 };
     uint8_t code[17 * sizeof(uint64_t)];
-    uint8_t fragment_code[3 * sizeof(uint64_t)];
+    uint8_t fragment_code[5 * sizeof(uint64_t)];
     uint8_t vertex_data[sizeof(vertices)];
     uint8_t fragment_uniform[sizeof(uint32_t)];
     uint8_t initial[FB_SIZE];
@@ -505,7 +515,9 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     };
     uint64_t fragment_instructions[] = {
         qpu_test_add_imm(32, 0, 0),
-        qpu_test_add_imm(0, 46, 0) | (1ULL << 44),
+        qpu_test_add_imm(41, 1, 0),
+        qpu_test_add(0, 41, 2, true),
+        qpu_test_add(1, 2, 46, false),
         3ULL << 60,
     };
 
@@ -658,7 +670,7 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
 
     memread(FB_ADDR, fb, sizeof(fb));
     g_assert_cmphex(read_u32(fb + (30 * 64 + 62) * sizeof(uint32_t)),
-                    ==, fragment_color);
+                    ==, fragment_color + 62 + 30);
     g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
 }

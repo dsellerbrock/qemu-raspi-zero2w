@@ -881,6 +881,15 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
         qpu.uniform_address = uniforms_address;
         qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
         qpu.uniform_opaque = s;
+        /* shortcut: fragment W/Z inputs wait for interpolated depth support. */
+        for (unsigned lane = 0; lane < batch; lane++) {
+            unsigned pixel = pixels[first + lane];
+
+            qpu.fragment_coord[0][lane] =
+                (s->tile_x * V3D_TILE_SIZE + pixel % V3D_TILE_SIZE) & 0x7ff;
+            qpu.fragment_coord[1][lane] =
+                (s->tile_y * V3D_TILE_SIZE + pixel / V3D_TILE_SIZE) & 0x7ff;
+        }
         result = bcm2835_v3d_qpu_run(code, code_size,
                                       V3D_QPU_INSTRUCTION_BUDGET, &qpu,
                                       &executed);

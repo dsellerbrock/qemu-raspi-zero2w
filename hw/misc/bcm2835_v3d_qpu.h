@@ -20,6 +20,7 @@ typedef bool (*BCM2835V3DQPUReadUniform)(void *opaque, uint32_t address,
 typedef struct BCM2835V3DQPUState {
     uint32_t rf[2][32][BCM2835_V3D_QPU_LANES];
     uint32_t acc[6][BCM2835_V3D_QPU_LANES];
+    uint32_t fragment_coord[2][BCM2835_V3D_QPU_LANES];
     uint32_t vpm[BCM2835_V3D_QPU_VPM_ROWS][BCM2835_V3D_QPU_LANES];
     uint32_t io[64][BCM2835_V3D_QPU_LANES];
     uint16_t z;

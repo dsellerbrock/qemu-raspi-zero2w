@@ -216,6 +216,12 @@ static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
         return true;
     }
 
+    if (address == 41) {
+        memcpy(value, qpu->fragment_coord[regfile_b],
+               sizeof(qpu->fragment_coord[0]));
+        return true;
+    }
+
     if (address == QPU_R_VPM) {
         if (!qpu->vpm_read_setup || !qpu->vpm_read_remaining) {
             qpu->io_fault = true;
