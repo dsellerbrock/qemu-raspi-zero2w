@@ -165,6 +165,8 @@ static void raspi_peripherals_base_init(Object *obj)
 
     /* VideoCore IV 3D engine */
     object_initialize_child(obj, "v3d", &s->v3d, TYPE_BCM2835_V3D);
+    object_property_add_const_link(OBJECT(&s->v3d), "dma-mr",
+                                   OBJECT(&s->gpu_bus_mr));
 
     /* SPI */
     object_initialize_child(obj, "bcm2835-spi0", &s->spi[0],
