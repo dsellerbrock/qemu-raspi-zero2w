@@ -109,10 +109,29 @@ static void append_u32(uint8_t *buffer, size_t *offset, uint32_t value)
     }
 }
 
+static void append_u48(uint8_t *buffer, size_t *offset, uint64_t value)
+{
+    for (unsigned i = 0; i < 6; i++) {
+        buffer[(*offset)++] = value >> (i * 8);
+    }
+}
+
 static uint32_t read_u32(const uint8_t *buffer)
 {
     return (uint32_t)buffer[0] | ((uint32_t)buffer[1] << 8) |
            ((uint32_t)buffer[2] << 16) | ((uint32_t)buffer[3] << 24);
+}
+
+static void append_tile_buffer_packet(uint8_t *buffer, size_t *offset,
+                                      uint8_t opcode, uint32_t address,
+                                      unsigned memory_format,
+                                      unsigned color_format)
+{
+    buffer[(*offset)++] = opcode;
+    append_u48(buffer, offset,
+               ((uint64_t)(address >> 4) << 20) |
+               ((uint64_t)color_format << 8) |
+               ((uint64_t)memory_format << 4) | 1);
 }
 
 static uint16_t read_u16(const uint8_t *buffer)
@@ -353,6 +372,96 @@ static void test_v3d_ct1_clear_lt_tiled_bgr565(void)
     }
 }
 
+static void test_v3d_ct1_load_store_color_tile(void)
+{
+    const uint32_t src = FB_ADDR;
+    const uint32_t dst = FB_ADDR + FB_SIZE;
+    uint8_t cl[96];
+    uint8_t source[FB_SIZE];
+    uint8_t destination[FB_SIZE];
+    uint8_t result[FB_SIZE];
+
+    for (unsigned color_format_i = 0; color_format_i < 2; color_format_i++) {
+        unsigned color_format = color_format_i == 0 ? 0 : 2;
+        unsigned bytes_per_pixel = color_format == 0 ? 4 : 2;
+        size_t surface_size = 64 * 64 * bytes_per_pixel;
+
+        for (unsigned i = 0; i < 64 * 64; i++) {
+            if (color_format == 0) {
+                uint32_t color = 0xff000000 | i;
+
+                source[i * 4] = color;
+                source[i * 4 + 1] = color >> 8;
+                source[i * 4 + 2] = color >> 16;
+                source[i * 4 + 3] = color >> 24;
+            } else {
+                uint16_t pixel = i * 13;
+
+                source[i * 2] = pixel;
+                source[i * 2 + 1] = pixel >> 8;
+            }
+        }
+        memwrite(src, source, surface_size);
+
+        for (unsigned memory_format = 0; memory_format <= 2; memory_format++) {
+            size_t offset = 0;
+
+            memset(destination, 0xa5, sizeof(destination));
+            memwrite(dst, destination, surface_size);
+
+            /* Copy a complete 64x64 surface as four V3D color tiles. */
+            cl[offset++] = 113;
+            append_u32(cl, &offset, src);
+            append_u16(cl, &offset, 64);
+            append_u16(cl, &offset, 64);
+            append_u16(cl, &offset, 0);
+            for (unsigned tile_y = 0; tile_y < 2; tile_y++) {
+                for (unsigned tile_x = 0; tile_x < 2; tile_x++) {
+                    cl[offset++] = 115;
+                    cl[offset++] = tile_x;
+                    cl[offset++] = tile_y;
+                    append_tile_buffer_packet(cl, &offset, 29, src,
+                                              memory_format, color_format);
+                    append_tile_buffer_packet(cl, &offset, 28, dst,
+                                              memory_format, color_format);
+                }
+            }
+
+            memwrite(CL_ADDR, cl, offset);
+            writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+            writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + offset);
+            memread(dst, result, surface_size);
+            g_assert_cmpmem(result, surface_size, source, surface_size);
+
+            /* The resolved multi-sample store consumes the loaded tile too. */
+            memset(destination, 0xa5, sizeof(destination));
+            memwrite(dst, destination, surface_size);
+            offset = 0;
+            cl[offset++] = 113;
+            append_u32(cl, &offset, dst);
+            append_u16(cl, &offset, 64);
+            append_u16(cl, &offset, 64);
+            append_u16(cl, &offset, (memory_format << 6) |
+                       ((color_format == 0 ? 1 : 2) << 2));
+            for (unsigned tile_y = 0; tile_y < 2; tile_y++) {
+                for (unsigned tile_x = 0; tile_x < 2; tile_x++) {
+                    cl[offset++] = 115;
+                    cl[offset++] = tile_x;
+                    cl[offset++] = tile_y;
+                    append_tile_buffer_packet(cl, &offset, 29, src,
+                                              memory_format, color_format);
+                    cl[offset++] = 25;
+                }
+            }
+            memwrite(CL_ADDR, cl, offset);
+            writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+            writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + offset);
+            memread(dst, result, surface_size);
+            g_assert_cmpmem(result, surface_size, source, surface_size);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -375,6 +484,8 @@ int main(int argc, char **argv)
                    test_v3d_ct1_clear_t_tiled_bgr565);
     qtest_add_func("/bcm2835/v3d/ct1_clear_lt_tiled_bgr565",
                    test_v3d_ct1_clear_lt_tiled_bgr565);
+    qtest_add_func("/bcm2835/v3d/ct1_load_store_color_tile",
+                   test_v3d_ct1_load_store_color_tile);
     qtest_start("-machine raspi3ap -smp 4");
     ret = g_test_run();
     qtest_end();

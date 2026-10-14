@@ -60,6 +60,7 @@
 #define V3D_PACKET_STORE_MS    24
 #define V3D_PACKET_STORE_MS_EOF 25
 #define V3D_PACKET_STORE_TILE  28
+#define V3D_PACKET_LOAD_TILE   29
 #define V3D_PACKET_ARRAY_PRIM  33
 #define V3D_PACKET_INDEX_PRIM  32
 #define V3D_PACKET_GL_SHADER_STATE 64
@@ -179,6 +180,276 @@ static void bcm2835_v3d_store_clear_pixel(uint8_t *dst, unsigned format,
     }
 }
 
+static uint32_t bcm2835_v3d_load_pixel(const uint8_t *src,
+                                       unsigned color_format)
+{
+    uint16_t pixel;
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+
+    if (color_format == 0) {
+        return ldl_le_p(src);
+    }
+
+    pixel = lduw_le_p(src);
+    red = pixel & 0x1f;
+    green = (pixel >> 5) & 0x3f;
+    blue = (pixel >> 11) & 0x1f;
+
+    red = (red << 3) | (red >> 2);
+    green = (green << 2) | (green >> 4);
+    blue = (blue << 3) | (blue >> 2);
+    return 0xff000000 | ((uint32_t)blue << 16) |
+           ((uint32_t)green << 8) | red;
+}
+
+static void bcm2835_v3d_store_pixel(uint8_t *dst, unsigned color_format,
+                                    uint32_t color)
+{
+    if (color_format == 0) {
+        stl_le_p(dst, color);
+    } else {
+        stw_le_p(dst, bcm2835_v3d_pack_bgr565(color));
+    }
+}
+
+static uint64_t bcm2835_v3d_tile_pixel_addr(BCM2835V3DState *s,
+                                            uint32_t base,
+                                            unsigned memory_format,
+                                            unsigned bytes_per_pixel,
+                                            unsigned x, unsigned y)
+{
+    uint32_t global_x = (uint32_t)s->tile_x * V3D_TILE_SIZE + x;
+    uint32_t global_y = (uint32_t)s->tile_y * V3D_TILE_SIZE + y;
+
+    if (memory_format == 0) {
+        return (uint64_t)base +
+               ((uint64_t)global_y * s->render_width + global_x) *
+               bytes_per_pixel;
+    }
+
+    if (memory_format == 2) {
+        uint32_t stride = DIV_ROUND_UP(s->render_width, 4) * 4 *
+                          bytes_per_pixel;
+
+        return (uint64_t)base + (global_y & ~3U) * (uint64_t)stride +
+               (global_x & ~3U) * bytes_per_pixel * 4 +
+               ((global_y & 3) * 4 + (global_x & 3)) * bytes_per_pixel;
+    }
+
+    {
+        static const uint8_t even_stile_map[4] = { 0, 3, 1, 2 };
+        static const uint8_t odd_stile_map[4] = { 2, 1, 3, 0 };
+        uint32_t tile_stride = DIV_ROUND_UP(s->render_width, V3D_TILE_SIZE);
+        bool odd_tile_y = s->tile_y & 1;
+        uint32_t tile_x = odd_tile_y ? tile_stride - s->tile_x - 1 :
+                                       s->tile_x;
+        uint32_t tile_bytes = V3D_TILE_SIZE * V3D_TILE_SIZE *
+                              bytes_per_pixel;
+        uint32_t utile_bytes = V3D_UTILE_PIXELS * bytes_per_pixel;
+        uint32_t stile_bytes = 16 * 16 * bytes_per_pixel;
+        uint32_t utile_x = (uint32_t)s->tile_x * 8 + x / 4;
+        uint32_t utile_y = (uint32_t)s->tile_y * 8 + y / 4;
+        uint32_t stile_index = (((y / 16) & 1) << 1) + ((x / 16) & 1);
+        uint32_t utile_in_stile = (utile_y & 3) * 4 + (utile_x & 3);
+        uint32_t pixel_in_utile = (y & 3) * 4 + (x & 3);
+        const uint8_t *stile_map = odd_tile_y ? odd_stile_map :
+                                                 even_stile_map;
+        uint64_t tile_base = (uint64_t)base +
+                             ((uint64_t)s->tile_y * tile_stride + tile_x) *
+                             tile_bytes;
+
+        return tile_base + stile_map[stile_index] * stile_bytes +
+               utile_in_stile * utile_bytes +
+               pixel_in_utile * bytes_per_pixel;
+    }
+}
+
+static uint64_t bcm2835_v3d_tile_utile_addr(BCM2835V3DState *s,
+                                             uint32_t base,
+                                             unsigned memory_format,
+                                             unsigned bytes_per_pixel,
+                                             unsigned utile_x,
+                                             unsigned utile_y)
+{
+    uint32_t global_x = (uint32_t)s->tile_x * V3D_TILE_SIZE + utile_x * 4;
+    uint32_t global_y = (uint32_t)s->tile_y * V3D_TILE_SIZE + utile_y * 4;
+
+    if (memory_format == 2) {
+        uint32_t stride = DIV_ROUND_UP(s->render_width, 4) * 4 *
+                          bytes_per_pixel;
+
+        return (uint64_t)base + global_y * (uint64_t)stride +
+               global_x * bytes_per_pixel * 4;
+    }
+
+    return bcm2835_v3d_tile_pixel_addr(s, base, memory_format,
+                                        bytes_per_pixel,
+                                        utile_x * 4, utile_y * 4);
+}
+
+static bool bcm2835_v3d_copy_tile(BCM2835V3DState *s, uint32_t base,
+                                  unsigned memory_format,
+                                  unsigned color_format, bool to_guest)
+{
+    uint8_t buffer[V3D_TILE_SIZE * sizeof(uint32_t)];
+    unsigned bytes_per_pixel = color_format == 0 ? sizeof(uint32_t) :
+                                                   sizeof(uint16_t);
+    uint32_t x0 = (uint32_t)s->tile_x * V3D_TILE_SIZE;
+    uint32_t y0 = (uint32_t)s->tile_y * V3D_TILE_SIZE;
+    uint32_t width = MIN(V3D_TILE_SIZE, s->render_width -
+                         MIN(x0, s->render_width));
+    uint32_t height = MIN(V3D_TILE_SIZE, s->render_height -
+                          MIN(y0, s->render_height));
+
+    if (memory_format > 2 || (color_format != 0 && color_format != 2)) {
+        return false;
+    }
+    if (!width || !height) {
+        return true;
+    }
+
+    if (memory_format == 0) {
+        for (unsigned y = 0; y < height; y++) {
+            uint64_t addr = (uint64_t)base +
+                            ((uint64_t)(y0 + y) * s->render_width + x0) *
+                            bytes_per_pixel;
+            size_t row_size = width * bytes_per_pixel;
+
+            if (addr + row_size > UINT32_MAX + 1ULL) {
+                return false;
+            }
+            if (!to_guest && !bcm2835_v3d_dma_read(s, addr, buffer,
+                                                    row_size)) {
+                return false;
+            }
+            for (unsigned x = 0; x < width; x++) {
+                unsigned tile_index = y * V3D_TILE_SIZE + x;
+                uint8_t *pixel = buffer + x * bytes_per_pixel;
+
+                if (to_guest) {
+                    bcm2835_v3d_store_pixel(pixel, color_format,
+                                            s->tile_color[tile_index]);
+                } else {
+                    s->tile_color[tile_index] =
+                        bcm2835_v3d_load_pixel(pixel, color_format);
+                }
+            }
+            if (to_guest &&
+                dma_memory_write(&s->dma_as, addr, buffer, row_size,
+                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    for (unsigned utile_y = 0; utile_y < V3D_TILE_SIZE / 4; utile_y++) {
+        uint32_t global_y = y0 + utile_y * 4;
+
+        if (global_y >= s->render_height) {
+            break;
+        }
+        for (unsigned utile_x = 0; utile_x < V3D_TILE_SIZE / 4; utile_x++) {
+            uint32_t global_x = x0 + utile_x * 4;
+            uint32_t valid_width;
+            uint32_t valid_height;
+            size_t utile_size = V3D_UTILE_PIXELS * bytes_per_pixel;
+            uint64_t addr;
+
+            if (global_x >= s->render_width) {
+                break;
+            }
+            valid_width = MIN(4, s->render_width - global_x);
+            valid_height = MIN(4, s->render_height - global_y);
+            addr = bcm2835_v3d_tile_utile_addr(s, base, memory_format,
+                                                bytes_per_pixel,
+                                                utile_x, utile_y);
+            if (addr + utile_size > UINT32_MAX + 1ULL) {
+                return false;
+            }
+            if (!to_guest || valid_width < 4 || valid_height < 4) {
+                if (!bcm2835_v3d_dma_read(s, addr, buffer, utile_size)) {
+                    return false;
+                }
+            }
+            for (unsigned y = 0; y < valid_height; y++) {
+                for (unsigned x = 0; x < valid_width; x++) {
+                    unsigned tile_index = (utile_y * 4 + y) *
+                                          V3D_TILE_SIZE + utile_x * 4 + x;
+                    uint8_t *pixel = buffer +
+                                     (y * 4 + x) * bytes_per_pixel;
+
+                    if (to_guest) {
+                        bcm2835_v3d_store_pixel(pixel, color_format,
+                                                s->tile_color[tile_index]);
+                    } else {
+                        s->tile_color[tile_index] =
+                            bcm2835_v3d_load_pixel(pixel, color_format);
+                    }
+                }
+            }
+            if (to_guest &&
+                dma_memory_write(&s->dma_as, addr, buffer, utile_size,
+                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
+                                            const uint8_t *packet,
+                                            bool store)
+{
+    uint64_t params = ldl_le_p(packet + 1) |
+                      ((uint64_t)lduw_le_p(packet + 5) << 32);
+    uint32_t base = ((params >> 20) & 0x0fffffff) << 4;
+    unsigned buffer = params & 7;
+    unsigned memory_format = (params >> 4) & 3;
+    unsigned mode = (params >> 6) & 3;
+    unsigned color_format = (params >> 8) & 3;
+
+    if (buffer == 0 || (buffer == 1 && (params & (1ULL << 16)))) {
+        return true;
+    }
+    /* shortcut: color only/single sample; add depth, MSAA, and dither later. */
+    if (buffer != 1 || mode != 0 || memory_format > 2 ||
+        (color_format != 0 && color_format != 2) ||
+        !s->render_config_valid || !s->render_width || !s->render_height) {
+        return false;
+    }
+
+    if (store) {
+        if (!s->tile_color_valid) {
+            if (!s->clear_color_valid) {
+                return false;
+            }
+            for (unsigned i = 0; i < G_N_ELEMENTS(s->tile_color); i++) {
+                s->tile_color[i] = s->clear_color[0];
+            }
+            s->tile_color_valid = true;
+        }
+        if (!bcm2835_v3d_copy_tile(s, base, memory_format,
+                                    color_format, true)) {
+            return false;
+        }
+        if (!(params & (1ULL << 13))) {
+            s->tile_color_valid = false;
+        }
+    } else {
+        memset(s->tile_color, 0, sizeof(s->tile_color));
+        if (!bcm2835_v3d_copy_tile(s, base, memory_format,
+                                    color_format, false)) {
+            return false;
+        }
+        s->tile_color_valid = true;
+    }
+    return true;
+}
+
 static void bcm2835_v3d_thread_error(BCM2835V3DState *s, unsigned thread,
                                      uint32_t addr, const char *reason)
 {
@@ -208,7 +479,8 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
     unsigned utile_bytes;
     unsigned y;
 
-    if (!s->render_config_valid || !s->clear_color_valid || !width || !height) {
+    if (!s->render_config_valid ||
+        (!s->clear_color_valid && !s->tile_color_valid) || !width || !height) {
         return true;
     }
 
@@ -217,6 +489,11 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
                       "bcm2835_v3d: clear skipped for render format %u/%u\n",
                       memory_format, format);
         return false;
+    }
+
+    if (s->tile_color_valid) {
+        return bcm2835_v3d_copy_tile(s, s->render_base, memory_format,
+                                      format == 1 ? 0 : 2, true);
     }
 
     bytes_per_pixel = format == 1 ? sizeof(uint32_t) : sizeof(uint16_t);
@@ -472,6 +749,7 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             s->render_height = lduw_le_p(packet + 7);
             s->render_config = lduw_le_p(packet + 9);
             s->render_config_valid = true;
+            s->tile_color_valid = false;
             break;
         case V3D_PACKET_CLEAR_COLORS:
             s->clear_color[0] = ldl_le_p(packet + 1);
@@ -481,6 +759,17 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
         case V3D_PACKET_TILE_COORDS:
             s->tile_x = packet[1];
             s->tile_y = packet[2];
+            s->tile_color_valid = false;
+            break;
+        case V3D_PACKET_STORE_TILE:
+        case V3D_PACKET_LOAD_TILE:
+            if (thread != 1 ||
+                !bcm2835_v3d_tile_buffer_packet(
+                    s, packet, opcode == V3D_PACKET_STORE_TILE)) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "unsupported tile buffer operation or DMA failure");
+                return;
+            }
             break;
         case V3D_PACKET_STORE_MS:
         case V3D_PACKET_STORE_MS_EOF:
@@ -726,6 +1015,7 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     memset(s->ct_semaphore, 0, sizeof(s->ct_semaphore));
     memset(s->ct_waiting, 0, sizeof(s->ct_waiting));
     memset(s->clear_color, 0, sizeof(s->clear_color));
+    memset(s->tile_color, 0, sizeof(s->tile_color));
     s->render_base = 0;
     s->render_width = 0;
     s->render_height = 0;
@@ -734,6 +1024,7 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->tile_y = 0;
     s->render_config_valid = false;
     s->clear_color_valid = false;
+    s->tile_color_valid = false;
     s->bin_alloc_base = 0;
     s->bin_alloc_size = 0;
     s->bin_state_base = 0;
@@ -770,7 +1061,7 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -807,6 +1098,8 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_BOOL_V(binning_started, BCM2835V3DState, 3),
         VMSTATE_UINT32_V(shader_state, BCM2835V3DState, 3),
         VMSTATE_BOOL_V(shader_state_valid, BCM2835V3DState, 3),
+        VMSTATE_UINT32_ARRAY_V(tile_color, BCM2835V3DState, 32 * 32, 4),
+        VMSTATE_BOOL_V(tile_color_valid, BCM2835V3DState, 4),
         VMSTATE_END_OF_LIST()
     },
 };
