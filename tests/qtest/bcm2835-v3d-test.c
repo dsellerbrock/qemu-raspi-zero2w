@@ -455,13 +455,16 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     uint8_t tile_list[45];
     uint8_t record[44] = { 0 };
     uint8_t code[17 * sizeof(uint64_t)];
+    uint8_t fragment_code[3 * sizeof(uint64_t)];
     uint8_t vertex_data[sizeof(vertices)];
+    uint8_t fragment_uniform[sizeof(uint32_t)];
     uint8_t initial[FB_SIZE];
     uint8_t fb[FB_SIZE];
     size_t render_size = 0;
     size_t bin_size = 0;
     size_t draw_size = 0;
     uint32_t draw_color = 0xff00ff00;
+    uint32_t fragment_color = 0xffff0000;
     uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8) | 8;
     uint32_t setup_read = (1U << 20) | (1U << 12) |
                           (1U << 11) | (2U << 8);
@@ -484,6 +487,11 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
         qpu_test_add_imm(6, 48, 0) | (1ULL << 44),
         3ULL << 60,
     };
+    uint64_t fragment_instructions[] = {
+        qpu_test_add_imm(32, 0, 0),
+        qpu_test_add_imm(0, 46, 0) | (1ULL << 44),
+        3ULL << 60,
+    };
 
     memset(initial, 0x5a, sizeof(initial));
     memwrite(FB_ADDR, initial, sizeof(initial));
@@ -494,6 +502,8 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
         }
     }
     stl_le_p(record + 28, 0x6200);
+    stl_le_p(record + 4, 0x6400);
+    stl_le_p(record + 8, 0x6600);
     record[26] = 1;
     record[0] = 1U << 2; /* Enable homogeneous clipping. */
     stl_le_p(record + 36, 0x7000);
@@ -504,7 +514,14 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     for (unsigned i = 0; i < G_N_ELEMENTS(instructions); i++) {
         stq_le_p(code + i * sizeof(uint64_t), instructions[i]);
     }
+    for (unsigned i = 0; i < G_N_ELEMENTS(fragment_instructions); i++) {
+        stq_le_p(fragment_code + i * sizeof(uint64_t),
+                 fragment_instructions[i]);
+    }
+    stl_le_p(fragment_uniform, fragment_color);
     memwrite(0x6200, code, sizeof(code));
+    memwrite(0x6400, fragment_code, sizeof(fragment_code));
+    memwrite(0x6600, fragment_uniform, sizeof(fragment_uniform));
 
     render_cl[render_size++] = 113;
     append_u32(render_cl, &render_size, FB_ADDR);
@@ -601,7 +618,7 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
 
     memread(FB_ADDR, fb, sizeof(fb));
     g_assert_cmphex(read_u32(fb + (30 * 64 + 62) * sizeof(uint32_t)),
-                    ==, draw_color);
+                    ==, fragment_color);
     g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
 }

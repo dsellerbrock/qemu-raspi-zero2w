@@ -842,6 +842,50 @@ static int64_t bcm2835_v3d_edge(int32_t ax, int32_t ay,
            (int64_t)(py - ay) * (bx - ax);
 }
 
+static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
+                                             const uint16_t *pixels,
+                                             unsigned count)
+{
+    uint32_t code_address = ldl_le_p(s->shader_record + 4) & ~7U;
+    uint32_t uniforms_address = ldl_le_p(s->shader_record + 8);
+    uint8_t *code;
+    uint32_t code_size;
+
+    if (!code_address || !count ||
+        !bcm2835_v3d_load_qpu_program(s, code_address, &code, &code_size)) {
+        return false;
+    }
+
+    for (unsigned first = 0; first < count;
+         first += BCM2835_V3D_QPU_LANES) {
+        BCM2835V3DQPUState qpu;
+        uint32_t executed;
+        uint32_t batch = MIN(count - first, BCM2835_V3D_QPU_LANES);
+        uint16_t expected_mask = batch == BCM2835_V3D_QPU_LANES ?
+                                 UINT16_MAX : (1U << batch) - 1;
+        BCM2835V3DQPUResult result;
+
+        bcm2835_v3d_qpu_init(&qpu);
+        qpu.uniform_address = uniforms_address;
+        qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
+        qpu.uniform_opaque = s;
+        result = bcm2835_v3d_qpu_run(code, code_size,
+                                      V3D_QPU_INSTRUCTION_BUDGET, &qpu,
+                                      &executed);
+        if (result != BCM2835_V3D_QPU_END ||
+            (qpu.tlb_color_all_write_mask & expected_mask) !=
+            expected_mask) {
+            g_free(code);
+            return false;
+        }
+        for (unsigned lane = 0; lane < batch; lane++) {
+            s->tile_color[pixels[first + lane]] = qpu.io[46][lane];
+        }
+    }
+    g_free(code);
+    return true;
+}
+
 static bool bcm2835_v3d_init_tile_lists(BCM2835V3DState *s)
 {
     uint32_t tile_count = (uint32_t)s->bin_tiles_x * s->bin_tiles_y;
@@ -1291,6 +1335,8 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
     int32_t min_x, min_y, max_x, max_y;
     int64_t area;
     uint32_t color = s->clear_color_valid ? s->clear_color[0] : UINT32_MAX;
+    uint16_t covered[64 * 64];
+    unsigned covered_count = 0;
 
     if (!s->tile_color_valid) {
         for (unsigned i = 0; i < G_N_ELEMENTS(s->tile_color); i++) {
@@ -1339,9 +1385,18 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
                 (area < 0 && e0 <= 0 && e1 <= 0 && e2 <= 0)) {
                 unsigned tile_pixel = (py - y0) * V3D_TILE_SIZE + px - x0;
 
-                s->tile_color[tile_pixel] = color;
+                if (covered_count >= G_N_ELEMENTS(covered)) {
+                    return false;
+                }
+                covered[covered_count++] = tile_pixel;
             }
         }
+    }
+    if (covered_count && ldl_le_p(s->shader_record + 4)) {
+        return bcm2835_v3d_run_fragment_shader(s, covered, covered_count);
+    }
+    for (unsigned i = 0; i < covered_count; i++) {
+        s->tile_color[covered[i]] = color;
     }
     return true;
 }
@@ -1354,8 +1409,7 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
 
     if (*ca == UINT32_MAX || !s->tile_primitive_format_valid ||
         s->tile_primitive_format != ((3 << 4) | 2) ||
-        !s->shader_state_valid || ldl_le_p(s->shader_record + 4) ||
-        s->shader_record[3]) {
+        !s->shader_state_valid || s->shader_record[3]) {
         return false;
     }
 
@@ -1409,7 +1463,7 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
     if ((packet[1] & 0xf) != 4 || count % 3) {
         return false;
     }
-    if (ldl_le_p(s->shader_record + 4) || s->shader_record[3]) {
+    if (s->shader_record[3]) {
         return false;
     }
     indices = g_new(uint32_t, count);

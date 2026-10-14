@@ -450,6 +450,9 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
     }
     if (waddr >= 38 && waddr < 64) {
         qpu->io[waddr][lane] = value;
+        if (waddr == 46) {
+            qpu->tlb_color_all_write_mask |= 1U << lane;
+        }
         return true;
     }
     return false;
