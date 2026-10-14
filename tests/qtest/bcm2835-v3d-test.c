@@ -121,6 +121,13 @@ static uint64_t qpu_test_v8_alu(unsigned op_add, unsigned op_mul,
            (6ULL << 9) | (7ULL << 6) | (6ULL << 3) | 7ULL;
 }
 
+static uint64_t qpu_test_read_r4(unsigned destination)
+{
+    return (1ULL << 60) | (1ULL << 49) | (uint64_t)destination << 38 |
+           (39ULL << 32) | (12ULL << 24) | (1ULL << 18) | (39ULL << 12) |
+           (4ULL << 9) | (6ULL << 6) | (7ULL << 3) | 7ULL;
+}
+
 static uint64_t qpu_test_pack_color(unsigned pack, unsigned destination)
 {
     return (13ULL << 60) | (1ULL << 56) | (uint64_t)pack << 52 |
@@ -312,6 +319,61 @@ static void test_v3d_qpu_color_pack_unpack(void)
         memcpy(&expected, &value, sizeof(expected));
         for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
             g_assert_cmphex(qpu.rf[0][unpack - 4][lane], ==, expected);
+        }
+    }
+}
+
+static void test_v3d_qpu_sfu(void)
+{
+    uint8_t code[5 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    static const unsigned sfu[] = { 52, 53, 54, 55 };
+    static const float input[4][4] = {
+        { 0.5f, 1.0f, 2.0f, 4.0f },
+        { 1.0f, 1.0f, 4.0f, 4.0f },
+        { -2.0f, -1.0f, 0.0f, 1.0f },
+        { 0.5f, 1.0f, 2.0f, 4.0f },
+    };
+    static const float expected[4][4] = {
+        { 2.0f, 1.0f, 0.5f, 0.25f },
+        { 1.0f, 1.0f, 0.5f, 0.5f },
+        { 0.25f, 0.5f, 1.0f, 2.0f },
+        { -1.0f, 0.0f, 1.0f, 2.0f },
+    };
+
+    for (unsigned op = 0; op < G_N_ELEMENTS(sfu); op++) {
+        bcm2835_v3d_qpu_init(&qpu);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            float value = input[op][lane % 4];
+
+            memcpy(&qpu.rf[0][0][lane], &value, sizeof(value));
+            qpu.rf[0][1][lane] = 0;
+            qpu.rf[1][0][lane] = 0;
+        }
+        stq_le_p(code, qpu_test_add(0, 0, sfu[op], false));
+        stq_le_p(code + sizeof(uint64_t), qpu_test_v8_alu(0, 0, 39));
+        stq_le_p(code + 2 * sizeof(uint64_t), qpu_test_v8_alu(0, 0, 39));
+        stq_le_p(code + 3 * sizeof(uint64_t), qpu_test_read_r4(8));
+        stq_le_p(code + 4 * sizeof(uint64_t), 3ULL << 60);
+
+        g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 2, &qpu,
+                                             &executed),
+                        ==, BCM2835_V3D_QPU_BUDGET);
+        g_assert_true(qpu.sfu_pending[0]);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            g_assert_cmphex(qpu.acc[4][lane], ==, 0);
+        }
+
+        g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                             &executed),
+                        ==, BCM2835_V3D_QPU_END);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            uint32_t bits;
+            float result = expected[op][lane % 4];
+
+            memcpy(&bits, &result, sizeof(bits));
+            g_assert_cmphex(qpu.rf[0][8][lane], ==, bits);
         }
     }
 }
@@ -1307,6 +1369,7 @@ int main(int argc, char **argv)
                    test_v3d_qpu_packed_byte_alu);
     qtest_add_func("/bcm2835/v3d/qpu_color_pack_unpack",
                    test_v3d_qpu_color_pack_unpack);
+    qtest_add_func("/bcm2835/v3d/qpu_sfu", test_v3d_qpu_sfu);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
                    test_v3d_qpu_vpm_vector_io);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_setup_and_write",

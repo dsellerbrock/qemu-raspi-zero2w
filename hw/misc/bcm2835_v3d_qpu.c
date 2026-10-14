@@ -99,6 +99,10 @@
 #define QPU_R_VPM           48
 #define QPU_W_VPM           48
 #define QPU_W_VPM_SETUP     49
+#define QPU_W_SFU_RECIP      52
+#define QPU_W_SFU_RECIPSQRT  53
+#define QPU_W_SFU_EXP        54
+#define QPU_W_SFU_LOG        55
 
 static uint32_t qpu_float_bits(float value)
 {
@@ -493,6 +497,31 @@ static bool qpu_execute_mul(unsigned op, uint32_t a, uint32_t b,
     }
 }
 
+static uint32_t qpu_execute_sfu(unsigned address, uint32_t input)
+{
+    float value = qpu_bits_float(input);
+    float result;
+
+    /* shortcut: libm is not bit-exact; use VC4 tables if rendered pixels require it. */
+    switch (address) {
+    case QPU_W_SFU_RECIP:
+        result = 1.0f / value;
+        break;
+    case QPU_W_SFU_RECIPSQRT:
+        result = 1.0f / sqrtf(value);
+        break;
+    case QPU_W_SFU_EXP:
+        result = exp2f(value);
+        break;
+    case QPU_W_SFU_LOG:
+        result = log2f(value);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    return qpu_float_bits(result);
+}
+
 static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
                       bool ws, unsigned lane, uint32_t value)
 {
@@ -572,8 +601,8 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms, and
  * horizontal 32-bit VPM access. shortcut: no register-file timing, A-file
- * pack/unpack, r4 half-float unpack, V8MULD, vertical VPM, TMU, or SFU; add
- * each as guest shader coverage requires it.
+ * pack/unpack, r4 half-float unpack, V8MULD, vertical VPM, or TMU; add each
+ * as guest shader coverage requires it.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -621,8 +650,18 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         bool writes_vpm;
         uint16_t active_add = 0;
         uint16_t active_mul = 0;
+        bool add_sfu_write;
+        bool mul_sfu_write;
 
         qpu->varying_c_pending_valid = false;
+        for (unsigned i = 0; i < G_N_ELEMENTS(qpu->sfu_pending); i++) {
+            if (qpu->sfu_pending[i] &&
+                qpu->sfu_ready_at[i] <= qpu->cycles) {
+                memcpy(qpu->acc[4], qpu->sfu_result[i],
+                       sizeof(qpu->acc[4]));
+                qpu->sfu_pending[i] = false;
+            }
+        }
 
         if ((uint64_t)qpu->pc * sizeof(uint64_t) + sizeof(uint64_t) >
             code_size) {
@@ -630,6 +669,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         }
         inst = ldq_le_p(code + qpu->pc * sizeof(uint64_t));
         (*executed)++;
+        qpu->cycles++;
         end = QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf) == QPU_SIG_PROG_END;
         sig = QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf);
         if (sig == 15) {
@@ -783,6 +823,40 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             }
         }
 
+        add_sfu_write = waddr_add >= QPU_W_SFU_RECIP &&
+                        waddr_add <= QPU_W_SFU_LOG && active_add;
+        mul_sfu_write = waddr_mul >= QPU_W_SFU_RECIP &&
+                        waddr_mul <= QPU_W_SFU_LOG && active_mul;
+        if ((add_sfu_write && mul_sfu_write) ||
+            (pm && pack && (add_sfu_write || mul_sfu_write))) {
+            return BCM2835_V3D_QPU_UNSUPPORTED;
+        }
+        if (add_sfu_write || mul_sfu_write) {
+            const uint32_t *input = add_sfu_write ? add_result : mul_result;
+            uint16_t active = add_sfu_write ? active_add : active_mul;
+            unsigned address = add_sfu_write ? waddr_add : waddr_mul;
+            unsigned slot;
+
+            for (slot = 0; slot < G_N_ELEMENTS(qpu->sfu_pending); slot++) {
+                if (!qpu->sfu_pending[slot]) {
+                    break;
+                }
+            }
+            if (slot == G_N_ELEMENTS(qpu->sfu_pending)) {
+                return BCM2835_V3D_QPU_UNSUPPORTED;
+            }
+            memcpy(qpu->sfu_result[slot], qpu->acc[4],
+                   sizeof(qpu->acc[4]));
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                if (active & (1U << lane)) {
+                    qpu->sfu_result[slot][lane] =
+                        qpu_execute_sfu(address, input[lane]);
+                }
+            }
+            qpu->sfu_ready_at[slot] = qpu->cycles + 2;
+            qpu->sfu_pending[slot] = true;
+        }
+
         if (waddr_add >= QPU_W_ACC0 &&
             waddr_add < QPU_W_ACC0 + 6 && waddr_add == waddr_mul &&
             (active_add & active_mul)) {
@@ -808,10 +882,10 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
             uint16_t bit = 1U << lane;
 
-            if (((active_add & bit) &&
+            if (((active_add & bit) && !add_sfu_write &&
                  !qpu_write(qpu, waddr_add, false, ws, lane,
                             add_result[lane])) ||
-                ((active_mul & bit) &&
+                ((active_mul & bit) && !mul_sfu_write &&
                  !qpu_write(qpu, waddr_mul, true, ws, lane,
                             mul_result[lane]))) {
                 return BCM2835_V3D_QPU_UNSUPPORTED;
