@@ -30,8 +30,10 @@ struct BCM2835GpioState {
 
     uint8_t fsel[54];
     uint32_t lev0, lev1;
+    uint32_t eds[2], ren[2], fen[2];
     uint8_t sd_fsel;
     qemu_irq out[54];
+    qemu_irq irq[4];
 };
 
 #define TYPE_BCM2835_GPIO "bcm2835_gpio"
