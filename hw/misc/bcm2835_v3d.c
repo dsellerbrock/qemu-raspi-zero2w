@@ -96,7 +96,6 @@ static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
     case V3D_PACKET_BRANCH_SUB:
     case 26: /* Store Full Resolution Tile Buffer */
     case 27: /* Load Full Resolution Tile Buffer */
-    case V3D_PACKET_INDEX_PRIM:
     case V3D_PACKET_GL_SHADER_STATE:
     case 65: /* NV Shader State */
     case 66: /* VG Shader State */
@@ -111,6 +110,8 @@ static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
         return 7;
     case V3D_PACKET_ARRAY_PRIM:
         return 10;
+    case V3D_PACKET_INDEX_PRIM:
+        return 14;
     case 56: /* Primitive List Format */
         return 2;
     case 96: /* Configuration Bits */

@@ -143,6 +143,44 @@ static void test_v3d_ct0_flush_count(void)
                     ==, V3D_FLDONE);
 }
 
+static void test_v3d_ct0_primitive_packet_lengths(void)
+{
+    static const struct {
+        uint8_t opcode;
+        size_t packet_size;
+    } packets[] = {
+        { 32, 14 }, /* GL_INDEXED_PRIMITIVE */
+        { 33, 10 }, /* GL_ARRAY_PRIMITIVE */
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(packets); i++) {
+        uint8_t cl[64];
+        size_t cl_size = 0;
+
+        cl[cl_size++] = 112;
+        append_u32(cl, &cl_size, 0x30000);
+        append_u32(cl, &cl_size, 0x2000);
+        append_u32(cl, &cl_size, 0x32000);
+        cl[cl_size++] = 2;
+        cl[cl_size++] = 2;
+        cl[cl_size++] = 0x04;
+        cl[cl_size++] = 6;
+        cl[cl_size++] = packets[i].opcode;
+        memset(cl + cl_size, 0, packets[i].packet_size - 1);
+        cl_size += packets[i].packet_size - 1;
+
+        writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
+        memwrite(CL_ADDR, cl, cl_size);
+        writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+        writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + cl_size);
+
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR,
+                        ==, V3D_CTERR);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA),
+                        ==, CL_ADDR + cl_size);
+    }
+}
+
 static void append_u16(uint8_t *buffer, size_t *offset, uint16_t value)
 {
     buffer[(*offset)++] = value;
@@ -521,6 +559,8 @@ int main(int argc, char **argv)
                    test_v3d_ct0_binning_setup);
     qtest_add_func("/bcm2835/v3d/ct0_flush_count",
                    test_v3d_ct0_flush_count);
+    qtest_add_func("/bcm2835/v3d/ct0_primitive_packet_lengths",
+                   test_v3d_ct0_primitive_packet_lengths);
     qtest_add_func("/bcm2835/v3d/ct1_clear_linear",
                    test_v3d_ct1_clear_linear);
     qtest_add_func("/bcm2835/v3d/ct1_clear_t_tiled",
