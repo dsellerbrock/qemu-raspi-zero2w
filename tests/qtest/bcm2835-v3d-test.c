@@ -112,6 +112,15 @@ static uint64_t qpu_test_add(unsigned raddr_a, unsigned raddr_b,
            (7ULL << 3) | 7ULL;
 }
 
+static uint64_t qpu_test_v8_alu(unsigned op_add, unsigned op_mul,
+                                unsigned destination)
+{
+    return (1ULL << 60) | (1ULL << 49) | (1ULL << 46) |
+           (uint64_t)destination << 38 | (uint64_t)destination << 32 |
+           (uint64_t)op_mul << 29 | (uint64_t)op_add << 24 |
+           (6ULL << 9) | (7ULL << 6) | (6ULL << 3) | 7ULL;
+}
+
 static uint64_t qpu_test_load_imm(unsigned waddr_add, uint32_t value)
 {
     return (14ULL << 60) | (1ULL << 49) | (uint64_t)waddr_add << 38 |
@@ -195,6 +204,38 @@ static void test_v3d_qpu_varying_read(void)
                         varying.partial[lane] + 0x100 + lane);
         g_assert_cmphex(qpu.rf[0][1][lane], ==, varying.c[lane]);
         g_assert_cmphex(qpu.acc[5][lane], ==, varying.c[lane]);
+    }
+}
+
+static void test_v3d_qpu_packed_byte_alu(void)
+{
+    uint8_t code[5 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    const uint32_t a = 0x7f00faff;
+    const uint32_t b = 0x810a14ff;
+
+    stq_le_p(code, qpu_test_v8_alu(30, 4, 2));
+    stq_le_p(code + 8, qpu_test_v8_alu(31, 5, 3));
+    stq_le_p(code + 16, qpu_test_v8_alu(0, 6, 4));
+    stq_le_p(code + 24, qpu_test_v8_alu(0, 7, 5));
+    stq_le_p(code + 32, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = a;
+        qpu.rf[1][0][lane] = b;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.rf[0][2][lane], ==, 0xff0affff);
+        g_assert_cmphex(qpu.rf[1][2][lane], ==, 0x7f0014ff);
+        g_assert_cmphex(qpu.rf[0][3][lane], ==, 0x0000e600);
+        g_assert_cmphex(qpu.rf[1][3][lane], ==, 0x810afaff);
+        g_assert_cmphex(qpu.rf[1][4][lane], ==, 0xff0affff);
+        g_assert_cmphex(qpu.rf[1][5][lane], ==, 0x0000e600);
     }
 }
 
@@ -1185,6 +1226,8 @@ int main(int argc, char **argv)
                    test_v3d_qpu_uniform_read);
     qtest_add_func("/bcm2835/v3d/qpu_varying_read",
                    test_v3d_qpu_varying_read);
+    qtest_add_func("/bcm2835/v3d/qpu_packed_byte_alu",
+                   test_v3d_qpu_packed_byte_alu);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
                    test_v3d_qpu_vpm_vector_io);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_setup_and_write",

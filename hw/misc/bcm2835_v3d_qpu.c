@@ -66,10 +66,16 @@
 #define QPU_A_XOR           22
 #define QPU_A_NOT           23
 #define QPU_A_CLZ           24
+#define QPU_A_V8ADDS        30
+#define QPU_A_V8SUBS        31
 
 #define QPU_M_NOP           0
 #define QPU_M_FMUL          1
 #define QPU_M_MUL24         2
+#define QPU_M_V8MIN         4
+#define QPU_M_V8MAX         5
+#define QPU_M_V8ADDS        6
+#define QPU_M_V8SUBS        7
 
 #define QPU_MUX_R0          0
 #define QPU_MUX_R5          5
@@ -183,6 +189,34 @@ static uint32_t qpu_small_immediate(unsigned imm)
         return qpu_float_bits((float)(1U << (imm - 32)));
     }
     return qpu_float_bits(1.0f / (float)(1U << (48 - imm)));
+}
+
+static uint32_t qpu_v8_saturating(uint32_t a, uint32_t b, bool subtract)
+{
+    uint32_t result = 0;
+
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+        unsigned av = (a >> shift) & 0xff;
+        unsigned bv = (b >> shift) & 0xff;
+        unsigned value = subtract ? (av > bv ? av - bv : 0) :
+                                    MIN(av + bv, 0xff);
+
+        result |= value << shift;
+    }
+    return result;
+}
+
+static uint32_t qpu_v8_minmax(uint32_t a, uint32_t b, bool maximum)
+{
+    uint32_t result = 0;
+
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+        unsigned av = (a >> shift) & 0xff;
+        unsigned bv = (b >> shift) & 0xff;
+
+        result |= (maximum ? MAX(av, bv) : MIN(av, bv)) << shift;
+    }
+    return result;
 }
 
 static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
@@ -379,6 +413,12 @@ static bool qpu_execute_add(unsigned op, uint32_t a, uint32_t b,
     case QPU_A_CLZ:
         *result = clz32(a);
         break;
+    case QPU_A_V8ADDS:
+        *result = qpu_v8_saturating(a, b, false);
+        break;
+    case QPU_A_V8SUBS:
+        *result = qpu_v8_saturating(a, b, true);
+        break;
     default:
         return false;
     }
@@ -399,6 +439,18 @@ static bool qpu_execute_mul(unsigned op, uint32_t a, uint32_t b,
     case QPU_M_MUL24:
         *result = (uint32_t)((int32_t)(a << 8) >> 8) *
                   (uint32_t)((int32_t)(b << 8) >> 8);
+        return true;
+    case QPU_M_V8MIN:
+        *result = qpu_v8_minmax(a, b, false);
+        return true;
+    case QPU_M_V8MAX:
+        *result = qpu_v8_minmax(a, b, true);
+        return true;
+    case QPU_M_V8ADDS:
+        *result = qpu_v8_saturating(a, b, false);
+        return true;
+    case QPU_M_V8SUBS:
+        *result = qpu_v8_saturating(a, b, true);
         return true;
     default:
         return false;
@@ -483,8 +535,9 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms, and
- * horizontal 32-bit VPM access. shortcut: no register-file timing, packed or
- * vertical VPM, TMU, or SFU; add each as guest shader coverage requires it.
+ * horizontal 32-bit VPM access. shortcut: no register-file timing, pack /
+ * unpack, V8MULD, vertical VPM, TMU, or SFU; add each as guest shader coverage
+ * requires it.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
