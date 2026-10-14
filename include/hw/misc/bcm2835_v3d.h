@@ -47,7 +47,7 @@ struct BCM2835V3DState {
     uint8_t tile_x;
     uint8_t tile_y;
     uint32_t clear_color[2];
-    uint32_t tile_color[32 * 32];
+    uint32_t tile_color[64 * 64];
     bool render_config_valid;
     bool clear_color_valid;
     bool tile_color_valid;

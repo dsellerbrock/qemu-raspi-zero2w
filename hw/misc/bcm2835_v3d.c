@@ -74,7 +74,8 @@
 #define V3D_PACKET_TILE_COORDS 115
 
 #define V3D_MAX_CL_COMMANDS    (1U << 16)
-#define V3D_TILE_SIZE          32
+#define V3D_TILE_SIZE          64
+#define V3D_T_MEMORY_TILE_SIZE 32
 #define V3D_UTILE_PIXELS       16
 
 /* VC4 packets 48 and 49 have data-dependent lengths and are not decoded yet. */
@@ -173,18 +174,8 @@ static uint16_t bcm2835_v3d_pack_bgr565(uint32_t rgba)
            ((uint16_t)(green >> 2) << 5) | (red >> 3);
 }
 
-static void bcm2835_v3d_store_clear_pixel(uint8_t *dst, unsigned format,
-                                           uint32_t color)
-{
-    if (format == 1) {
-        stl_le_p(dst, color);
-    } else {
-        stw_le_p(dst, bcm2835_v3d_pack_bgr565(color));
-    }
-}
-
 static uint32_t bcm2835_v3d_load_pixel(const uint8_t *src,
-                                       unsigned color_format)
+                                        unsigned color_format)
 {
     uint16_t pixel;
     uint8_t red;
@@ -244,23 +235,31 @@ static uint64_t bcm2835_v3d_tile_pixel_addr(BCM2835V3DState *s,
     {
         static const uint8_t even_stile_map[4] = { 0, 3, 1, 2 };
         static const uint8_t odd_stile_map[4] = { 2, 1, 3, 0 };
-        uint32_t tile_stride = DIV_ROUND_UP(s->render_width, V3D_TILE_SIZE);
-        bool odd_tile_y = s->tile_y & 1;
-        uint32_t tile_x = odd_tile_y ? tile_stride - s->tile_x - 1 :
-                                       s->tile_x;
-        uint32_t tile_bytes = V3D_TILE_SIZE * V3D_TILE_SIZE *
+        uint32_t tile_stride = DIV_ROUND_UP(s->render_width,
+                                            V3D_T_MEMORY_TILE_SIZE);
+        uint32_t memory_tile_x = global_x / V3D_T_MEMORY_TILE_SIZE;
+        uint32_t memory_tile_y = global_y / V3D_T_MEMORY_TILE_SIZE;
+        bool odd_tile_y = memory_tile_y & 1;
+        uint32_t tile_x = odd_tile_y ? tile_stride - memory_tile_x - 1 :
+                                       memory_tile_x;
+        uint32_t tile_bytes = V3D_T_MEMORY_TILE_SIZE *
+                              V3D_T_MEMORY_TILE_SIZE *
                               bytes_per_pixel;
         uint32_t utile_bytes = V3D_UTILE_PIXELS * bytes_per_pixel;
         uint32_t stile_bytes = 16 * 16 * bytes_per_pixel;
-        uint32_t utile_x = (uint32_t)s->tile_x * 8 + x / 4;
-        uint32_t utile_y = (uint32_t)s->tile_y * 8 + y / 4;
-        uint32_t stile_index = (((y / 16) & 1) << 1) + ((x / 16) & 1);
+        uint32_t local_x = global_x % V3D_T_MEMORY_TILE_SIZE;
+        uint32_t local_y = global_y % V3D_T_MEMORY_TILE_SIZE;
+        uint32_t utile_x = global_x / 4;
+        uint32_t utile_y = global_y / 4;
+        uint32_t stile_index = (((local_y / 16) & 1) << 1) +
+                               ((local_x / 16) & 1);
         uint32_t utile_in_stile = (utile_y & 3) * 4 + (utile_x & 3);
-        uint32_t pixel_in_utile = (y & 3) * 4 + (x & 3);
+        uint32_t pixel_in_utile = (global_y & 3) * 4 + (global_x & 3);
         const uint8_t *stile_map = odd_tile_y ? odd_stile_map :
                                                  even_stile_map;
         uint64_t tile_base = (uint64_t)base +
-                             ((uint64_t)s->tile_y * tile_stride + tile_x) *
+                             ((uint64_t)memory_tile_y * tile_stride +
+                              tile_x) *
                              tile_bytes;
 
         return tile_base + stile_map[stile_index] * stile_bytes +
@@ -466,9 +465,6 @@ static void bcm2835_v3d_thread_error(BCM2835V3DState *s, unsigned thread,
 
 static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
 {
-    uint8_t row[V3D_TILE_SIZE * sizeof(uint32_t)];
-    uint8_t utile[64];
-    uint8_t pixel[sizeof(uint32_t)];
     uint32_t x0 = s->tile_x * V3D_TILE_SIZE;
     uint32_t y0 = s->tile_y * V3D_TILE_SIZE;
     uint32_t width = MIN(V3D_TILE_SIZE, s->render_width -
@@ -478,9 +474,6 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
     uint32_t color = s->clear_color[0];
     unsigned format = (s->render_config >> 2) & 3;
     unsigned memory_format = (s->render_config >> 6) & 3;
-    unsigned bytes_per_pixel;
-    unsigned utile_bytes;
-    unsigned y;
 
     if (!s->render_config_valid ||
         (!s->clear_color_valid && !s->tile_color_valid) || !width || !height) {
@@ -499,109 +492,12 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
                                       format == 1 ? 0 : 2, true);
     }
 
-    bytes_per_pixel = format == 1 ? sizeof(uint32_t) : sizeof(uint16_t);
-    utile_bytes = V3D_UTILE_PIXELS * bytes_per_pixel;
-    bcm2835_v3d_store_clear_pixel(pixel, format, color);
-
-    if (memory_format == 0) {
-        for (unsigned x = 0; x < width; x++) {
-            memcpy(row + x * bytes_per_pixel, pixel, bytes_per_pixel);
-        }
-
-        for (y = 0; y < height; y++) {
-            uint64_t addr = (uint64_t)s->render_base +
-                            ((uint64_t)(y0 + y) * s->render_width + x0) *
-                            bytes_per_pixel;
-
-            if (addr + width * bytes_per_pixel > UINT32_MAX + 1ULL ||
-                dma_memory_write(&s->dma_as, addr, row,
-                                 width * bytes_per_pixel,
-                                 MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-                return false;
-            }
-        }
-        return true;
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->tile_color); i++) {
+        s->tile_color[i] = color;
     }
-
-    for (unsigned i = 0; i < utile_bytes; i += bytes_per_pixel) {
-        memcpy(utile + i, pixel, bytes_per_pixel);
-    }
-
-    if (memory_format == 2) {
-        uint32_t stride = DIV_ROUND_UP(s->render_width, 4) * 4 *
-                          bytes_per_pixel;
-
-        for (unsigned uy = 0; uy < V3D_TILE_SIZE / 4; uy++) {
-            uint32_t py = y0 + uy * 4;
-
-            if (py >= s->render_height) {
-                break;
-            }
-            for (unsigned ux = 0; ux < V3D_TILE_SIZE / 4; ux++) {
-                uint32_t px = x0 + ux * 4;
-                uint64_t addr;
-
-                if (px >= s->render_width) {
-                    break;
-                }
-                addr = (uint64_t)s->render_base +
-                       (uint64_t)py * stride +
-                       (uint64_t)px * bytes_per_pixel * 4;
-                if (addr + utile_bytes > UINT32_MAX + 1ULL ||
-                    dma_memory_write(&s->dma_as, addr, utile, utile_bytes,
-                                     MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    /* VC4 T-format stores 32x32 pixel tiles with serpentine rows. */
-    {
-        static const uint8_t even_stile_map[4] = { 0, 3, 1, 2 };
-        static const uint8_t odd_stile_map[4] = { 2, 1, 3, 0 };
-        uint32_t tile_bytes = V3D_TILE_SIZE * V3D_TILE_SIZE * bytes_per_pixel;
-        uint32_t stile_bytes = V3D_UTILE_PIXELS * 16 * bytes_per_pixel;
-        uint32_t tile_stride = DIV_ROUND_UP(s->render_width, V3D_TILE_SIZE);
-        bool odd_tile_y = s->tile_y & 1;
-        uint32_t tile_x = odd_tile_y ? tile_stride - s->tile_x - 1 : s->tile_x;
-        uint64_t tile_base = (uint64_t)s->render_base +
-                             ((uint64_t)s->tile_y * tile_stride + tile_x) *
-                             tile_bytes;
-
-        for (unsigned uy = 0; uy < V3D_TILE_SIZE / 4; uy++) {
-            uint32_t utile_y = (uint32_t)s->tile_y * 8 + uy;
-            uint32_t py = y0 + uy * 4;
-            uint32_t stile_y = (utile_y >> 2) & 1;
-
-            if (py >= s->render_height) {
-                break;
-            }
-            for (unsigned ux = 0; ux < V3D_TILE_SIZE / 4; ux++) {
-                uint32_t utile_x = (uint32_t)s->tile_x * 8 + ux;
-                uint32_t px = x0 + ux * 4;
-                uint32_t stile_x = (utile_x >> 2) & 1;
-                uint32_t stile_index = (stile_y << 1) + stile_x;
-                uint32_t utile_in_stile = (utile_y & 3) * 4 + (utile_x & 3);
-                const uint8_t *stile_map = odd_tile_y ? odd_stile_map :
-                                                          even_stile_map;
-                uint64_t addr;
-
-                if (px >= s->render_width) {
-                    break;
-                }
-                addr = tile_base + stile_map[stile_index] * stile_bytes +
-                       utile_in_stile * utile_bytes;
-                if (addr + utile_bytes > UINT32_MAX + 1ULL ||
-                    dma_memory_write(&s->dma_as, addr, utile, utile_bytes,
-                                     MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
-                    return false;
-                }
-            }
-        }
-    }
-    return true;
+    s->tile_color_valid = true;
+    return bcm2835_v3d_copy_tile(s, s->render_base, memory_format,
+                                  format == 1 ? 0 : 2, true);
 }
 
 static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread);
@@ -1068,13 +964,17 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
 {
     BCM2835V3DState *s = opaque;
 
+    if (version_id < 5) {
+        memset(s->tile_color, 0, sizeof(s->tile_color));
+        s->tile_color_valid = false;
+    }
     bcm2835_v3d_update_irq(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -1111,8 +1011,8 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_BOOL_V(binning_started, BCM2835V3DState, 3),
         VMSTATE_UINT32_V(shader_state, BCM2835V3DState, 3),
         VMSTATE_BOOL_V(shader_state_valid, BCM2835V3DState, 3),
-        VMSTATE_UINT32_ARRAY_V(tile_color, BCM2835V3DState, 32 * 32, 4),
-        VMSTATE_BOOL_V(tile_color_valid, BCM2835V3DState, 4),
+        VMSTATE_UINT32_ARRAY_V(tile_color, BCM2835V3DState, 64 * 64, 5),
+        VMSTATE_BOOL_V(tile_color_valid, BCM2835V3DState, 5),
         VMSTATE_END_OF_LIST()
     },
 };
