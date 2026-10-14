@@ -71,6 +71,7 @@
 
 #define V3D_MAX_CL_COMMANDS    (1U << 16)
 #define V3D_TILE_SIZE          32
+#define V3D_UTILE_PIXELS       16
 
 /* VC4 packets 48 and 49 have data-dependent lengths and are not decoded yet. */
 static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
@@ -157,6 +158,26 @@ static bool bcm2835_v3d_dma_read(BCM2835V3DState *s, uint32_t addr,
                            MEMTXATTRS_UNSPECIFIED) == MEMTX_OK;
 }
 
+static uint16_t bcm2835_v3d_pack_bgr565(uint32_t rgba)
+{
+    uint8_t red = rgba;
+    uint8_t green = rgba >> 8;
+    uint8_t blue = rgba >> 16;
+
+    return ((uint16_t)(blue >> 3) << 11) |
+           ((uint16_t)(green >> 2) << 5) | (red >> 3);
+}
+
+static void bcm2835_v3d_store_clear_pixel(uint8_t *dst, unsigned format,
+                                           uint32_t color)
+{
+    if (format == 1) {
+        stl_le_p(dst, color);
+    } else {
+        stw_le_p(dst, bcm2835_v3d_pack_bgr565(color));
+    }
+}
+
 static void bcm2835_v3d_thread_error(BCM2835V3DState *s, unsigned thread,
                                      uint32_t addr, const char *reason)
 {
@@ -172,6 +193,7 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
 {
     uint8_t row[V3D_TILE_SIZE * sizeof(uint32_t)];
     uint8_t utile[64];
+    uint8_t pixel[sizeof(uint32_t)];
     uint32_t x0 = s->tile_x * V3D_TILE_SIZE;
     uint32_t y0 = s->tile_y * V3D_TILE_SIZE;
     uint32_t width = MIN(V3D_TILE_SIZE, s->render_width -
@@ -181,32 +203,38 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
     uint32_t color = s->clear_color[0];
     unsigned format = (s->render_config >> 2) & 3;
     unsigned memory_format = (s->render_config >> 6) & 3;
+    unsigned bytes_per_pixel;
+    unsigned utile_bytes;
     unsigned y;
 
     if (!s->render_config_valid || !s->clear_color_valid || !width || !height) {
         return true;
     }
 
-    if (format != 1 || memory_format > 2) {
+    if ((format != 1 && format != 2) || memory_format > 2) {
         qemu_log_mask(LOG_UNIMP,
                       "bcm2835_v3d: clear skipped for render format %u/%u\n",
                       memory_format, format);
         return false;
     }
 
+    bytes_per_pixel = format == 1 ? sizeof(uint32_t) : sizeof(uint16_t);
+    utile_bytes = V3D_UTILE_PIXELS * bytes_per_pixel;
+    bcm2835_v3d_store_clear_pixel(pixel, format, color);
+
     if (memory_format == 0) {
         for (unsigned x = 0; x < width; x++) {
-            stl_le_p(row + x * sizeof(uint32_t), color);
+            memcpy(row + x * bytes_per_pixel, pixel, bytes_per_pixel);
         }
 
         for (y = 0; y < height; y++) {
             uint64_t addr = (uint64_t)s->render_base +
                             ((uint64_t)(y0 + y) * s->render_width + x0) *
-                            sizeof(uint32_t);
+                            bytes_per_pixel;
 
-            if (addr + width * sizeof(uint32_t) > UINT32_MAX + 1ULL ||
+            if (addr + width * bytes_per_pixel > UINT32_MAX + 1ULL ||
                 dma_memory_write(&s->dma_as, addr, row,
-                                 width * sizeof(uint32_t),
+                                 width * bytes_per_pixel,
                                  MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
                 return false;
             }
@@ -214,13 +242,13 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
         return true;
     }
 
-    for (unsigned i = 0; i < sizeof(utile); i += sizeof(uint32_t)) {
-        stl_le_p(utile + i, color);
+    for (unsigned i = 0; i < utile_bytes; i += bytes_per_pixel) {
+        memcpy(utile + i, pixel, bytes_per_pixel);
     }
 
     if (memory_format == 2) {
         uint32_t stride = DIV_ROUND_UP(s->render_width, 4) * 4 *
-                          sizeof(uint32_t);
+                          bytes_per_pixel;
 
         for (unsigned uy = 0; uy < V3D_TILE_SIZE / 4; uy++) {
             uint32_t py = y0 + uy * 4;
@@ -236,9 +264,10 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
                     break;
                 }
                 addr = (uint64_t)s->render_base +
-                       (uint64_t)py * stride + (uint64_t)px * 16;
-                if (addr + sizeof(utile) > UINT32_MAX + 1ULL ||
-                    dma_memory_write(&s->dma_as, addr, utile, sizeof(utile),
+                       (uint64_t)py * stride +
+                       (uint64_t)px * bytes_per_pixel * 4;
+                if (addr + utile_bytes > UINT32_MAX + 1ULL ||
+                    dma_memory_write(&s->dma_as, addr, utile, utile_bytes,
                                      MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
                     return false;
                 }
@@ -247,15 +276,18 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
         return true;
     }
 
-    /* VC4 T-format uses 32x32 pixel, 4 KiB tiles with serpentine rows. */
+    /* VC4 T-format stores 32x32 pixel tiles with serpentine rows. */
     {
         static const uint8_t even_stile_map[4] = { 0, 3, 1, 2 };
         static const uint8_t odd_stile_map[4] = { 2, 1, 3, 0 };
+        uint32_t tile_bytes = V3D_TILE_SIZE * V3D_TILE_SIZE * bytes_per_pixel;
+        uint32_t stile_bytes = V3D_UTILE_PIXELS * 16 * bytes_per_pixel;
         uint32_t tile_stride = DIV_ROUND_UP(s->render_width, V3D_TILE_SIZE);
         bool odd_tile_y = s->tile_y & 1;
         uint32_t tile_x = odd_tile_y ? tile_stride - s->tile_x - 1 : s->tile_x;
         uint64_t tile_base = (uint64_t)s->render_base +
-                             ((uint64_t)s->tile_y * tile_stride + tile_x) * 4096;
+                             ((uint64_t)s->tile_y * tile_stride + tile_x) *
+                             tile_bytes;
 
         for (unsigned uy = 0; uy < V3D_TILE_SIZE / 4; uy++) {
             uint32_t utile_y = (uint32_t)s->tile_y * 8 + uy;
@@ -278,10 +310,10 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
                 if (px >= s->render_width) {
                     break;
                 }
-                addr = tile_base + stile_map[stile_index] * 1024 +
-                       utile_in_stile * sizeof(utile);
-                if (addr + sizeof(utile) > UINT32_MAX + 1ULL ||
-                    dma_memory_write(&s->dma_as, addr, utile, sizeof(utile),
+                addr = tile_base + stile_map[stile_index] * stile_bytes +
+                       utile_in_stile * utile_bytes;
+                if (addr + utile_bytes > UINT32_MAX + 1ULL ||
+                    dma_memory_write(&s->dma_as, addr, utile, utile_bytes,
                                      MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
                     return false;
                 }

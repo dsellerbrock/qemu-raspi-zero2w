@@ -25,6 +25,9 @@
 #define FB_ADDR     0x20000
 #define FB_SIZE     (64 * 64 * sizeof(uint32_t))
 
+#define V3D_FORMAT_RGBA8888 1
+#define V3D_FORMAT_BGR565   2
+
 #define V3D_EXPECTED_IDENT0 0x02443356
 #define V3D_EXPECTED_IDENT1 0xc0101432
 
@@ -75,9 +78,25 @@ static uint32_t read_u32(const uint8_t *buffer)
            ((uint32_t)buffer[2] << 16) | ((uint32_t)buffer[3] << 24);
 }
 
+static uint16_t read_u16(const uint8_t *buffer)
+{
+    return (uint16_t)buffer[0] | ((uint16_t)buffer[1] << 8);
+}
+
+static uint16_t pack_bgr565(uint32_t rgba)
+{
+    uint8_t red = rgba;
+    uint8_t green = rgba >> 8;
+    uint8_t blue = rgba >> 16;
+
+    return ((uint16_t)(blue >> 3) << 11) |
+           ((uint16_t)(green >> 2) << 5) | (red >> 3);
+}
+
 static size_t make_clear_list(uint8_t *buffer, uint32_t target,
                               uint16_t width, uint16_t height,
-                              unsigned memory_format, uint8_t tile_x,
+                              unsigned memory_format, unsigned color_format,
+                              uint8_t tile_x,
                               uint8_t tile_y, uint32_t color)
 {
     size_t offset = 0;
@@ -87,7 +106,7 @@ static size_t make_clear_list(uint8_t *buffer, uint32_t target,
     append_u32(buffer, &offset, target);
     append_u16(buffer, &offset, width);
     append_u16(buffer, &offset, height);
-    append_u16(buffer, &offset, (memory_format << 6) | 4);
+    append_u16(buffer, &offset, (memory_format << 6) | (color_format << 2));
 
     /* CLEAR_COLORS, TILE_COORDS, and STORE_MS_TILE_BUFFER_AND_EOF. */
     buffer[offset++] = 114;
@@ -108,6 +127,7 @@ static void submit_clear(unsigned memory_format, uint8_t tile_x,
 {
     uint8_t cl[64];
     size_t cl_size = make_clear_list(cl, FB_ADDR, 64, 64, memory_format,
+                                     V3D_FORMAT_RGBA8888,
                                      tile_x, tile_y, color);
 
     memwrite(CL_ADDR, cl, cl_size);
@@ -129,7 +149,8 @@ static void test_v3d_ct1_clear_linear(void)
     uint8_t initial[FB_SIZE];
     uint8_t fb[FB_SIZE];
     uint32_t color = 0x11223344;
-    size_t cl_size = make_clear_list(cl, FB_ADDR, 32, 32, 0, 0, 0, color);
+    size_t cl_size = make_clear_list(cl, FB_ADDR, 32, 32, 0,
+                                     V3D_FORMAT_RGBA8888, 0, 0, color);
 
     memset(initial, 0xa5, sizeof(initial));
     memwrite(FB_ADDR, initial, sizeof(initial));
@@ -204,6 +225,97 @@ static void test_v3d_ct1_clear_lt_tiled(void)
     }
 }
 
+static void test_v3d_ct1_clear_linear_bgr565(void)
+{
+    uint8_t cl[64];
+    uint8_t initial[FB_SIZE];
+    uint8_t fb[FB_SIZE];
+    uint32_t color = 0x11223344;
+    uint16_t expected = pack_bgr565(color);
+    size_t cl_size = make_clear_list(cl, FB_ADDR, 32, 32, 0,
+                                    V3D_FORMAT_BGR565, 0, 0, color);
+
+    g_assert_cmphex(expected, ==, 0x2188);
+    memset(initial, 0xa5, sizeof(initial));
+    memwrite(FB_ADDR, initial, sizeof(initial));
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+
+    memread(FB_ADDR, fb, 32 * 32 * sizeof(uint16_t));
+    for (size_t i = 0; i < 32 * 32; i++) {
+        g_assert_cmphex(read_u16(fb + i * sizeof(uint16_t)), ==, expected);
+    }
+}
+
+static void assert_bgr565_block(const uint8_t *fb, size_t offset,
+                                uint16_t color)
+{
+    for (size_t i = 0; i < 32 * 32 * sizeof(uint16_t); i += sizeof(uint16_t)) {
+        g_assert_cmphex(read_u16(fb + offset + i), ==, color);
+    }
+}
+
+static void test_v3d_ct1_clear_t_tiled_bgr565(void)
+{
+    static const uint32_t colors[4] = {
+        0x01020304, 0x11223344, 0x55667788, 0x99aabbcc,
+    };
+    uint8_t cl[64];
+    uint8_t initial[FB_SIZE];
+    uint8_t fb[FB_SIZE];
+
+    memset(initial, 0xa5, sizeof(initial));
+    memwrite(FB_ADDR, initial, sizeof(initial));
+
+    for (unsigned tile = 0; tile < G_N_ELEMENTS(colors); tile++) {
+        size_t cl_size = make_clear_list(cl, FB_ADDR, 64, 64, 1,
+                                         V3D_FORMAT_BGR565,
+                                         tile & 1, tile >> 1, colors[tile]);
+
+        memwrite(CL_ADDR, cl, cl_size);
+        writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+        writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+    }
+
+    memread(FB_ADDR, fb, sizeof(fb));
+    assert_bgr565_block(fb, 0, pack_bgr565(colors[0]));
+    assert_bgr565_block(fb, 2048, pack_bgr565(colors[1]));
+    /* T-tile rows alternate direction in memory. */
+    assert_bgr565_block(fb, 6144, pack_bgr565(colors[2]));
+    assert_bgr565_block(fb, 4096, pack_bgr565(colors[3]));
+}
+
+static void test_v3d_ct1_clear_lt_tiled_bgr565(void)
+{
+    uint8_t cl[64];
+    uint8_t initial[FB_SIZE];
+    uint8_t fb[FB_SIZE];
+    uint32_t color = 0x11223344;
+    uint16_t expected = pack_bgr565(color);
+    size_t cl_size = make_clear_list(cl, FB_ADDR, 64, 64, 2,
+                                    V3D_FORMAT_BGR565, 1, 1, color);
+
+    memset(initial, 0xa5, sizeof(initial));
+    memwrite(FB_ADDR, initial, sizeof(initial));
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+    memread(FB_ADDR, fb, sizeof(fb));
+
+    for (unsigned utile_y = 0; utile_y < 8; utile_y++) {
+        for (unsigned utile_x = 0; utile_x < 8; utile_x++) {
+            size_t offset = (32 + utile_y * 4) * 128 +
+                            (32 + utile_x * 4) * 8;
+
+            for (unsigned pixel = 0; pixel < 16; pixel++) {
+                g_assert_cmphex(read_u16(fb + offset + pixel * 2),
+                                ==, expected);
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -218,6 +330,12 @@ int main(int argc, char **argv)
                    test_v3d_ct1_clear_t_tiled);
     qtest_add_func("/bcm2835/v3d/ct1_clear_lt_tiled",
                    test_v3d_ct1_clear_lt_tiled);
+    qtest_add_func("/bcm2835/v3d/ct1_clear_linear_bgr565",
+                   test_v3d_ct1_clear_linear_bgr565);
+    qtest_add_func("/bcm2835/v3d/ct1_clear_t_tiled_bgr565",
+                   test_v3d_ct1_clear_t_tiled_bgr565);
+    qtest_add_func("/bcm2835/v3d/ct1_clear_lt_tiled_bgr565",
+                   test_v3d_ct1_clear_lt_tiled_bgr565);
     qtest_start("-machine raspi3ap -smp 4");
     ret = g_test_run();
     qtest_end();
