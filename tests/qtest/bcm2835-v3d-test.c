@@ -432,21 +432,30 @@ static uint32_t read_u32(const uint8_t *buffer)
            ((uint32_t)buffer[2] << 16) | ((uint32_t)buffer[3] << 24);
 }
 
-static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
+static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
 {
-    static const uint32_t screen_xy[] = {
-        (352U << 16) | (uint16_t)-352,
-        (352U << 16) | 352,
-        ((uint16_t)-352 << 16),
+    static const uint32_t vertices[6][7] = {
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
+          0xff00ff00, 0x00000000, 0x3f800000 },
+        { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
+          0xff000400, 0x00000000, 0x3f800000 },
+        { 0x00000000, 0x3f000000, 0x00000000, 0x3f800000,
+          0x01000000, 0x00000000, 0x3f800000 },
+        { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
+          0xff00ff00, 0x00000000, 0x3f800000 },
+        { 0x40000000, 0x00000000, 0x00000000, 0x3f800000,
+          0xff000400, 0x00000000, 0x3f800000 },
+        { 0x40000000, 0x3f000000, 0x00000000, 0x3f800000,
+          0x01000000, 0x00000000, 0x3f800000 },
     };
     uint8_t render_cl[32];
     uint8_t bin_cl[64];
     uint8_t draw_cl[32];
     uint8_t tile_head[6];
-    uint8_t tile_list[23];
+    uint8_t tile_list[45];
     uint8_t record[44] = { 0 };
-    uint8_t code[13 * sizeof(uint64_t)];
-    uint8_t vertices[sizeof(screen_xy)];
+    uint8_t code[17 * sizeof(uint64_t)];
+    uint8_t vertex_data[sizeof(vertices)];
     uint8_t initial[FB_SIZE];
     uint8_t fb[FB_SIZE];
     size_t render_size = 0;
@@ -454,35 +463,44 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     size_t draw_size = 0;
     uint32_t draw_color = 0xff00ff00;
     uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8) | 8;
-    uint32_t setup_read = (1U << 20) | (1U << 11) | (2U << 8);
+    uint32_t setup_read = (1U << 20) | (1U << 12) |
+                          (1U << 11) | (2U << 8);
     uint64_t instructions[] = {
         qpu_test_load_imm(49, setup_write) | (1ULL << 44),
-        qpu_test_load_imm(0, 0),
-        qpu_test_load_imm(1, 0x3f800000),
-        qpu_test_load_imm(49, setup_read),
+        qpu_test_load_imm(49, setup_read | (7U << 20)),
+        qpu_test_add_imm(48, 0, 0),
+        qpu_test_add_imm(48, 1, 0),
         qpu_test_add_imm(48, 2, 0),
-        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(48, 3, 0),
+        qpu_test_add_imm(48, 4, 0),
+        qpu_test_add_imm(48, 5, 0),
+        qpu_test_add_imm(48, 6, 0),
         qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(1, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(1, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(3, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(4, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(5, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(6, 48, 0) | (1ULL << 44),
         3ULL << 60,
     };
 
     memset(initial, 0x5a, sizeof(initial));
     memwrite(FB_ADDR, initial, sizeof(initial));
-    for (unsigned i = 0; i < G_N_ELEMENTS(screen_xy); i++) {
-        stl_le_p(vertices + i * sizeof(uint32_t), screen_xy[i]);
+    for (unsigned i = 0; i < G_N_ELEMENTS(vertices); i++) {
+        for (unsigned word = 0; word < G_N_ELEMENTS(vertices[i]); word++) {
+            stl_le_p(vertex_data + (i * G_N_ELEMENTS(vertices[i]) + word) *
+                     sizeof(uint32_t), vertices[i][word]);
+        }
     }
     stl_le_p(record + 28, 0x6200);
     record[26] = 1;
+    record[0] = 1U << 2; /* Enable homogeneous clipping. */
     stl_le_p(record + 36, 0x7000);
-    record[40] = sizeof(uint32_t) - 1;
-    record[41] = sizeof(uint32_t);
+    record[40] = sizeof(vertices[0]) - 1;
+    record[41] = sizeof(vertices[0]);
     memwrite(0x34000, record, sizeof(record));
-    memwrite(0x7000, vertices, sizeof(vertices));
+    memwrite(0x7000, vertex_data, sizeof(vertex_data));
     for (unsigned i = 0; i < G_N_ELEMENTS(instructions); i++) {
         stq_le_p(code + i * sizeof(uint64_t), instructions[i]);
     }
@@ -497,6 +515,9 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     append_u32(render_cl, &render_size, draw_color);
     append_u32(render_cl, &render_size, 0);
     append_u32(render_cl, &render_size, 0);
+    render_cl[render_size++] = 103;
+    append_u16(render_cl, &render_size, 40);
+    append_u16(render_cl, &render_size, 32);
     render_cl[render_size++] = 0;
     memwrite(CL_ADDR, render_cl, render_size);
     writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
@@ -512,9 +533,18 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     bin_cl[bin_size++] = 6;
     bin_cl[bin_size++] = 64;
     append_u32(bin_cl, &bin_size, 0x34001);
+    bin_cl[bin_size++] = 103;
+    append_u16(bin_cl, &bin_size, 40);
+    append_u16(bin_cl, &bin_size, 32);
+    bin_cl[bin_size++] = 104;
+    append_u32(bin_cl, &bin_size, 0xbf800000);
+    append_u32(bin_cl, &bin_size, 0x3f800000);
+    bin_cl[bin_size++] = 105;
+    append_u32(bin_cl, &bin_size, 0x44000000);
+    append_u32(bin_cl, &bin_size, 0x44000000);
     bin_cl[bin_size++] = 33;
     bin_cl[bin_size++] = 4;
-    append_u32(bin_cl, &bin_size, 3);
+    append_u32(bin_cl, &bin_size, G_N_ELEMENTS(vertices));
     append_u32(bin_cl, &bin_size, 0);
     bin_cl[bin_size++] = 4;
     memwrite(CL_ADDR, bin_cl, bin_size);
@@ -531,16 +561,26 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     memread(0x30024, tile_list, sizeof(tile_list));
     g_assert_cmphex(tile_head[0], ==, 17);
     g_assert_cmphex(read_u32(tile_head + 1), ==, 0x30024);
+    {
+        uint8_t list_length[4];
+
+        memread(0x30020, list_length, sizeof(list_length));
+        g_assert_cmpuint(read_u32(list_length), ==, 44);
+    }
     g_assert_cmphex(tile_list[0], ==, 56);
     g_assert_cmphex(tile_list[1], ==, 0x32);
     g_assert_cmphex(tile_list[7], ==, 48);
     g_assert_cmphex(tile_list[8], ==, 129);
-    for (unsigned i = 0; i < G_N_ELEMENTS(screen_xy); i++) {
-        g_assert_cmphex(read_u32(tile_list + 9 + i * sizeof(uint32_t)),
-                        ==, screen_xy[i]);
-    }
+    g_assert_cmphex(read_u32(tile_list + 9), ==, 0xff00ff00);
+    g_assert_cmphex(read_u32(tile_list + 13), ==, 0xff000200);
+    g_assert_cmphex(read_u32(tile_list + 17), ==, 0x00000200);
     g_assert_cmphex(tile_list[21], ==, 128);
-    g_assert_cmphex(tile_list[22], ==, 18);
+    g_assert_cmphex(tile_list[22], ==, 56);
+    g_assert_cmphex(read_u32(tile_list + 22 + 9), ==, 0xff00ff00);
+    g_assert_cmphex(read_u32(tile_list + 22 + 13), ==, 0x00000200);
+    g_assert_cmphex(read_u32(tile_list + 22 + 17), ==, 0x01000000);
+    g_assert_cmphex(tile_list[43], ==, 128);
+    g_assert_cmphex(tile_list[44], ==, 18);
 
     /* CT1 loads the tile, follows the binner's tile sublist, and stores it. */
     draw_cl[draw_size++] = 29;
@@ -560,7 +600,7 @@ static void test_v3d_ct0_rasterizes_coordinate_triangle(void)
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTERR, ==, 0);
 
     memread(FB_ADDR, fb, sizeof(fb));
-    g_assert_cmphex(read_u32(fb + (30 * 64 + 32) * sizeof(uint32_t)),
+    g_assert_cmphex(read_u32(fb + (30 * 64 + 62) * sizeof(uint32_t)),
                     ==, draw_color);
     g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
@@ -1028,8 +1068,8 @@ int main(int argc, char **argv)
                    test_v3d_ct0_flush_count);
     qtest_add_func("/bcm2835/v3d/ct0_shader_state_dma",
                    test_v3d_ct0_shader_state_dma);
-    qtest_add_func("/bcm2835/v3d/ct0_rasterizes_coordinate_triangle",
-                   test_v3d_ct0_rasterizes_coordinate_triangle);
+    qtest_add_func("/bcm2835/v3d/ct0_clips_and_rasterizes_coordinate_triangles",
+                   test_v3d_ct0_clips_and_rasterizes_coordinate_triangles);
     qtest_add_func("/bcm2835/v3d/ct0_primitive_packet_lengths",
                    test_v3d_ct0_primitive_packet_lengths);
     qtest_add_func("/bcm2835/v3d/ct1_clear_linear",

@@ -68,6 +68,14 @@ struct BCM2835V3DState {
     uint16_t shader_record_size;
     uint8_t shader_attribute_count;
     bool shader_record_extended;
+    uint32_t clipper_xy_scale[2];
+    uint32_t clipper_z_min;
+    uint32_t clipper_z_max;
+    int16_t viewport_center_x;
+    int16_t viewport_center_y;
+    bool clipper_xy_scale_valid;
+    bool clipper_z_clip_valid;
+    bool viewport_offset_valid;
     uint8_t tile_primitive_format;
     bool tile_primitive_format_valid;
     uint32_t pending_tile_load_base;

@@ -14,6 +14,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "system/dma.h"
+#include <math.h>
 
 #define V3D_IDENT0             0x000
 #define V3D_IDENT1             0x004
@@ -74,6 +75,11 @@
 #define V3D_PACKET_RENDER_CONFIG 113
 #define V3D_PACKET_CLEAR_COLORS 114
 #define V3D_PACKET_TILE_COORDS 115
+#define V3D_PACKET_Z_CLIP     104
+#define V3D_PACKET_CLIPPER_XY_SCALE 105
+#define V3D_PACKET_VIEWPORT_OFFSET 103
+
+#define V3D_SHADER_STATE_CLIP  (1U << 2)
 
 #define V3D_MAX_CL_COMMANDS    (1U << 16)
 #define V3D_MAX_PRIMITIVE_INDICES (1U << 20)
@@ -82,9 +88,14 @@
 #define V3D_QPU_INSTRUCTION_BUDGET (1U << 16)
 #define V3D_MAX_RASTER_WORK       (1U << 22)
 #define V3D_MAX_RASTER_TILES      4096
+#define V3D_MAX_CLIPPED_VERTICES  12
 #define V3D_TILE_SIZE          64
 #define V3D_T_MEMORY_TILE_SIZE 32
 #define V3D_UTILE_PIXELS       16
+
+typedef struct BCM2835V3DVertex {
+    uint32_t word[7];
+} BCM2835V3DVertex;
 
 /* VC4 packets 48 and 49 have data-dependent lengths and are not decoded yet. */
 static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
@@ -724,7 +735,7 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                                        unsigned uniforms_offset,
                                        unsigned attributes_offset,
                                        unsigned vpm_offset_byte,
-                                       uint32_t *screen_xy)
+                                       BCM2835V3DVertex *vertices)
 {
     uint32_t code_address = ldl_le_p(s->shader_record + code_offset) & ~7U;
     uint32_t uniforms_address = ldl_le_p(s->shader_record + uniforms_offset);
@@ -732,7 +743,7 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
     uint32_t code_size;
 
     if (!code_address) {
-        return screen_xy == NULL;
+        return vertices == NULL;
     }
     if (count > V3D_MAX_SHADER_VERTICES) {
         return false;
@@ -764,9 +775,7 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
             g_free(code);
             return false;
         }
-        if (screen_xy) {
-            uint8_t coordinate_row;
-
+        if (vertices) {
             if (qpu.vpm_write_total !=
                     BCM2835_V3D_QPU_VPM_WRITE_HISTORY ||
                 qpu.vpm_write_history_count !=
@@ -774,10 +783,16 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                 g_free(code);
                 return false;
             }
-            coordinate_row = qpu.vpm_write_history[4];
-            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
-                if (first + lane < count) {
-                    screen_xy[first + lane] = qpu.vpm[coordinate_row][lane];
+            for (unsigned word = 0; word <
+                 BCM2835_V3D_QPU_VPM_WRITE_HISTORY; word++) {
+                uint8_t coordinate_row = qpu.vpm_write_history[word];
+
+                for (unsigned lane = 0; lane <
+                     BCM2835_V3D_QPU_LANES; lane++) {
+                    if (first + lane < count) {
+                        vertices[first + lane].word[word] =
+                            qpu.vpm[coordinate_row][lane];
+                    }
                 }
             }
         }
@@ -971,9 +986,252 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
     return true;
 }
 
-/* CT0 bins coordinate triangles into guest-memory tile sublists. */
+static float bcm2835_v3d_bits_float(uint32_t bits)
+{
+    float value;
+
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static uint32_t bcm2835_v3d_float_bits(float value)
+{
+    uint32_t bits;
+
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static bool bcm2835_v3d_project_clipped_vertex(BCM2835V3DState *s,
+                                               BCM2835V3DVertex *vertex)
+{
+    float x = bcm2835_v3d_bits_float(vertex->word[0]);
+    float y = bcm2835_v3d_bits_float(vertex->word[1]);
+    float w = bcm2835_v3d_bits_float(vertex->word[3]);
+    float scale_x = bcm2835_v3d_bits_float(s->clipper_xy_scale[0]);
+    float scale_y = bcm2835_v3d_bits_float(s->clipper_xy_scale[1]);
+    float screen_x;
+    float screen_y;
+    long fixed_x;
+    long fixed_y;
+
+    if (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(scale_x) ||
+        !isfinite(scale_y) || w == 0.0f || scale_x <= 0.0f ||
+        scale_y <= 0.0f) {
+        return false;
+    }
+    screen_x = x / w * scale_x;
+    screen_y = y / w * scale_y;
+    if (!isfinite(screen_x) || !isfinite(screen_y) ||
+        screen_x < INT16_MIN || screen_x > INT16_MAX ||
+        screen_y < INT16_MIN || screen_y > INT16_MAX) {
+        return false;
+    }
+    fixed_x = lrintf(screen_x);
+    fixed_y = lrintf(screen_y);
+    if (fixed_x < INT16_MIN || fixed_x > INT16_MAX ||
+        fixed_y < INT16_MIN || fixed_y > INT16_MAX) {
+        return false;
+    }
+    vertex->word[4] = ((uint32_t)(uint16_t)(int16_t)fixed_y << 16) |
+                      (uint16_t)(int16_t)fixed_x;
+    vertex->word[6] = bcm2835_v3d_float_bits(1.0f / w);
+    return true;
+}
+
+static float bcm2835_v3d_clip_distance(BCM2835V3DState *s,
+                                       const BCM2835V3DVertex *vertex,
+                                       unsigned plane)
+{
+    float x = bcm2835_v3d_bits_float(vertex->word[0]);
+    float y = bcm2835_v3d_bits_float(vertex->word[1]);
+    float z = bcm2835_v3d_bits_float(vertex->word[2]);
+    float w = bcm2835_v3d_bits_float(vertex->word[3]);
+
+    switch (plane) {
+    case 0:
+        return x + w;
+    case 1:
+        return w - x;
+    case 2:
+        return y + w;
+    case 3:
+        return w - y;
+    case 4:
+        return z - bcm2835_v3d_bits_float(s->clipper_z_min) * w;
+    case 5:
+        return bcm2835_v3d_bits_float(s->clipper_z_max) * w - z;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static BCM2835V3DVertex bcm2835_v3d_lerp_vertex(
+    const BCM2835V3DVertex *a, const BCM2835V3DVertex *b, float t)
+{
+    BCM2835V3DVertex result;
+
+    for (unsigned i = 0; i < 4; i++) {
+        float av = bcm2835_v3d_bits_float(a->word[i]);
+        float bv = bcm2835_v3d_bits_float(b->word[i]);
+
+        result.word[i] = bcm2835_v3d_float_bits(av + (bv - av) * t);
+    }
+    result.word[4] = 0;
+    for (unsigned i = 5; i < 7; i++) {
+        float av = bcm2835_v3d_bits_float(a->word[i]);
+        float bv = bcm2835_v3d_bits_float(b->word[i]);
+
+        result.word[i] = bcm2835_v3d_float_bits(av + (bv - av) * t);
+    }
+    return result;
+}
+
+static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
+                                      const BCM2835V3DVertex *triangle,
+                                      BCM2835V3DVertex *polygon,
+                                      unsigned *polygon_count)
+{
+    BCM2835V3DVertex current[V3D_MAX_CLIPPED_VERTICES];
+    BCM2835V3DVertex next[V3D_MAX_CLIPPED_VERTICES];
+    unsigned current_count = 3;
+    float scale_x = bcm2835_v3d_bits_float(s->clipper_xy_scale[0]);
+    float scale_y = bcm2835_v3d_bits_float(s->clipper_xy_scale[1]);
+    float z_min = bcm2835_v3d_bits_float(s->clipper_z_min);
+    float z_max = bcm2835_v3d_bits_float(s->clipper_z_max);
+
+    if (!s->clipper_xy_scale_valid || !s->clipper_z_clip_valid ||
+        !isfinite(scale_x) || !isfinite(scale_y) || scale_x <= 0.0f ||
+        scale_y <= 0.0f || !isfinite(z_min) || !isfinite(z_max) ||
+        z_min > z_max) {
+        return false;
+    }
+    memcpy(current, triangle, sizeof(BCM2835V3DVertex) * current_count);
+    for (unsigned vertex = 0; vertex < current_count; vertex++) {
+        for (unsigned word = 0; word < 4; word++) {
+            if (!isfinite(bcm2835_v3d_bits_float(
+                    current[vertex].word[word]))) {
+                return false;
+            }
+        }
+    }
+
+    for (unsigned plane = 0; plane < 6 && current_count; plane++) {
+        unsigned next_count = 0;
+        BCM2835V3DVertex previous = current[current_count - 1];
+        float previous_distance = bcm2835_v3d_clip_distance(
+            s, &previous, plane);
+        bool previous_inside;
+
+        if (!isfinite(previous_distance)) {
+            return false;
+        }
+        previous_inside = previous_distance >= 0.0f;
+
+        for (unsigned i = 0; i < current_count; i++) {
+            BCM2835V3DVertex vertex = current[i];
+            float distance = bcm2835_v3d_clip_distance(s, &vertex, plane);
+            bool inside;
+
+            if (!isfinite(distance)) {
+                return false;
+            }
+            inside = distance >= 0.0f;
+
+            if (inside != previous_inside) {
+                float denominator = previous_distance - distance;
+                float t;
+                BCM2835V3DVertex intersection;
+
+                if (!isfinite(denominator) || denominator == 0.0f ||
+                    next_count == V3D_MAX_CLIPPED_VERTICES) {
+                    return false;
+                }
+                t = previous_distance / denominator;
+                if (!isfinite(t) || t < 0.0f || t > 1.0f) {
+                    return false;
+                }
+                intersection = bcm2835_v3d_lerp_vertex(
+                    &previous, &vertex, t);
+                if (!bcm2835_v3d_project_clipped_vertex(s, &intersection)) {
+                    return false;
+                }
+                next[next_count++] = intersection;
+            }
+            if (inside) {
+                if (next_count == V3D_MAX_CLIPPED_VERTICES) {
+                    return false;
+                }
+                next[next_count++] = vertex;
+            }
+            previous = vertex;
+            previous_distance = distance;
+            previous_inside = inside;
+        }
+        memcpy(current, next, sizeof(BCM2835V3DVertex) * next_count);
+        current_count = next_count;
+    }
+    memcpy(polygon, current, sizeof(BCM2835V3DVertex) * current_count);
+    *polygon_count = current_count;
+    return true;
+}
+
+static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
+                                             const BCM2835V3DVertex *triangle,
+                                             uint64_t *binned_tiles)
+{
+    int32_t center_x = s->viewport_offset_valid ? s->viewport_center_x :
+                                                 s->render_width / 2;
+    int32_t center_y = s->viewport_offset_valid ? s->viewport_center_y :
+                                                 s->render_height / 2;
+    int32_t x[3];
+    int32_t y[3];
+    int32_t min_x, min_y, max_x, max_y;
+    int32_t pixel_min_x, pixel_min_y, pixel_max_x, pixel_max_y;
+    int64_t area;
+    uint32_t screen_xy[3];
+
+    for (unsigned i = 0; i < 3; i++) {
+        screen_xy[i] = triangle[i].word[4];
+        x[i] = center_x * 16 + (int16_t)screen_xy[i];
+        y[i] = center_y * 16 -
+               (int16_t)(screen_xy[i] >> 16);
+    }
+    area = bcm2835_v3d_edge(x[0], y[0], x[1], y[1], x[2], y[2]);
+    if (!area) {
+        return true;
+    }
+    min_x = MIN(x[0], MIN(x[1], x[2]));
+    max_x = MAX(x[0], MAX(x[1], x[2]));
+    min_y = MIN(y[0], MIN(y[1], y[2]));
+    max_y = MAX(y[0], MAX(y[1], y[2]));
+    pixel_min_x = MAX(0, bcm2835_v3d_floor_12_4(min_x));
+    pixel_min_y = MAX(0, bcm2835_v3d_floor_12_4(min_y));
+    pixel_max_x = MIN((int32_t)s->render_width - 1,
+                      bcm2835_v3d_floor_12_4(max_x));
+    pixel_max_y = MIN((int32_t)s->render_height - 1,
+                      bcm2835_v3d_floor_12_4(max_y));
+    if (pixel_min_x > pixel_max_x || pixel_min_y > pixel_max_y) {
+        return true;
+    }
+
+    for (uint32_t tile_y = pixel_min_y / V3D_TILE_SIZE;
+         tile_y <= (uint32_t)pixel_max_y / V3D_TILE_SIZE; tile_y++) {
+        for (uint32_t tile_x = pixel_min_x / V3D_TILE_SIZE;
+             tile_x <= (uint32_t)pixel_max_x / V3D_TILE_SIZE; tile_x++) {
+            if (++*binned_tiles > V3D_MAX_RASTER_TILES ||
+                !bcm2835_v3d_append_tile_triangle(s, tile_x, tile_y,
+                                                 screen_xy)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* CT0 clips coordinate triangles, then emits the visible fan per tile. */
 static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
-                                      const uint32_t *screen_xy,
+                                      const BCM2835V3DVertex *vertices,
                                       unsigned count)
 {
     unsigned format = (s->render_config >> 2) & 3;
@@ -989,48 +1247,28 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
     }
 
     for (unsigned vertex = 0; vertex < count; vertex += 3) {
-        int32_t x[3];
-        int32_t y[3];
-        int32_t min_x, min_y, max_x, max_y;
-        int32_t pixel_min_x, pixel_min_y, pixel_max_x, pixel_max_y;
-        int64_t area;
+        if (s->shader_record[0] & V3D_SHADER_STATE_CLIP) {
+            BCM2835V3DVertex polygon[V3D_MAX_CLIPPED_VERTICES];
+            unsigned polygon_count;
 
-        for (unsigned i = 0; i < 3; i++) {
-            uint32_t packed = screen_xy[vertex + i];
+            if (!bcm2835_v3d_clip_triangle(s, vertices + vertex, polygon,
+                                           &polygon_count)) {
+                return false;
+            }
+            /* shortcut: XY fans until CT1 handles clipped varyings. */
+            for (unsigned i = 1; i + 1 < polygon_count; i++) {
+                BCM2835V3DVertex triangle[3] = {
+                    polygon[0], polygon[i], polygon[i + 1],
+                };
 
-            x[i] = (int32_t)s->render_width * 8 + (int16_t)packed;
-            y[i] = (int32_t)s->render_height * 8 - (int16_t)(packed >> 16);
-        }
-        area = bcm2835_v3d_edge(x[0], y[0], x[1], y[1], x[2], y[2]);
-        if (!area) {
-            continue;
-        }
-        min_x = MIN(x[0], MIN(x[1], x[2]));
-        max_x = MAX(x[0], MAX(x[1], x[2]));
-        min_y = MIN(y[0], MIN(y[1], y[2]));
-        max_y = MAX(y[0], MAX(y[1], y[2]));
-        pixel_min_x = MAX(0, bcm2835_v3d_floor_12_4(min_x));
-        pixel_min_y = MAX(0, bcm2835_v3d_floor_12_4(min_y));
-        pixel_max_x = MIN((int32_t)s->render_width - 1,
-                          bcm2835_v3d_floor_12_4(max_x));
-        pixel_max_y = MIN((int32_t)s->render_height - 1,
-                          bcm2835_v3d_floor_12_4(max_y));
-        if (pixel_min_x > pixel_max_x || pixel_min_y > pixel_max_y) {
-            continue;
-        }
-
-        for (uint32_t tile_y = pixel_min_y / V3D_TILE_SIZE;
-             tile_y <= (uint32_t)pixel_max_y / V3D_TILE_SIZE; tile_y++) {
-            for (uint32_t tile_x = pixel_min_x / V3D_TILE_SIZE;
-                 tile_x <= (uint32_t)pixel_max_x / V3D_TILE_SIZE; tile_x++) {
-                if (++binned_tiles > V3D_MAX_RASTER_TILES) {
-                    return false;
-                }
-                if (!bcm2835_v3d_append_tile_triangle(
-                        s, tile_x, tile_y, screen_xy + vertex)) {
+                if (!bcm2835_v3d_bin_screen_triangle(s, triangle,
+                                                     &binned_tiles)) {
                     return false;
                 }
             }
+        } else if (!bcm2835_v3d_bin_screen_triangle(s, vertices + vertex,
+                                                    &binned_tiles)) {
+            return false;
         }
     }
     return true;
@@ -1040,6 +1278,10 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
                                                  const uint32_t *screen_xy,
                                                  uint64_t *work)
 {
+    int32_t center_x = s->viewport_offset_valid ? s->viewport_center_x :
+                                                 s->render_width / 2;
+    int32_t center_y = s->viewport_offset_valid ? s->viewport_center_y :
+                                                 s->render_height / 2;
     int32_t x[3];
     int32_t y[3];
     int32_t x0 = (int32_t)s->tile_x * V3D_TILE_SIZE;
@@ -1059,8 +1301,8 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
     for (unsigned i = 0; i < 3; i++) {
         uint32_t packed = screen_xy[i];
 
-        x[i] = (int32_t)s->render_width * 8 + (int16_t)packed;
-        y[i] = (int32_t)s->render_height * 8 - (int16_t)(packed >> 16);
+        x[i] = center_x * 16 + (int16_t)packed;
+        y[i] = center_y * 16 - (int16_t)(packed >> 16);
     }
     area = bcm2835_v3d_edge(x[0], y[0], x[1], y[1], x[2], y[2]);
     if (!area) {
@@ -1155,7 +1397,7 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
 {
     uint32_t count = ldl_le_p(packet + 2);
     uint32_t *indices;
-    uint32_t *screen_xy;
+    BCM2835V3DVertex *vertices;
     bool success;
 
     if (!count) {
@@ -1171,7 +1413,7 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
         return false;
     }
     indices = g_new(uint32_t, count);
-    screen_xy = g_new(uint32_t, count);
+    vertices = g_new0(BCM2835V3DVertex, count);
     if (opcode == V3D_PACKET_ARRAY_PRIM) {
         uint32_t first = ldl_le_p(packet + 6);
 
@@ -1191,7 +1433,7 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
             if (!bcm2835_v3d_dma_read(s, address + first * index_size,
                                       indices_bytes, bytes)) {
                 g_free(indices);
-                g_free(screen_xy);
+                g_free(vertices);
                 return false;
             }
             for (uint32_t i = 0; i < batch; i++) {
@@ -1204,12 +1446,12 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
 
     /* CT0 runs the coordinate transform used by the tile binner. */
     success = bcm2835_v3d_run_qpu_stage(s, indices, count, 28, 32, 26, 7,
-                                         screen_xy);
+                                         vertices);
     g_free(indices);
     if (success) {
-        success = bcm2835_v3d_bin_triangles(s, screen_xy, count);
+        success = bcm2835_v3d_bin_triangles(s, vertices, count);
     }
-    g_free(screen_xy);
+    g_free(vertices);
     return success;
 }
 
@@ -1370,6 +1612,31 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                                          "shader state DMA read failed");
                 return;
             }
+            break;
+        case V3D_PACKET_Z_CLIP:
+            if (thread != 0) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "Z clipping state outside binning");
+                return;
+            }
+            s->clipper_z_min = ldl_le_p(packet + 1);
+            s->clipper_z_max = ldl_le_p(packet + 5);
+            s->clipper_z_clip_valid = true;
+            break;
+        case V3D_PACKET_VIEWPORT_OFFSET:
+            s->viewport_center_x = (int16_t)lduw_le_p(packet + 1);
+            s->viewport_center_y = (int16_t)lduw_le_p(packet + 3);
+            s->viewport_offset_valid = true;
+            break;
+        case V3D_PACKET_CLIPPER_XY_SCALE:
+            if (thread != 0) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "XY clipper scale outside binning");
+                return;
+            }
+            s->clipper_xy_scale[0] = ldl_le_p(packet + 1);
+            s->clipper_xy_scale[1] = ldl_le_p(packet + 5);
+            s->clipper_xy_scale_valid = true;
             break;
         case V3D_PACKET_PRIMITIVE_FORMAT:
             if (thread != 1) {
@@ -1707,6 +1974,14 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->shader_record_size = 0;
     s->shader_attribute_count = 0;
     s->shader_record_extended = false;
+    memset(s->clipper_xy_scale, 0, sizeof(s->clipper_xy_scale));
+    s->clipper_z_min = 0;
+    s->clipper_z_max = 0;
+    s->viewport_center_x = 0;
+    s->viewport_center_y = 0;
+    s->clipper_xy_scale_valid = false;
+    s->clipper_z_clip_valid = false;
+    s->viewport_offset_valid = false;
     s->tile_primitive_format = 0;
     s->tile_primitive_format_valid = false;
     s->pending_tile_load_base = 0;
@@ -1754,13 +2029,25 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
         s->pending_tile_load_color_format = 0;
         s->pending_tile_load = false;
     }
+    if (version_id < 8) {
+        memset(s->clipper_xy_scale, 0, sizeof(s->clipper_xy_scale));
+        s->clipper_z_min = 0;
+        s->clipper_z_max = 0;
+        s->clipper_xy_scale_valid = false;
+        s->clipper_z_clip_valid = false;
+    }
+    if (version_id < 9) {
+        s->viewport_center_x = 0;
+        s->viewport_center_y = 0;
+        s->viewport_offset_valid = false;
+    }
     bcm2835_v3d_update_irq(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 7,
+    .version_id = 9,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -1805,6 +2092,14 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_UINT16_V(shader_record_size, BCM2835V3DState, 6),
         VMSTATE_UINT8_V(shader_attribute_count, BCM2835V3DState, 6),
         VMSTATE_BOOL_V(shader_record_extended, BCM2835V3DState, 6),
+        VMSTATE_UINT32_ARRAY_V(clipper_xy_scale, BCM2835V3DState, 2, 8),
+        VMSTATE_UINT32_V(clipper_z_min, BCM2835V3DState, 8),
+        VMSTATE_UINT32_V(clipper_z_max, BCM2835V3DState, 8),
+        VMSTATE_BOOL_V(clipper_xy_scale_valid, BCM2835V3DState, 8),
+        VMSTATE_BOOL_V(clipper_z_clip_valid, BCM2835V3DState, 8),
+        VMSTATE_INT16_V(viewport_center_x, BCM2835V3DState, 9),
+        VMSTATE_INT16_V(viewport_center_y, BCM2835V3DState, 9),
+        VMSTATE_BOOL_V(viewport_offset_valid, BCM2835V3DState, 9),
         VMSTATE_UINT8_V(tile_primitive_format, BCM2835V3DState, 7),
         VMSTATE_BOOL_V(tile_primitive_format_valid, BCM2835V3DState, 7),
         VMSTATE_UINT32_V(pending_tile_load_base, BCM2835V3DState, 7),
