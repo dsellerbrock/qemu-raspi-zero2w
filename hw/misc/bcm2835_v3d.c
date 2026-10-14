@@ -561,6 +561,10 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                 }
                 s->binning_started = true;
                 s->shader_state_valid = false;
+                s->shader_record_size = 0;
+                s->shader_attribute_count = 0;
+                s->shader_record_extended = false;
+                memset(s->shader_record, 0, sizeof(s->shader_record));
                 s->ct_cs[thread] &= ~V3D_CS_CTMODE;
             }
             break;
@@ -645,7 +649,34 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                                          "shader state outside tile binning");
                 return;
             }
-            s->shader_state = ldl_le_p(packet + 1);
+            {
+                uint32_t pointer = ldl_le_p(packet + 1);
+                uint32_t address = pointer & ~0xfU;
+                unsigned attributes = pointer & 7;
+                bool extended = pointer & 8;
+                uint16_t record_size;
+
+                if (!attributes) {
+                    attributes = 8;
+                }
+                record_size = extended ? 100 + attributes * 4 :
+                                         36 + attributes * 8;
+                if ((uint64_t)address + record_size > UINT32_MAX + 1ULL ||
+                    !bcm2835_v3d_dma_read(s, address, s->shader_record,
+                                           record_size)) {
+                    bcm2835_v3d_thread_error(s, thread, *ca,
+                                             "shader state DMA read failed");
+                    return;
+                }
+                if (record_size < sizeof(s->shader_record)) {
+                    memset(s->shader_record + record_size, 0,
+                           sizeof(s->shader_record) - record_size);
+                }
+                s->shader_state = pointer;
+                s->shader_record_size = record_size;
+                s->shader_attribute_count = attributes;
+                s->shader_record_extended = extended;
+            }
             s->shader_state_valid = true;
             break;
         case V3D_PACKET_FLUSH:
@@ -925,6 +956,7 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     memset(s->ct_waiting, 0, sizeof(s->ct_waiting));
     memset(s->clear_color, 0, sizeof(s->clear_color));
     memset(s->tile_color, 0, sizeof(s->tile_color));
+    memset(s->shader_record, 0, sizeof(s->shader_record));
     s->render_base = 0;
     s->render_width = 0;
     s->render_height = 0;
@@ -944,6 +976,9 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->binning_started = false;
     s->shader_state = 0;
     s->shader_state_valid = false;
+    s->shader_record_size = 0;
+    s->shader_attribute_count = 0;
+    s->shader_record_extended = false;
     s->irq_status = 0;
     s->irq_enable = 0;
     bcm2835_v3d_update_irq(s);
@@ -968,13 +1003,20 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
         memset(s->tile_color, 0, sizeof(s->tile_color));
         s->tile_color_valid = false;
     }
+    if (version_id < 6) {
+        memset(s->shader_record, 0, sizeof(s->shader_record));
+        s->shader_record_size = 0;
+        s->shader_attribute_count = 0;
+        s->shader_record_extended = false;
+        s->shader_state_valid = false;
+    }
     bcm2835_v3d_update_irq(s);
     return 0;
 }
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -1013,6 +1055,10 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_BOOL_V(shader_state_valid, BCM2835V3DState, 3),
         VMSTATE_UINT32_ARRAY_V(tile_color, BCM2835V3DState, 64 * 64, 5),
         VMSTATE_BOOL_V(tile_color_valid, BCM2835V3DState, 5),
+        VMSTATE_UINT8_ARRAY_V(shader_record, BCM2835V3DState, 132, 6),
+        VMSTATE_UINT16_V(shader_record_size, BCM2835V3DState, 6),
+        VMSTATE_UINT8_V(shader_attribute_count, BCM2835V3DState, 6),
+        VMSTATE_BOOL_V(shader_record_extended, BCM2835V3DState, 6),
         VMSTATE_END_OF_LIST()
     },
 };

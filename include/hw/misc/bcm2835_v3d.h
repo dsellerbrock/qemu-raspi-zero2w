@@ -62,6 +62,10 @@ struct BCM2835V3DState {
     bool binning_started;
     uint32_t shader_state;
     bool shader_state_valid;
+    uint8_t shader_record[132];
+    uint16_t shader_record_size;
+    uint8_t shader_attribute_count;
+    bool shader_record_extended;
 };
 
 #endif /* HW_MISC_BCM2835_V3D_H */

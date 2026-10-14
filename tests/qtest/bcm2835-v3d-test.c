@@ -145,6 +145,51 @@ static void test_v3d_ct0_flush_count(void)
                     ==, V3D_FLDONE);
 }
 
+static void test_v3d_ct0_shader_state_dma(void)
+{
+    uint8_t cl[64];
+    uint8_t record[44] = { 0 };
+
+    record[3] = 2; /* Fragment shader varying count. */
+    record[14] = 1; /* Vertex shader attribute array select. */
+    record[15] = 12; /* Vertex shader total attribute size. */
+    record[16] = 0x00;
+    record[17] = 0x60; /* Vertex shader code: 0x6000. */
+    record[20] = 0x00;
+    record[21] = 0x61; /* Vertex shader uniforms: 0x6100. */
+    record[28] = 0x00;
+    record[29] = 0x62; /* Coordinate shader code: 0x6200. */
+    record[36] = 0x00;
+    record[37] = 0x70; /* Attribute array 0 base: 0x7000. */
+    record[40] = 11; /* Attribute array byte count minus one. */
+    record[41] = 12; /* Attribute array stride. */
+    memwrite(0x34000, record, sizeof(record));
+
+    for (unsigned invalid = 0; invalid < 2; invalid++) {
+        size_t cl_size = 0;
+        uint32_t pointer = invalid ? 0x7f000001 : 0x34001;
+
+        cl[cl_size++] = 112;
+        append_u32(cl, &cl_size, 0x30000);
+        append_u32(cl, &cl_size, 0x2000);
+        append_u32(cl, &cl_size, 0x32000);
+        cl[cl_size++] = 1;
+        cl[cl_size++] = 1;
+        cl[cl_size++] = 0x04;
+        cl[cl_size++] = 6;
+        cl[cl_size++] = 64;
+        append_u32(cl, &cl_size, pointer);
+
+        writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
+        memwrite(CL_ADDR, cl, cl_size);
+        writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+        writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + cl_size);
+
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR,
+                        ==, invalid ? V3D_CTERR : 0);
+    }
+}
+
 static void test_v3d_ct0_primitive_packet_lengths(void)
 {
     static const struct {
@@ -568,6 +613,8 @@ int main(int argc, char **argv)
                    test_v3d_ct0_binning_setup);
     qtest_add_func("/bcm2835/v3d/ct0_flush_count",
                    test_v3d_ct0_flush_count);
+    qtest_add_func("/bcm2835/v3d/ct0_shader_state_dma",
+                   test_v3d_ct0_shader_state_dma);
     qtest_add_func("/bcm2835/v3d/ct0_primitive_packet_lengths",
                    test_v3d_ct0_primitive_packet_lengths);
     qtest_add_func("/bcm2835/v3d/ct1_clear_linear",
