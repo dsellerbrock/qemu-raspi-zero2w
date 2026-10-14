@@ -60,6 +60,8 @@ struct BCM2835V3DState {
     uint8_t bin_tiles_y;
     uint8_t bin_flags;
     uint64_t bin_alloc_next;
+    uint32_t bin_overflow_next;
+    uint32_t bin_overflow_remaining;
     uint16_t bin_alloc_block_size;
     uint16_t bin_alloc_initial_block_size;
     uint32_t bin_draw_append_count;

@@ -924,6 +924,8 @@ static bool bcm2835_v3d_init_tile_lists(BCM2835V3DState *s)
 
     /* The PTB starts each tile in its initial block, then shares the rest. */
     s->bin_alloc_next = pool_address;
+    s->bin_overflow_next = 0;
+    s->bin_overflow_remaining = 0;
     s->bin_draw_append_count = 0;
     s->bin_draw_resume = false;
     s->bin_oom_waiting = false;
@@ -952,6 +954,17 @@ static bool bcm2835_v3d_init_tile_lists(BCM2835V3DState *s)
     return true;
 }
 
+static bool bcm2835_v3d_overflow_range_valid(BCM2835V3DState *s,
+                                             uint32_t base, uint32_t size)
+{
+    uint64_t end = (uint64_t)base + size;
+    uint32_t memory_window = s->bin_alloc_base & 0xf0000000;
+
+    return base && size >= s->bin_alloc_block_size && !(base & 15) &&
+           end <= UINT32_MAX + 1ULL && (base & 0xf0000000) == memory_window &&
+           ((end - 1) & 0xf0000000) == memory_window;
+}
+
 static bool bcm2835_v3d_alloc_tile_block(BCM2835V3DState *s,
                                          uint32_t *address)
 {
@@ -963,25 +976,32 @@ static bool bcm2835_v3d_alloc_tile_block(BCM2835V3DState *s,
         return true;
     }
 
-    {
+    if (s->bin_overflow_remaining < s->bin_alloc_block_size) {
+        s->bin_overflow_next = 0;
+        s->bin_overflow_remaining = 0;
+    }
+
+    if (!s->bin_overflow_remaining) {
         uint32_t overflow_base = s->regs[V3D_BPOA >> 2];
         uint32_t overflow_size = s->regs[V3D_BPOS >> 2];
-        uint64_t overflow_end = (uint64_t)overflow_base + overflow_size;
-        uint32_t memory_window = s->bin_alloc_base & 0xf0000000;
 
-        if (overflow_base && overflow_size >= s->bin_alloc_block_size &&
-            !(overflow_base & 15) && overflow_end <= UINT32_MAX + 1ULL &&
-            (overflow_base & 0xf0000000) == memory_window &&
-            ((overflow_end - 1) & 0xf0000000) == memory_window) {
-            *address = overflow_base;
-            s->regs[V3D_BPOA >> 2] += s->bin_alloc_block_size;
-            s->regs[V3D_BPOS >> 2] -= s->bin_alloc_block_size;
+        if (bcm2835_v3d_overflow_range_valid(s, overflow_base,
+                                             overflow_size)) {
+            s->bin_overflow_next = overflow_base;
+            s->bin_overflow_remaining = overflow_size;
+            s->regs[V3D_BPOS >> 2] = 0;
             if (!s->bin_spilluse) {
                 s->bin_spilluse = true;
                 bcm2835_v3d_raise_irq(s, V3D_INT_SPILLUSE);
             }
-            return true;
         }
+    }
+
+    if (s->bin_overflow_remaining >= s->bin_alloc_block_size) {
+        *address = s->bin_overflow_next;
+        s->bin_overflow_next += s->bin_alloc_block_size;
+        s->bin_overflow_remaining -= s->bin_alloc_block_size;
+        return true;
     }
 
     s->bin_oom_waiting = true;
@@ -1716,6 +1736,8 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             s->bin_tiles_y = tiles_y;
             s->bin_flags = flags;
             s->bin_alloc_next = 0;
+            s->bin_overflow_next = 0;
+            s->bin_overflow_remaining = 0;
             s->bin_alloc_block_size = block_size;
             s->bin_alloc_initial_block_size = initial_block_size;
             memset(s->bin_tile_list_addr, 0,
@@ -1871,13 +1893,15 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 
 static void bcm2835_v3d_resume_binner_if_ready(BCM2835V3DState *s)
 {
-    if (!s->bin_oom_waiting || !s->regs[V3D_BPOA >> 2] ||
-        !s->regs[V3D_BPOS >> 2]) {
+    uint32_t base = s->regs[V3D_BPOA >> 2];
+    uint32_t size = s->regs[V3D_BPOS >> 2];
+
+    if (!s->bin_oom_waiting ||
+        !bcm2835_v3d_overflow_range_valid(s, base, size)) {
         return;
     }
 
     s->bin_oom_waiting = false;
-    s->regs[V3D_PCS >> 2] &= ~V3D_PCS_BMOOM;
     s->ct_cs[0] &= ~V3D_CS_CTSUBS;
     if (s->ct_ca[0] != s->ct_ea[0]) {
         s->ct_cs[0] |= V3D_CS_CTRUN;
@@ -2083,6 +2107,9 @@ static void bcm2835_v3d_write(void *opaque, hwaddr offset, uint64_t value,
     case V3D_BPOA:
     case V3D_BPOS:
         s->regs[offset >> 2] = value32;
+        if (offset == V3D_BPOS) {
+            s->regs[V3D_PCS >> 2] &= ~V3D_PCS_BMOOM;
+        }
         bcm2835_v3d_resume_binner_if_ready(s);
         break;
     default:
@@ -2139,6 +2166,8 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->bin_tiles_y = 0;
     s->bin_flags = 0;
     s->bin_alloc_next = 0;
+    s->bin_overflow_next = 0;
+    s->bin_overflow_remaining = 0;
     s->bin_alloc_block_size = 0;
     s->bin_alloc_initial_block_size = 0;
     s->bin_draw_append_count = 0;
@@ -2230,6 +2259,10 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
         memset(s->bin_tile_list_addr, 0, sizeof(s->bin_tile_list_addr));
         memset(s->bin_tile_list_used, 0, sizeof(s->bin_tile_list_used));
     }
+    if (version_id < 12) {
+        s->bin_overflow_next = 0;
+        s->bin_overflow_remaining = 0;
+    }
     if (version_id < 11) {
         s->bin_draw_append_count = 0;
         s->bin_draw_resume = false;
@@ -2242,7 +2275,7 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 11,
+    .version_id = 12,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -2276,6 +2309,8 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_UINT8_V(bin_tiles_y, BCM2835V3DState, 3),
         VMSTATE_UINT8_V(bin_flags, BCM2835V3DState, 3),
         VMSTATE_UINT64_V(bin_alloc_next, BCM2835V3DState, 10),
+        VMSTATE_UINT32_V(bin_overflow_next, BCM2835V3DState, 12),
+        VMSTATE_UINT32_V(bin_overflow_remaining, BCM2835V3DState, 12),
         VMSTATE_UINT16_V(bin_alloc_block_size, BCM2835V3DState, 10),
         VMSTATE_UINT16_V(bin_alloc_initial_block_size, BCM2835V3DState, 10),
         VMSTATE_UINT32_ARRAY_V(bin_tile_list_addr, BCM2835V3DState,

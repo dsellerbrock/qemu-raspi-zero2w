@@ -592,11 +592,16 @@ static void test_v3d_ct0_clips_and_rasterizes_coordinate_triangles(void)
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_OUTOMEM,
                     ==, V3D_INT_OUTOMEM);
     writel(RASPI3_V3D_BASE + V3D_BPOA, 0x35000);
+    writel(RASPI3_V3D_BASE + V3D_BPOS, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
+                    ==, V3D_CTRUN | V3D_CTSUBS);
     writel(RASPI3_V3D_BASE + V3D_BPOS, 0x80);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR, ==, 0);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOA), ==, 0x35020);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOS), ==, 0x60);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOA), ==, 0x35000);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOS), ==, 0);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCA), ==, 0x30120);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCS), ==, 0);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_SPILLUSE,
