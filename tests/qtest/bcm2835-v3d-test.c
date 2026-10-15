@@ -48,7 +48,7 @@
 #define V3D_FORMAT_BGR565   2
 
 #define V3D_EXPECTED_IDENT0 0x02443356
-#define V3D_EXPECTED_IDENT1 0xc0101432
+#define V3D_EXPECTED_IDENT1 0xc0101431
 
 static void append_u32(uint8_t *buffer, size_t *offset, uint32_t value);
 static void append_u16(uint8_t *buffer, size_t *offset, uint16_t value);
@@ -184,6 +184,14 @@ static uint64_t qpu_test_add(unsigned raddr_a, unsigned raddr_b,
            (uint64_t)ws << 44 | (39ULL << 32) | (12ULL << 24) |
            (uint64_t)raddr_a << 18 |
            (uint64_t)raddr_b << 12 | (6ULL << 9) | (7ULL << 6) |
+           (7ULL << 3) | 7ULL;
+}
+
+static uint64_t qpu_test_ftoi(unsigned raddr_a, unsigned waddr_add)
+{
+    return (1ULL << 60) | (1ULL << 49) | (uint64_t)waddr_add << 38 |
+           (39ULL << 32) | (7ULL << 24) | (uint64_t)raddr_a << 18 |
+           (39ULL << 12) | (6ULL << 9) | (7ULL << 6) |
            (7ULL << 3) | 7ULL;
 }
 
@@ -496,10 +504,39 @@ static void test_v3d_qpu_v8muld(void)
     }
 }
 
+static void test_v3d_qpu_ftoi_edge_values(void)
+{
+    uint8_t code[2 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    static const uint32_t input[] = {
+        0xbfe00000, 0x3f400000, 0x7fc00000, 0x7f800000,
+        0xff800000, 0x4f000000, 0xcf000000, 0x00000000,
+    };
+    static const uint32_t expected[] = {
+        UINT32_MAX, 0, 0, INT32_MAX, INT32_MIN, INT32_MAX, INT32_MIN, 0,
+    };
+
+    qpu_test_store_code(code, qpu_test_ftoi(0, 33));
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = input[lane % G_N_ELEMENTS(input)];
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.acc[1][lane], ==,
+                        expected[lane % G_N_ELEMENTS(expected)]);
+    }
+}
+
 static void test_v3d_qpu_color_pack_unpack(void)
 {
     uint8_t pack_code[6 * sizeof(uint64_t)];
     uint8_t unpack_code[5 * sizeof(uint64_t)];
+    uint8_t pack_a_code[3 * sizeof(uint64_t)];
     BCM2835V3DQPUState qpu;
     uint32_t executed;
     static const uint32_t input[4] = {
@@ -554,6 +591,23 @@ static void test_v3d_qpu_color_pack_unpack(void)
         for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
             g_assert_cmphex(qpu.rf[0][unpack - 4][lane], ==, expected);
         }
+    }
+
+    stq_le_p(pack_a_code, qpu_test_add(0, 0, 2, false) | (1ULL << 52));
+    stq_le_p(pack_a_code + sizeof(uint64_t),
+             qpu_test_add(0, 0, 2, false) | (2ULL << 52));
+    stq_le_p(pack_a_code + 2 * sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = 0x1000;
+        qpu.rf[1][0][lane] = 0x234;
+        qpu.rf[0][2][lane] = 0xabcd0000;
+    }
+    g_assert_cmpint(bcm2835_v3d_qpu_run(pack_a_code, sizeof(pack_a_code), 8,
+                                         &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.rf[0][2][lane], ==, 0x12341234);
     }
 }
 
@@ -782,6 +836,36 @@ static void test_v3d_ct0_binning_setup(void)
     }
 }
 
+static void test_v3d_ct0_primitive_list_format(void)
+{
+    uint8_t cl[48];
+    size_t cl_size = 0;
+
+    cl[cl_size++] = 112;
+    append_u32(cl, &cl_size, 0x30000);
+    append_u32(cl, &cl_size, 0x2000);
+    append_u32(cl, &cl_size, 0x32000);
+    cl[cl_size++] = 2;
+    cl[cl_size++] = 2;
+    cl[cl_size++] = 0x04;
+    cl[cl_size++] = 6;
+    cl[cl_size++] = 56; /* PRIMITIVE_LIST_FORMAT, legal in CT0 bin CL. */
+    cl[cl_size++] = 0x12; /* 16-bit index triangles, as emitted by Mesa. */
+    cl[cl_size++] = 4;
+
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_INTCTL, V3D_FLDONE);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + cl_size);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA), ==,
+                    CL_ADDR + cl_size);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_FLDONE,
+                    ==, V3D_FLDONE);
+}
+
 static void test_v3d_ct0_flush_count(void)
 {
     uint8_t cl[32];
@@ -965,6 +1049,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     size_t bin_size = 0;
     size_t draw_size = 0;
     uint32_t draw_color = 0xff00ff00;
+    uint32_t bin_count;
     uint32_t vertex_setup_write = (1U << 12) | (1U << 11) | (2U << 8);
     uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8) | 8;
     uint32_t setup_read = (1U << 12) | (1U << 11) | (2U << 8);
@@ -1093,6 +1178,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     append_u32(bin_cl, &bin_size, 0);
     bin_cl[bin_size++] = 4;
     memwrite(CL_ADDR, bin_cl, bin_size);
+    writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
     writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
     writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
 
@@ -1182,6 +1268,48 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     }
     g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
+
+    /* Mesa clears with a four-vertex GL_TRIANGLE_FAN. */
+    bin_count = readl(RASPI3_V3D_BASE + V3D_BFC);
+    memcpy(vertex_data + 3 * sizeof(vertices[0]), vertex_data,
+           sizeof(vertices[0]));
+    memwrite(0x7000, vertex_data, sizeof(vertex_data));
+    record[0] = 0;
+    memwrite(0x34000, record, sizeof(record));
+    bin_size = 0;
+    bin_cl[bin_size++] = 112;
+    append_u32(bin_cl, &bin_size, 0x36000);
+    append_u32(bin_cl, &bin_size, 0x1000);
+    append_u32(bin_cl, &bin_size, 0x38000);
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 0x2c;
+    bin_cl[bin_size++] = 6;
+    bin_cl[bin_size++] = 64;
+    append_u32(bin_cl, &bin_size, 0x34001);
+    bin_cl[bin_size++] = 103;
+    append_u16(bin_cl, &bin_size, 40);
+    append_u16(bin_cl, &bin_size, 32);
+    bin_cl[bin_size++] = 104;
+    append_u32(bin_cl, &bin_size, 0xbf800000);
+    append_u32(bin_cl, &bin_size, 0x3f800000);
+    bin_cl[bin_size++] = 105;
+    append_u32(bin_cl, &bin_size, 0x44000000);
+    append_u32(bin_cl, &bin_size, 0x44000000);
+    bin_cl[bin_size++] = 33;
+    bin_cl[bin_size++] = 6;
+    append_u32(bin_cl, &bin_size, 4);
+    append_u32(bin_cl, &bin_size, 0);
+    bin_cl[bin_size++] = 4;
+    memwrite(CL_ADDR, bin_cl, bin_size);
+    writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA), ==,
+                    CL_ADDR + bin_size);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BFC), ==, bin_count + 1);
 }
 
 static void append_tile_buffer_packet(uint8_t *buffer, size_t *offset,
@@ -1711,6 +1839,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/v3d/qpu_packed_byte_alu",
                    test_v3d_qpu_packed_byte_alu);
     qtest_add_func("/bcm2835/v3d/qpu_v8muld", test_v3d_qpu_v8muld);
+    qtest_add_func("/bcm2835/v3d/qpu_ftoi_edge_values",
+                   test_v3d_qpu_ftoi_edge_values);
     qtest_add_func("/bcm2835/v3d/qpu_color_pack_unpack",
                    test_v3d_qpu_color_pack_unpack);
     qtest_add_func("/bcm2835/v3d/qpu_sfu", test_v3d_qpu_sfu);
@@ -1725,6 +1855,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/v3d/irq_masks", test_v3d_irq_masks);
     qtest_add_func("/bcm2835/v3d/ct0_binning_setup",
                    test_v3d_ct0_binning_setup);
+    qtest_add_func("/bcm2835/v3d/ct0_primitive_list_format",
+                   test_v3d_ct0_primitive_list_format);
     qtest_add_func("/bcm2835/v3d/ct0_flush_count",
                    test_v3d_ct0_flush_count);
     qtest_add_func("/bcm2835/v3d/ct0_shader_state_dma",

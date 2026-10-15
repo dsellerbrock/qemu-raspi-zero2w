@@ -76,6 +76,10 @@
 #define V3D_PACKET_INDEX_PRIM  32
 #define V3D_PACKET_GL_SHADER_STATE 64
 #define V3D_PACKET_PRIMITIVE_FORMAT 56
+#define V3D_PRIMITIVE_LIST_16_INDEX_TRIANGLES 0x12
+#define V3D_PRIMITIVE_LIST_32_XY_TRIANGLES 0x32
+#define V3D_PRIMITIVE_TRIANGLES 4
+#define V3D_PRIMITIVE_TRIANGLE_FAN 6
 #define V3D_PACKET_COMPRESSED  48
 #define V3D_PACKET_CLIPPED     49
 #define V3D_PACKET_BIN_CONFIG  112
@@ -825,6 +829,9 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
         return false;
     }
     if (!bcm2835_v3d_load_qpu_program(s, code_address, &code, &code_size)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: QPU program read failed at 0x%08x\n",
+                      code_address);
         return false;
     }
 
@@ -849,6 +856,9 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
         if (!bcm2835_v3d_load_qpu_attributes(
                 s, &qpu, indices, count, first,
                 s->shader_record[attributes_offset], vpm_offset_byte)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: QPU attribute load failed for program 0x%08x\n",
+                          code_address);
             g_free(code);
             return false;
         }
@@ -856,6 +866,26 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                                       V3D_QPU_INSTRUCTION_BUDGET, &qpu,
                                       &executed);
         if (result != BCM2835_V3D_QPU_END) {
+            uint64_t instruction = 0;
+            char trace[16 * 17 + 1] = { 0 };
+            size_t trace_size = 0;
+            unsigned trace_words = MIN(qpu.pc + 1, 16);
+
+            if ((uint64_t)qpu.pc * sizeof(uint64_t) + sizeof(uint64_t) <=
+                code_size) {
+                instruction = ldq_le_p(code + qpu.pc * sizeof(uint64_t));
+            }
+            for (unsigned i = 0; i < trace_words; i++) {
+                trace_size += g_snprintf(trace + trace_size,
+                                         sizeof(trace) - trace_size,
+                                         "%s%016" PRIx64,
+                                         i ? " " : "",
+                                         ldq_le_p(code + i * sizeof(uint64_t)));
+            }
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: QPU program 0x%08x returned %u at pc %u, instruction 0x%016" PRIx64 " acc2[0]=0x%08x code=%s\n",
+                          code_address, result, qpu.pc, instruction,
+                          qpu.acc[2][0], trace);
             g_free(code);
             return false;
         }
@@ -868,6 +898,31 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                     6 + s->shader_record[3] ||
                 qpu.vpm_write_history_count !=
                     6 + s->shader_record[3]) {
+                char instructions[16 * 17 + 1] = { 0 };
+                char rows[4 * BCM2835_V3D_QPU_VPM_WRITE_HISTORY + 1] = { 0 };
+                size_t instruction_size = 0;
+                size_t row_size = 0;
+
+                for (unsigned i = 0;
+                     i < MIN(code_size / sizeof(uint64_t), 16); i++) {
+                    instruction_size += g_snprintf(
+                        instructions + instruction_size,
+                        sizeof(instructions) - instruction_size,
+                        "%s%016" PRIx64, i ? " " : "",
+                        ldq_le_p(code + i * sizeof(uint64_t)));
+                }
+                for (unsigned i = 0; i < qpu.vpm_write_history_count; i++) {
+                    row_size += g_snprintf(rows + row_size,
+                                           sizeof(rows) - row_size,
+                                           "%s%u", i ? "," : "",
+                                           qpu.vpm_write_history[i]);
+                }
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm2835_v3d: QPU coordinate output mismatch: shader=0x%08x varyings=%u wrote=%u history=%u expected=%u rows=[%s] code=%s\n",
+                              code_address, s->shader_record[3],
+                              qpu.vpm_write_total,
+                              qpu.vpm_write_history_count,
+                              6 + s->shader_record[3], rows, instructions);
                 g_free(code);
                 return false;
             }
@@ -1177,7 +1232,7 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
     }
 
     commands[offset++] = V3D_PACKET_PRIMITIVE_FORMAT;
-    commands[offset++] = (3 << 4) | 2; /* 32-bit XY triangles */
+    commands[offset++] = V3D_PRIMITIVE_LIST_32_XY_TRIANGLES;
     commands[offset++] = V3D_PACKET_GL_SHADER_STATE;
     stl_le_p(commands + offset, s->shader_state);
     offset += sizeof(uint32_t);
@@ -1487,6 +1542,11 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
         (format != 1 && format != 2) || memory_format > 2 ||
         DIV_ROUND_UP(s->render_width, V3D_TILE_SIZE) > s->bin_tiles_x ||
         DIV_ROUND_UP(s->render_height, V3D_TILE_SIZE) > s->bin_tiles_y) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: invalid bin setup render=%u/%u/%u bin=%u/%u/%u/%u\n",
+                      s->render_config_valid, s->render_width,
+                      s->render_height, s->bin_config_valid,
+                      s->binning_started, s->bin_tiles_x, s->bin_tiles_y);
         return false;
     }
 
@@ -1497,6 +1557,9 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
 
             if (!bcm2835_v3d_clip_triangle(s, vertices + vertex, polygon,
                                            &polygon_count)) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm2835_v3d: triangle clipping failed at vertex %u\n",
+                              vertex);
                 return false;
             }
             for (unsigned i = 1; i + 1 < polygon_count; i++) {
@@ -1507,12 +1570,18 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
                 if (!bcm2835_v3d_bin_screen_triangle(s, triangle,
                                                      &binned_tiles,
                                                      &append_index)) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "bcm2835_v3d: clipped triangle bin failed at vertex %u\n",
+                                  vertex);
                     return false;
                 }
             }
         } else if (!bcm2835_v3d_bin_screen_triangle(s, vertices + vertex,
                                                     &binned_tiles,
                                                     &append_index)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: triangle bin failed at vertex %u\n",
+                          vertex);
             return false;
         }
     }
@@ -1713,7 +1782,7 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
     bool previous_valid = false;
 
     if (*ca == UINT32_MAX || !s->tile_primitive_format_valid ||
-        s->tile_primitive_format != ((3 << 4) | 2) ||
+        s->tile_primitive_format != V3D_PRIMITIVE_LIST_32_XY_TRIANGLES ||
         !s->shader_state_valid ||
         s->shader_record[3] > V3D_MAX_FRAGMENT_VARYINGS) {
         return false;
@@ -1866,8 +1935,10 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
                                                    uint8_t opcode)
 {
     uint32_t count = ldl_le_p(packet + 2);
+    unsigned mode = packet[1] & 0xf;
     uint32_t *indices;
     BCM2835V3DVertex *vertices;
+    BCM2835V3DVertex *fan_vertices = NULL;
     uint32_t (*vertex_vpm)[BCM2835_V3D_QPU_VPM_ROWS]
                           [BCM2835_V3D_QPU_LANES] = NULL;
     bool success;
@@ -1876,12 +1947,26 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
         return true;
     }
     if (count > V3D_MAX_SHADER_VERTICES) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: coordinate shader vertex count %u exceeds limit\n",
+                      count);
         return false;
     }
-    if ((packet[1] & 0xf) != 4 || count % 3) {
+    if (mode == V3D_PRIMITIVE_TRIANGLE_FAN && count < 3) {
+        return true;
+    }
+    if ((mode != V3D_PRIMITIVE_TRIANGLES &&
+         mode != V3D_PRIMITIVE_TRIANGLE_FAN) ||
+        (mode == V3D_PRIMITIVE_TRIANGLES && count % 3)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: unsupported primitive mode 0x%x for %u vertices\n",
+                      mode, count);
         return false;
     }
     if (s->shader_record[3] > V3D_MAX_FRAGMENT_VARYINGS) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: shader has unsupported %u varyings\n",
+                      s->shader_record[3]);
         return false;
     }
     indices = g_new(uint32_t, count);
@@ -1904,6 +1989,9 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
 
             if (!bcm2835_v3d_dma_read(s, address + first * index_size,
                                       indices_bytes, bytes)) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm2835_v3d: index read failed at 0x%08x (%zu bytes)\n",
+                              address + first * index_size, bytes);
                 g_free(indices);
                 g_free(vertices);
                 return false;
@@ -1934,8 +2022,28 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
     g_free(indices);
     g_free(vertex_vpm);
     if (success) {
-        success = bcm2835_v3d_bin_triangles(s, vertices, count);
+        if (mode == V3D_PRIMITIVE_TRIANGLE_FAN) {
+            unsigned triangle_vertices = 3 * (count - 2);
+
+            fan_vertices = g_new(BCM2835V3DVertex, triangle_vertices);
+            for (unsigned triangle = 0; triangle < count - 2; triangle++) {
+                fan_vertices[triangle * 3] = vertices[0];
+                fan_vertices[triangle * 3 + 1] = vertices[triangle + 1];
+                fan_vertices[triangle * 3 + 2] = vertices[triangle + 2];
+            }
+            success = bcm2835_v3d_bin_triangles(s, fan_vertices,
+                                                triangle_vertices);
+        } else {
+            success = bcm2835_v3d_bin_triangles(s, vertices, count);
+        }
+        if (!success) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: triangle binning rejected render %ux%u config 0x%08x tiles %ux%u\n",
+                          s->render_width, s->render_height,
+                          s->render_config, s->bin_tiles_x, s->bin_tiles_y);
+        }
     }
+    g_free(fan_vertices);
     g_free(vertices);
     return success;
 }
@@ -2140,9 +2248,13 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             s->clipper_xy_scale_valid = true;
             break;
         case V3D_PACKET_PRIMITIVE_FORMAT:
-            if (thread != 1) {
+            if ((thread == 0 &&
+                 packet[1] != V3D_PRIMITIVE_LIST_16_INDEX_TRIANGLES &&
+                 packet[1] != V3D_PRIMITIVE_LIST_32_XY_TRIANGLES) ||
+                (thread == 1 &&
+                 packet[1] != V3D_PRIMITIVE_LIST_32_XY_TRIANGLES)) {
                 bcm2835_v3d_thread_error(s, thread, *ca,
-                                         "primitive format outside tile rendering");
+                                         "unsupported primitive list format");
                 return;
             }
             s->tile_primitive_format = packet[1];
@@ -2297,7 +2409,7 @@ static uint64_t bcm2835_v3d_read(void *opaque, hwaddr offset, unsigned size)
     case V3D_IDENT0:
         return 0x02443356;
     case V3D_IDENT1:
-        return 0xc0101432;
+        return 0xc0101431;
     case V3D_IDENT2:
         return 0;
     case BCM2835_V3D_INTCTL:

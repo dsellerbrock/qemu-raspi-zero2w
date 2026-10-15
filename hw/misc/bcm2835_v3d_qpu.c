@@ -264,6 +264,15 @@ static uint32_t qpu_pack_mul_color(uint32_t value, unsigned pack)
     return packed << ((pack - 4) * 8);
 }
 
+static uint32_t qpu_pack_a_half(uint32_t value, uint32_t previous,
+                                unsigned pack)
+{
+    if (pack == 1) {
+        return (previous & 0xffff0000) | (value & 0xffff);
+    }
+    return (previous & 0x0000ffff) | ((value & 0xffff) << 16);
+}
+
 static bool qpu_tmu_normalize(float coordinate, unsigned wrap,
                               float *normalized)
 {
@@ -660,10 +669,11 @@ static bool qpu_execute_add(unsigned op, uint32_t a, uint32_t b,
         *result = qpu_float_bits(fabsf(fa) > fabsf(fb) ? fa : fb);
         break;
     case QPU_A_FTOI:
-        if (!isfinite(fa) || fa < -2147483648.0f || fa >= 2147483648.0f) {
-            return false;
-        }
-        *result = (uint32_t)(int32_t)fa;
+        /* shortcut: VC4 leaves NaN/overflow bits unspecified; use silicon
+         * captures if exact edge behavior matters.
+         */
+        *result = isnan(fa) ? 0 : fa >= 2147483648.0f ? INT32_MAX :
+                  fa <= -2147483648.0f ? INT32_MIN : (uint32_t)(int32_t)fa;
         break;
     case QPU_A_ITOF:
         *result = qpu_float_bits((float)sa);
@@ -1024,7 +1034,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
 
         if ((pm && (unpack == 1 || unpack == 2 || pack == 1 || pack == 2 ||
                     unpack > 7 || pack > 7)) ||
-            (!pm && (unpack || pack))) {
+            (!pm && (unpack || pack > 2))) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
 
@@ -1092,6 +1102,22 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         if (pm && pack) {
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
                 mul_result[lane] = qpu_pack_mul_color(mul_result[lane], pack);
+            }
+        }
+        if (!pm && pack) {
+            bool pack_add = !ws;
+            unsigned waddr = pack_add ? waddr_add : waddr_mul;
+            uint16_t active = pack_add ? active_add : active_mul;
+            uint32_t *result = pack_add ? add_result : mul_result;
+
+            if (waddr >= 32) {
+                return BCM2835_V3D_QPU_UNSUPPORTED;
+            }
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                if (active & (1U << lane)) {
+                    result[lane] = qpu_pack_a_half(
+                        result[lane], qpu->rf[0][waddr][lane], pack);
+                }
             }
         }
 
