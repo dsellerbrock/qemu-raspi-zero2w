@@ -112,7 +112,7 @@ typedef struct BCM2835V3DFragmentVarying {
     unsigned count;
 } BCM2835V3DFragmentVarying;
 
-/* VC4 packets 48 and 49 have data-dependent lengths and are not decoded yet. */
+/* VC4 packet 49 and compressed-list relative branches are not decoded yet. */
 static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
 {
     switch (opcode) {
@@ -1644,11 +1644,34 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
     return true;
 }
 
+static int32_t bcm2835_v3d_sign_extend(uint32_t value, unsigned bits)
+{
+    uint32_t sign = 1U << (bits - 1);
+
+    return value & sign ? (int32_t)value - (1 << bits) : (int32_t)value;
+}
+
+static bool bcm2835_v3d_add_xy_delta(uint32_t xy, int32_t dx, int32_t dy,
+                                      uint32_t *result)
+{
+    int32_t x = (int16_t)xy + dx;
+    int32_t y = (int16_t)(xy >> 16) + dy;
+
+    if (x < INT16_MIN || x > INT16_MAX ||
+        y < INT16_MIN || y > INT16_MAX) {
+        return false;
+    }
+    *result = (uint16_t)x | ((uint32_t)(uint16_t)y << 16);
+    return true;
+}
+
 static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
                                                uint32_t *ca)
 {
     uint32_t triangles = 0;
     uint64_t work = 0;
+    uint32_t previous[3];
+    bool previous_valid = false;
 
     if (*ca == UINT32_MAX || !s->tile_primitive_format_valid ||
         s->tile_primitive_format != ((3 << 4) | 2) ||
@@ -1661,7 +1684,7 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
     while (triangles < V3D_MAX_RASTER_WORK / (V3D_TILE_SIZE *
                                               V3D_TILE_SIZE)) {
         uint8_t code;
-        uint8_t coord_bytes[sizeof(uint32_t) * 3];
+        uint8_t data[13];
         uint8_t varying_bytes[sizeof(uint32_t) *
                               3 * (V3D_MAX_FRAGMENT_VARYINGS + 1)];
         uint32_t coords[3];
@@ -1669,7 +1692,8 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
         uint32_t reciprocal_w[3];
         size_t varying_size = s->shader_record[3] ?
             3 * (s->shader_record[3] + 1) * sizeof(uint32_t) : 0;
-        size_t triangle_size = 1 + sizeof(coord_bytes) + varying_size;
+        size_t encoded_size;
+        size_t triangle_size;
 
         if (!bcm2835_v3d_dma_read(s, *ca, &code, sizeof(code))) {
             return false;
@@ -1678,19 +1702,102 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
             *ca += 1;
             return true;
         }
-        if (code != 129 || (uint64_t)*ca + triangle_size >
-                           UINT32_MAX + 1ULL ||
-            !bcm2835_v3d_dma_read(s, *ca + 1, coord_bytes,
-                                  sizeof(coord_bytes)) ||
-            (varying_size &&
-             !bcm2835_v3d_dma_read(s, *ca + 1 + sizeof(coord_bytes),
-                                   varying_bytes, varying_size))) {
+        if (code == 130) {
             return false;
         }
-        for (unsigned i = 0; i < G_N_ELEMENTS(coords); i++) {
-            coords[i] = ldl_le_p(coord_bytes + i * sizeof(uint32_t));
+
+        if (code == 129) {
+            encoded_size = 13;
+        } else if (code == 15) {
+            encoded_size = 8;
+        } else if ((code & 3) == 3) {
+            encoded_size = 3;
+        } else {
+            encoded_size = 2;
         }
+
+        triangle_size = encoded_size + (code == 129 ? varying_size : 0);
+        if ((uint64_t)*ca + triangle_size > UINT32_MAX + 1ULL ||
+            !bcm2835_v3d_dma_read(s, *ca, data, encoded_size)) {
+            return false;
+        }
+
+        if (code == 129) {
+            for (unsigned i = 0; i < G_N_ELEMENTS(coords); i++) {
+                coords[i] = ldl_le_p(data + 1 + i * sizeof(uint32_t));
+            }
+        } else {
+            uint32_t dx;
+            uint32_t dy;
+            unsigned orientation;
+
+            if (varying_size) {
+                return false;
+            }
+            if (code == 15) {
+                uint64_t encoded = ldq_le_p(data);
+
+                coords[0] = lduw_le_p(data + 4) |
+                            ((uint32_t)lduw_le_p(data + 6) << 16);
+                dx = (encoded >> 4) & 0x7f;
+                dy = (encoded >> 11) & 0x7f;
+                uint32_t dx2 = (encoded >> 18) & 0x7f;
+                uint32_t dy2 = (encoded >> 25) & 0x7f;
+                if (!bcm2835_v3d_add_xy_delta(coords[0],
+                        bcm2835_v3d_sign_extend(dx, 7),
+                        bcm2835_v3d_sign_extend(dy, 7), &coords[1]) ||
+                    !bcm2835_v3d_add_xy_delta(coords[0],
+                        bcm2835_v3d_sign_extend(dx2, 7),
+                        bcm2835_v3d_sign_extend(dy2, 7), &coords[2])) {
+                    return false;
+                }
+            } else {
+                bool wide = (code & 3) == 3;
+                uint32_t encoded = wide ?
+                    data[0] | ((uint32_t)data[1] << 8) |
+                    ((uint32_t)data[2] << 16) : lduw_le_p(data);
+                unsigned x_bits = wide ? 10 : 7;
+                unsigned x_shift = wide ? 4 : 2;
+                unsigned y_shift = wide ? 14 : 9;
+
+                orientation = wide ? (encoded >> 2) & 3 : encoded & 3;
+                if (!previous_valid || orientation > 2) {
+                    return false;
+                }
+                dx = (encoded >> x_shift) & ((1U << x_bits) - 1);
+                dy = (encoded >> y_shift) & ((1U << (wide ? 10 :
+                                                                  7)) - 1);
+                if (!wide && bcm2835_v3d_sign_extend(dx, 7) < -62) {
+                    return false;
+                }
+                switch (orientation) {
+                case 0:
+                    coords[0] = previous[2];
+                    coords[1] = previous[1];
+                    break;
+                case 1:
+                    coords[0] = previous[0];
+                    coords[1] = previous[2];
+                    break;
+                default:
+                    coords[0] = previous[1];
+                    coords[1] = previous[0];
+                    break;
+                }
+                if (!bcm2835_v3d_add_xy_delta(previous[2],
+                        bcm2835_v3d_sign_extend(dx, x_bits),
+                        bcm2835_v3d_sign_extend(dy, wide ? 10 : 7),
+                        &coords[2])) {
+                    return false;
+                }
+            }
+        }
+
         if (varying_size) {
+            if (!bcm2835_v3d_dma_read(s, *ca + encoded_size, varying_bytes,
+                                      varying_size)) {
+                return false;
+            }
             for (unsigned index = 0; index < s->shader_record[3]; index++) {
                 for (unsigned i = 0; i < 3; i++) {
                     varying[index * 3 + i] = ldl_le_p(varying_bytes +
@@ -1707,6 +1814,8 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
                 varying_size ? reciprocal_w : NULL, &work)) {
             return false;
         }
+        memcpy(previous, coords, sizeof(previous));
+        previous_valid = true;
         *ca += triangle_size;
         triangles++;
     }

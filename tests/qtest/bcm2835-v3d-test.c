@@ -1083,6 +1083,77 @@ static void test_v3d_ct1_clear_single_sample_64x64_tile(void)
     }
 }
 
+static void test_v3d_ct1_compressed_xy_triangle_encodings(void)
+{
+    uint8_t cl[96];
+    uint8_t record[44] = { 0 };
+    uint8_t initial[FB_SIZE];
+    uint8_t fb[FB_SIZE];
+    uint32_t color = 0xff123456;
+    size_t cl_size = 0;
+    uint64_t relative_triangle = 15 | (48ULL << 4) | (80ULL << 11) |
+                                 (48ULL << 25) |
+                                 (0xffe8ULL << 32) | (0xffe8ULL << 48);
+
+    memset(initial, 0x5a, sizeof(initial));
+    memwrite(FB_ADDR, initial, sizeof(initial));
+    memwrite(0x34000, record, sizeof(record));
+
+    cl[cl_size++] = 113;
+    append_u32(cl, &cl_size, FB_ADDR);
+    append_u16(cl, &cl_size, 64);
+    append_u16(cl, &cl_size, 64);
+    append_u16(cl, &cl_size, V3D_FORMAT_RGBA8888 << 2);
+    cl[cl_size++] = 114;
+    append_u32(cl, &cl_size, color);
+    append_u32(cl, &cl_size, 0);
+    append_u32(cl, &cl_size, 0);
+    cl[cl_size++] = 0; /* Final byte of the 14-byte clear-colors packet. */
+    append_tile_buffer_packet(cl, &cl_size, 29, FB_ADDR, 0, 0);
+    cl[cl_size++] = 115;
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 103;
+    append_u16(cl, &cl_size, 32);
+    append_u16(cl, &cl_size, 32);
+    cl[cl_size++] = 56;
+    cl[cl_size++] = 0x32; /* 32-bit XY triangle coordinates. */
+    cl[cl_size++] = 64;
+    append_u32(cl, &cl_size, 0x34001);
+    cl[cl_size++] = 48;
+    stq_le_p(cl + cl_size, relative_triangle); /* Coding 2: absolute + deltas. */
+    cl_size += sizeof(relative_triangle);
+    append_u16(cl, &cl_size, 0xa004); /* Coding 0: shared edge + delta. */
+    cl[cl_size++] = 11; /* Coding 1: shared edge + wide delta, orientation 2. */
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 129; /* Coding 3: absolute triangle. */
+    append_u32(cl, &cl_size, 0xffe8ffe8);
+    append_u32(cl, &cl_size, 0xffe80018);
+    append_u32(cl, &cl_size, 0x0018ffe8);
+    cl[cl_size++] = 128; /* Compressed-list escape. */
+    cl[cl_size++] = 25;  /* Store tile and end frame. */
+
+    writel(RASPI3_V3D_BASE + V3D_CT1CS, 1U << 15);
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTERR, ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CA), ==,
+                    CL_ADDR + cl_size);
+
+    memread(FB_ADDR, fb, sizeof(fb));
+    unsigned drawn_pixels = 0;
+    for (unsigned i = 0; i < FB_SIZE / sizeof(uint32_t); i++) {
+        drawn_pixels += read_u32(fb + i * sizeof(uint32_t)) == color;
+    }
+    g_assert_cmpuint(drawn_pixels, >, 0);
+    g_assert_cmphex(read_u32(fb + (32 * 64 + 32) * sizeof(uint32_t)),
+                    ==, color);
+    g_assert_cmphex(read_u32(fb + (10 * 64 + 50) * sizeof(uint32_t)),
+                    ==, 0x5a5a5a5a);
+}
+
 static void test_v3d_ct1_frame_done_requires_eof(void)
 {
     uint8_t cl[64];
@@ -1500,6 +1571,8 @@ int main(int argc, char **argv)
                    test_v3d_ct1_load_store_layout_conversion);
     qtest_add_func("/bcm2835/v3d/ct1_clear_single_sample_64x64_tile",
                    test_v3d_ct1_clear_single_sample_64x64_tile);
+    qtest_add_func("/bcm2835/v3d/ct1_compressed_xy_triangle_encodings",
+                   test_v3d_ct1_compressed_xy_triangle_encodings);
     qtest_add_func("/bcm2835/v3d/ct1_frame_done_requires_eof",
                    test_v3d_ct1_frame_done_requires_eof);
     qtest_start("-machine raspi3ap -smp 4");
