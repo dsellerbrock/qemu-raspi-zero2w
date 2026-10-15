@@ -1410,10 +1410,10 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
     float z_min = bcm2835_v3d_bits_float(s->clipper_z_min);
     float z_max = bcm2835_v3d_bits_float(s->clipper_z_max);
 
-    if (!s->clipper_xy_scale_valid || !s->clipper_z_clip_valid ||
-        !isfinite(scale_x) || !isfinite(scale_y) || scale_x <= 0.0f ||
-        scale_y <= 0.0f || !isfinite(z_min) || !isfinite(z_max) ||
-        z_min > z_max) {
+    if (!s->clipper_xy_scale_valid || !isfinite(scale_x) ||
+        !isfinite(scale_y) || scale_x <= 0.0f || scale_y <= 0.0f ||
+        (s->clipper_z_clip_valid &&
+         (!isfinite(z_min) || !isfinite(z_max) || z_min > z_max))) {
         return false;
     }
     memcpy(current, triangle, sizeof(BCM2835V3DVertex) * current_count);
@@ -1426,7 +1426,13 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
         }
     }
 
-    for (unsigned plane = 0; plane < 6 && current_count; plane++) {
+    /*
+     * shortcut: Mesa omits packet 104; skip Z clipping until its default
+     * bounds are modeled for depth draws.
+     */
+    for (unsigned plane = 0;
+         plane < (s->clipper_z_clip_valid ? 6 : 4) && current_count;
+         plane++) {
         unsigned next_count = 0;
         BCM2835V3DVertex previous = current[current_count - 1];
         float previous_distance = bcm2835_v3d_clip_distance(

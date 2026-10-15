@@ -1164,9 +1164,6 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     bin_cl[bin_size++] = 103;
     append_u16(bin_cl, &bin_size, 40);
     append_u16(bin_cl, &bin_size, 32);
-    bin_cl[bin_size++] = 104;
-    append_u32(bin_cl, &bin_size, 0xbf800000);
-    append_u32(bin_cl, &bin_size, 0x3f800000);
     bin_cl[bin_size++] = 105;
     append_u32(bin_cl, &bin_size, 0x44000000);
     append_u32(bin_cl, &bin_size, 0x44000000);
