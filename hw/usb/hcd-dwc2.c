@@ -942,8 +942,8 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
     if (prst) {
         trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old,
                                    val & ~HPRT0_CONNDET);
-        trace_usb_dwc2_hreg0_action("call usb_port_reset");
-        usb_port_reset(&s->uport);
+        trace_usb_dwc2_hreg0_action("call usb_device_reset");
+        usb_device_reset(dev);
         val &= ~HPRT0_CONNDET;
     } else {
         trace_usb_dwc2_hreg0_write(addr, hreg0nm[index], orig, old, val);
