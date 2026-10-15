@@ -204,6 +204,15 @@ static uint64_t qpu_test_itof_rfa_unpack(unsigned raddr_a,
            (6ULL << 6);
 }
 
+static uint64_t qpu_test_rfa_unpack(unsigned unpack, unsigned op_add,
+                                    unsigned waddr_add)
+{
+    return (13ULL << 60) | (uint64_t)unpack << 57 | (1ULL << 49) |
+           (uint64_t)waddr_add << 38 | (39ULL << 32) |
+           (uint64_t)op_add << 24 | (6ULL << 9) | (7ULL << 6) |
+           (7ULL << 3) | 7ULL;
+}
+
 static uint64_t qpu_test_write_tmu(unsigned address, bool regfile_b)
 {
     return (1ULL << 60) | (1ULL << 49) |
@@ -566,6 +575,69 @@ static void test_v3d_qpu_rfa_unpack_itof(void)
         g_assert_cmphex(qpu.rf[0][1][lane], ==,
                         qpu_test_float_bits((float)expected[
                             lane % G_N_ELEMENTS(expected)]));
+    }
+}
+
+static void test_v3d_qpu_rfa_unpack_modes(void)
+{
+    static const uint32_t half_input[] = {
+        0x3c00bc00, 0x00013c00, 0x00000000, 0x7bfffc00,
+    };
+    static const uint32_t byte_input[] = {
+        0x12345678, 0x99aabbcc, 0x000000ff, 0x80000000,
+    };
+    static const uint32_t half_float[2][4] = {
+        { 0xbf800000, 0x3f800000, 0x00000000, 0xff800000 },
+        { 0x3f800000, 0x33800000, 0x00000000, 0x477fe000 },
+    };
+    static const uint32_t half_integer[2][4] = {
+        { 0xffffbc00, 0x00003c00, 0x00000000, 0xfffffc00 },
+        { 0x00003c00, 0x00000001, 0x00000000, 0x00007bff },
+    };
+
+    for (unsigned unpack = 1; unpack <= 7; unpack++) {
+        for (unsigned floating = 0; floating < 2; floating++) {
+            uint8_t code[2 * sizeof(uint64_t)];
+            BCM2835V3DQPUState qpu;
+            uint32_t executed;
+
+            if (unpack == 3 && floating) {
+                continue;
+            }
+            qpu_test_store_code(code,
+                qpu_test_rfa_unpack(unpack, floating ? 1 : 12, 4));
+            bcm2835_v3d_qpu_init(&qpu);
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                unsigned index = lane % G_N_ELEMENTS(half_input);
+
+                qpu.rf[0][0][lane] = unpack <= 2 ? half_input[index] :
+                                                        byte_input[index];
+            }
+            g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8,
+                                                 &qpu, &executed),
+                            ==, BCM2835_V3D_QPU_END);
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                unsigned index = lane % G_N_ELEMENTS(half_input);
+                uint32_t expected;
+
+                if (unpack <= 2) {
+                    expected = floating ? half_float[unpack - 1][index] :
+                                          half_integer[unpack - 1][index];
+                } else {
+                    uint32_t byte = unpack == 3 ? byte_input[index] >> 24 :
+                        (byte_input[index] >> ((unpack - 4) * 8)) & 0xff;
+
+                    if (unpack == 3) {
+                        expected = (byte & 0xff) * UINT32_C(0x01010101);
+                    } else if (floating) {
+                        expected = qpu_test_float_bits((byte & 0xff) / 255.0f);
+                    } else {
+                        expected = byte & 0xff;
+                    }
+                }
+                g_assert_cmphex(qpu.rf[0][4][lane], ==, expected);
+            }
+        }
     }
 }
 
@@ -2017,6 +2089,8 @@ int main(int argc, char **argv)
                    test_v3d_qpu_ftoi_edge_values);
     qtest_add_func("/bcm2835/v3d/qpu_rfa_unpack_itof",
                    test_v3d_qpu_rfa_unpack_itof);
+    qtest_add_func("/bcm2835/v3d/qpu_rfa_unpack_modes",
+                   test_v3d_qpu_rfa_unpack_modes);
     qtest_add_func("/bcm2835/v3d/qpu_color_pack_unpack",
                    test_v3d_qpu_color_pack_unpack);
     qtest_add_func("/bcm2835/v3d/qpu_cross_mux_register_reads",

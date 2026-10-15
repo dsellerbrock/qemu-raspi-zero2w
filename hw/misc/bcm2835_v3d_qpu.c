@@ -922,10 +922,9 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms,
  * horizontal 32-bit VPM access, MUL vector rotation, TMU0 RGBA texture
- * sampling, and signed 16a integer unpack from register file A. shortcut:
- * no register-file timing, A-file packing, other unpack modes, vertical VPM,
- * TMU1, different min/mag spatial filters or multiple mip levels; add as guest
- * shaders require.
+ * sampling, and register-file A unpack. shortcut: no register-file timing,
+ * A-file packing, vertical VPM access, TMU1, different min/mag spatial filters
+ * or multiple mip levels; add those as guest shaders require.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -1088,8 +1087,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
              op_mul == QPU_M_FMUL);
 
         if ((pm && (pack == 1 || pack == 2 || unpack > 7 || pack > 7)) ||
-            (!pm && (unpack > 1 || pack > 2 ||
-                     (unpack && rfa_float_input)))) {
+            (!pm && (unpack > 7 || pack > 2))) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
 
@@ -1112,9 +1110,28 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         if (qpu->io_fault) {
             return BCM2835_V3D_QPU_CODE_FAULT;
         }
-        if (!pm && unpack == 1) {
+        if (!pm && unpack) {
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
-                reg_a[lane] = (uint32_t)(int32_t)(int16_t)reg_a[lane];
+                uint32_t value = reg_a[lane];
+
+                if (unpack == 1 || unpack == 2) {
+                    unsigned shift = (unpack - 1) * 16;
+                    uint16_t half = (uint16_t)(value >> shift);
+
+                    reg_a[lane] = rfa_float_input ?
+                        qpu_half_to_float_bits(half) :
+                        (uint32_t)(int32_t)(int16_t)half;
+                } else if (unpack == 3) {
+                    uint32_t alpha = (value >> 24) & 0xff;
+
+                    reg_a[lane] = alpha * UINT32_C(0x01010101);
+                } else {
+                    unsigned shift = (unpack - 4) * 8;
+                    uint32_t byte = (value >> shift) & 0xff;
+
+                    reg_a[lane] = rfa_float_input ?
+                        qpu_float_bits(byte / 255.0f) : byte;
+                }
             }
         }
         if (sig == QPU_SIG_LOAD_IMM) {
