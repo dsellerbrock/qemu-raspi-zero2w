@@ -13,6 +13,7 @@
 #define BCM2835_V3D_QPU_LANES 16
 #define BCM2835_V3D_QPU_VPM_ROWS 64
 #define BCM2835_V3D_QPU_VPM_WRITE_HISTORY BCM2835_V3D_QPU_VPM_ROWS
+#define BCM2835_V3D_QPU_TMUS 2
 
 typedef bool (*BCM2835V3DQPUReadUniform)(void *opaque, uint32_t address,
                                          uint32_t *value);
@@ -28,6 +29,16 @@ typedef bool (*BCM2835V3DQPUReadVarying)(
     uint32_t partial[BCM2835_V3D_QPU_LANES],
     uint32_t c[BCM2835_V3D_QPU_LANES]);
 
+typedef struct BCM2835V3DQPUTMU {
+    uint32_t t[BCM2835_V3D_QPU_LANES];
+    uint32_t result[BCM2835_V3D_QPU_LANES];
+    uint32_t config0;
+    uint16_t t_mask;
+    uint16_t instruction_write_mask[4];
+    bool has_t;
+    bool pending;
+} BCM2835V3DQPUTMU;
+
 typedef struct BCM2835V3DQPUState {
     uint32_t rf[2][32][BCM2835_V3D_QPU_LANES];
     uint32_t acc[6][BCM2835_V3D_QPU_LANES];
@@ -41,13 +52,7 @@ typedef struct BCM2835V3DQPUState {
     uint32_t sfu_result[3][BCM2835_V3D_QPU_LANES];
     uint64_t sfu_ready_at[3];
     bool sfu_pending[3];
-    uint32_t tmu0_t[BCM2835_V3D_QPU_LANES];
-    uint32_t tmu0_result[BCM2835_V3D_QPU_LANES];
-    uint32_t tmu0_config0;
-    uint16_t tmu0_t_mask;
-    uint16_t tmu0_instruction_write_mask[4];
-    bool tmu0_has_t;
-    bool tmu0_pending;
+    BCM2835V3DQPUTMU tmu[BCM2835_V3D_QPU_TMUS];
     uint16_t z;
     uint16_t n;
     uint16_t c;

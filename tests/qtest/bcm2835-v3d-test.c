@@ -405,6 +405,56 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
     }
 }
 
+static void test_v3d_qpu_tmu1_rgba_texture_sampling(void)
+{
+    uint8_t code[4 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    QPUTestTexture texture = {
+        .uniform_address = 0x1000,
+        .memory_base = 0x4000,
+        .texels = {
+            0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00,
+        },
+        .config = {
+            0x4000,
+            (2U << 20) | (2U << 8) | (1U << 7) | (1U << 4) |
+            (1U << 2) | 1U,
+        },
+    };
+    uint32_t executed;
+
+    stq_le_p(code, qpu_test_write_tmu(61, false));
+    stq_le_p(code + sizeof(uint64_t), qpu_test_write_tmu(60, true));
+    stq_le_p(code + 2 * sizeof(uint64_t), 11ULL << 60); /* Load TMU1. */
+    stq_le_p(code + 3 * sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.uniform_address = texture.uniform_address;
+    qpu.read_uniform = qpu_test_read_texture_uniform;
+    qpu.uniform_opaque = &texture;
+    qpu.read_texture = qpu_test_read_texture;
+    qpu.texture_opaque = &texture;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = qpu_test_float_bits(
+            lane & 1 ? 0.75f : 0.25f);
+        qpu.rf[1][0][lane] = qpu_test_float_bits(
+            lane & 2 ? 0.75f : 0.25f);
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(texture.uniform_reads, ==, 2);
+    g_assert_cmpuint(texture.memory_reads, ==,
+                     BCM2835_V3D_QPU_LANES);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        unsigned x = lane & 2 ? 1 : 0;
+        unsigned y = lane & 1 ? 1 : 0;
+
+        g_assert_cmphex(qpu.acc[4][lane], ==,
+                        texture.texels[y * 2 + x]);
+    }
+}
+
 static void test_v3d_qpu_fragment_w_register(void)
 {
     uint8_t code[2 * sizeof(uint64_t)];
@@ -2342,6 +2392,8 @@ int main(int argc, char **argv)
                    test_v3d_qpu_uniform_read);
     qtest_add_func("/bcm2835/v3d/qpu_tmu0_rgba_texture_sampling",
                    test_v3d_qpu_tmu0_rgba_texture_sampling);
+    qtest_add_func("/bcm2835/v3d/qpu_tmu1_rgba_texture_sampling",
+                   test_v3d_qpu_tmu1_rgba_texture_sampling);
     qtest_add_func("/bcm2835/v3d/qpu_fragment_w_register",
                    test_v3d_qpu_fragment_w_register);
     qtest_add_func("/bcm2835/v3d/qpu_tile_color_signals",
