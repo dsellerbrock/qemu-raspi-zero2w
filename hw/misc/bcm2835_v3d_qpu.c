@@ -261,6 +261,11 @@ static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
                               unsigned address,
                               uint32_t value[BCM2835_V3D_QPU_LANES])
 {
+    if (address == 15 && !regfile_b && qpu->fragment_shader) {
+        memcpy(value, qpu->fragment_w, sizeof(qpu->fragment_w));
+        return true;
+    }
+
     if (address < 32) {
         memcpy(value, qpu->rf[regfile_b][address], sizeof(qpu->rf[0][0]));
         return true;

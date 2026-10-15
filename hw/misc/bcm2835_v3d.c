@@ -96,6 +96,7 @@
 #define V3D_MAX_RASTER_WORK       (1U << 22)
 #define V3D_MAX_RASTER_TILES      BCM2835_V3D_MAX_TILES
 #define V3D_MAX_CLIPPED_VERTICES  12
+#define V3D_MAX_FRAGMENT_VARYINGS 1
 #define V3D_TILE_SIZE          64
 #define V3D_T_MEMORY_TILE_SIZE 32
 #define V3D_UTILE_PIXELS       16
@@ -103,6 +104,11 @@
 typedef struct BCM2835V3DVertex {
     uint32_t word[7];
 } BCM2835V3DVertex;
+
+/* shortcut: one scalar varying, expand when VPM output becomes variable-length. */
+typedef struct BCM2835V3DFragmentVarying {
+    uint32_t partial[BCM2835_V3D_QPU_LANES];
+} BCM2835V3DFragmentVarying;
 
 /* VC4 packets 48 and 49 have data-dependent lengths and are not decoded yet. */
 static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
@@ -658,6 +664,21 @@ static bool bcm2835_v3d_qpu_read_uniform(void *opaque, uint32_t address,
     return true;
 }
 
+static bool bcm2835_v3d_qpu_read_varying(
+    void *opaque, unsigned index,
+    uint32_t partial[BCM2835_V3D_QPU_LANES],
+    uint32_t c[BCM2835_V3D_QPU_LANES])
+{
+    BCM2835V3DFragmentVarying *varying = opaque;
+
+    if (index) {
+        return false;
+    }
+    memcpy(partial, varying->partial, sizeof(varying->partial));
+    memset(c, 0, sizeof(varying->partial));
+    return true;
+}
+
 static bool bcm2835_v3d_load_qpu_program(BCM2835V3DState *s,
                                          uint32_t address,
                                          uint8_t **code, uint32_t *code_size)
@@ -870,6 +891,8 @@ static int64_t bcm2835_v3d_edge(int32_t ax, int32_t ay,
 
 static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
                                              const uint16_t *pixels,
+                                             const uint32_t *varying_partial,
+                                             const uint32_t *fragment_w,
                                              unsigned count)
 {
     uint32_t code_address = ldl_le_p(s->shader_record + 4) & ~7U;
@@ -885,6 +908,7 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
     for (unsigned first = 0; first < count;
          first += BCM2835_V3D_QPU_LANES) {
         BCM2835V3DQPUState qpu;
+        BCM2835V3DFragmentVarying varying = { 0 };
         uint32_t executed;
         uint32_t batch = MIN(count - first, BCM2835_V3D_QPU_LANES);
         uint16_t expected_mask = batch == BCM2835_V3D_QPU_LANES ?
@@ -895,6 +919,11 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
         qpu.uniform_address = uniforms_address;
         qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
         qpu.uniform_opaque = s;
+        qpu.fragment_shader = true;
+        if (s->shader_record[3]) {
+            qpu.read_varying = bcm2835_v3d_qpu_read_varying;
+            qpu.varying_opaque = &varying;
+        }
         /* shortcut: fragment W/Z inputs wait for interpolated depth support. */
         for (unsigned lane = 0; lane < batch; lane++) {
             unsigned pixel = pixels[first + lane];
@@ -903,6 +932,8 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
                 (s->tile_x * V3D_TILE_SIZE + pixel % V3D_TILE_SIZE) & 0x7ff;
             qpu.fragment_coord[1][lane] =
                 (s->tile_y * V3D_TILE_SIZE + pixel / V3D_TILE_SIZE) & 0x7ff;
+            qpu.fragment_w[lane] = fragment_w[first + lane];
+            varying.partial[lane] = varying_partial[first + lane];
         }
         result = bcm2835_v3d_qpu_run(code, code_size,
                                       V3D_QPU_INSTRUCTION_BUDGET, &qpu,
@@ -1036,19 +1067,24 @@ static bool bcm2835_v3d_alloc_tile_block(BCM2835V3DState *s,
 static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
                                              uint32_t tile_x,
                                              uint32_t tile_y,
-                                             const uint32_t *screen_xy)
+                                             const BCM2835V3DVertex *triangle)
 {
     uint32_t tile_index = tile_y * s->bin_tiles_x + tile_x;
-    uint8_t commands[23];
+    uint8_t commands[23 + 6 * sizeof(uint32_t)];
     uint32_t list_address;
     uint32_t used;
     uint32_t list_capacity;
     uint64_t pool_start;
+    size_t command_size = 23;
     size_t offset = 0;
 
     if (tile_x >= s->bin_tiles_x || tile_y >= s->bin_tiles_y ||
-        tile_index >= V3D_MAX_RASTER_TILES) {
+        tile_index >= V3D_MAX_RASTER_TILES ||
+        s->shader_record[3] > V3D_MAX_FRAGMENT_VARYINGS) {
         return false;
+    }
+    if (s->shader_record[3]) {
+        command_size += 6 * sizeof(uint32_t);
     }
     list_address = s->bin_tile_list_addr[tile_index];
     used = s->bin_tile_list_used[tile_index];
@@ -1063,7 +1099,7 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
         return false;
     }
 
-    if (sizeof(commands) - 1 > list_capacity - used) {
+    if (command_size - 1 > list_capacity - used) {
         uint32_t next_block;
         uint8_t branch[5] = { V3D_PACKET_BRANCH };
         uint8_t empty_list = V3D_PACKET_RETURN;
@@ -1087,8 +1123,8 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
         used = 1;
         list_capacity = s->bin_alloc_block_size;
     }
-    if (sizeof(commands) - 1 > list_capacity - used ||
-        (uint64_t)list_address + used + sizeof(commands) - 1 >
+    if (command_size - 1 > list_capacity - used ||
+        (uint64_t)list_address + used + command_size - 1 >
             UINT32_MAX + 1ULL) {
         return false;
     }
@@ -1101,19 +1137,30 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
     commands[offset++] = V3D_PACKET_COMPRESSED;
     commands[offset++] = 129; /* absolute triangle coordinates */
     for (unsigned i = 0; i < 3; i++) {
-        stl_le_p(commands + offset, screen_xy[i]);
+        stl_le_p(commands + offset, triangle[i].word[4]);
         offset += sizeof(uint32_t);
+    }
+    if (s->shader_record[3]) {
+        /* Prototype CT1 consumes these per-vertex interpolation inputs. */
+        for (unsigned i = 0; i < 3; i++) {
+            stl_le_p(commands + offset, triangle[i].word[5]);
+            offset += sizeof(uint32_t);
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            stl_le_p(commands + offset, triangle[i].word[6]);
+            offset += sizeof(uint32_t);
+        }
     }
     commands[offset++] = 128; /* compressed-list escape */
     commands[offset++] = V3D_PACKET_RETURN;
-    g_assert(offset == sizeof(commands));
+    g_assert(offset == command_size);
 
     if (dma_memory_write(&s->dma_as, list_address + used - 1, commands,
-                         sizeof(commands),
+                         command_size,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         return false;
     }
-    s->bin_tile_list_used[tile_index] = used + sizeof(commands) - 1;
+    s->bin_tile_list_used[tile_index] = used + command_size - 1;
     return true;
 }
 
@@ -1358,7 +1405,7 @@ static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
                 continue;
             }
             if (!bcm2835_v3d_append_tile_triangle(s, tile_x, tile_y,
-                                                  screen_xy)) {
+                                                  triangle)) {
                 s->bin_draw_resume = s->bin_oom_waiting;
                 return false;
             }
@@ -1399,7 +1446,6 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
                                            &polygon_count)) {
                 return false;
             }
-            /* shortcut: XY fans until CT1 handles clipped varyings. */
             for (unsigned i = 1; i + 1 < polygon_count; i++) {
                 BCM2835V3DVertex triangle[3] = {
                     polygon[0], polygon[i], polygon[i + 1],
@@ -1424,6 +1470,8 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
 
 static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
                                                  const uint32_t *screen_xy,
+                                                 const uint32_t *varying,
+                                                 const uint32_t *reciprocal_w,
                                                  uint64_t *work)
 {
     int32_t center_x = s->viewport_offset_valid ? s->viewport_center_x :
@@ -1440,7 +1488,28 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
     int64_t area;
     uint32_t color = s->clear_color_valid ? s->clear_color[0] : UINT32_MAX;
     uint16_t covered[64 * 64];
+    uint32_t covered_partial[64 * 64];
+    uint32_t covered_w[64 * 64];
+    float vertex_varying[3] = { 0 };
+    float vertex_reciprocal_w[3] = { 1.0f, 1.0f, 1.0f };
     unsigned covered_count = 0;
+
+    if (s->shader_record[3]) {
+        if (s->shader_record[3] != V3D_MAX_FRAGMENT_VARYINGS ||
+            !varying || !reciprocal_w) {
+            return false;
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            vertex_varying[i] = bcm2835_v3d_bits_float(varying[i]);
+            vertex_reciprocal_w[i] =
+                bcm2835_v3d_bits_float(reciprocal_w[i]);
+            if (!isfinite(vertex_varying[i]) ||
+                !isfinite(vertex_reciprocal_w[i]) ||
+                vertex_reciprocal_w[i] == 0.0f) {
+                return false;
+            }
+        }
+    }
 
     if (!s->tile_color_valid) {
         for (unsigned i = 0; i < G_N_ELEMENTS(s->tile_color); i++) {
@@ -1488,16 +1557,47 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
             if ((area > 0 && e0 >= 0 && e1 >= 0 && e2 >= 0) ||
                 (area < 0 && e0 <= 0 && e1 <= 0 && e2 <= 0)) {
                 unsigned tile_pixel = (py - y0) * V3D_TILE_SIZE + px - x0;
+                float fragment_w = 1.0f;
+                float partial = 0.0f;
 
                 if (covered_count >= G_N_ELEMENTS(covered)) {
                     return false;
                 }
-                covered[covered_count++] = tile_pixel;
+                if (s->shader_record[3]) {
+                    double b0 = (double)e0 / area;
+                    double b1 = (double)e1 / area;
+                    double b2 = (double)e2 / area;
+                    double inv_w = b0 * vertex_reciprocal_w[0] +
+                                   b1 * vertex_reciprocal_w[1] +
+                                   b2 * vertex_reciprocal_w[2];
+                    double value = b0 * vertex_varying[0] *
+                                   vertex_reciprocal_w[0] +
+                                   b1 * vertex_varying[1] *
+                                   vertex_reciprocal_w[1] +
+                                   b2 * vertex_varying[2] *
+                                   vertex_reciprocal_w[2];
+
+                    if (!isfinite(inv_w) || inv_w == 0.0 ||
+                        !isfinite(value)) {
+                        return false;
+                    }
+                    fragment_w = 1.0 / inv_w;
+                    partial = value;
+                    if (!isfinite(fragment_w) || !isfinite(partial)) {
+                        return false;
+                    }
+                }
+                covered[covered_count] = tile_pixel;
+                covered_partial[covered_count] =
+                    bcm2835_v3d_float_bits(partial);
+                covered_w[covered_count] = bcm2835_v3d_float_bits(fragment_w);
+                covered_count++;
             }
         }
     }
     if (covered_count && ldl_le_p(s->shader_record + 4)) {
-        return bcm2835_v3d_run_fragment_shader(s, covered, covered_count);
+        return bcm2835_v3d_run_fragment_shader(s, covered, covered_partial,
+                                                covered_w, covered_count);
     }
     for (unsigned i = 0; i < covered_count; i++) {
         s->tile_color[covered[i]] = color;
@@ -1513,7 +1613,8 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
 
     if (*ca == UINT32_MAX || !s->tile_primitive_format_valid ||
         s->tile_primitive_format != ((3 << 4) | 2) ||
-        !s->shader_state_valid || s->shader_record[3]) {
+        !s->shader_state_valid ||
+        s->shader_record[3] > V3D_MAX_FRAGMENT_VARYINGS) {
         return false;
     }
 
@@ -1522,7 +1623,12 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
                                               V3D_TILE_SIZE)) {
         uint8_t code;
         uint8_t coord_bytes[sizeof(uint32_t) * 3];
+        uint8_t varying_bytes[sizeof(uint32_t) * 6];
         uint32_t coords[3];
+        uint32_t varying[3];
+        uint32_t reciprocal_w[3];
+        size_t varying_size = s->shader_record[3] ? sizeof(varying_bytes) : 0;
+        size_t triangle_size = 1 + sizeof(coord_bytes) + varying_size;
 
         if (!bcm2835_v3d_dma_read(s, *ca, &code, sizeof(code))) {
             return false;
@@ -1531,19 +1637,31 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
             *ca += 1;
             return true;
         }
-        if (code != 129 || (uint64_t)*ca + 1 + sizeof(coord_bytes) >
+        if (code != 129 || (uint64_t)*ca + triangle_size >
                            UINT32_MAX + 1ULL ||
             !bcm2835_v3d_dma_read(s, *ca + 1, coord_bytes,
-                                   sizeof(coord_bytes))) {
+                                  sizeof(coord_bytes)) ||
+            (varying_size &&
+             !bcm2835_v3d_dma_read(s, *ca + 1 + sizeof(coord_bytes),
+                                   varying_bytes, varying_size))) {
             return false;
         }
         for (unsigned i = 0; i < G_N_ELEMENTS(coords); i++) {
             coords[i] = ldl_le_p(coord_bytes + i * sizeof(uint32_t));
         }
-        if (!bcm2835_v3d_rasterize_tile_triangle(s, coords, &work)) {
+        if (varying_size) {
+            for (unsigned i = 0; i < G_N_ELEMENTS(varying); i++) {
+                varying[i] = ldl_le_p(varying_bytes + i * sizeof(uint32_t));
+                reciprocal_w[i] = ldl_le_p(varying_bytes +
+                    (G_N_ELEMENTS(varying) + i) * sizeof(uint32_t));
+            }
+        }
+        if (!bcm2835_v3d_rasterize_tile_triangle(
+                s, coords, varying_size ? varying : NULL,
+                varying_size ? reciprocal_w : NULL, &work)) {
             return false;
         }
-        *ca += 1 + sizeof(coord_bytes);
+        *ca += triangle_size;
         triangles++;
     }
     return false;
@@ -1569,7 +1687,7 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
     if ((packet[1] & 0xf) != 4 || count % 3) {
         return false;
     }
-    if (s->shader_record[3]) {
+    if (s->shader_record[3] > V3D_MAX_FRAGMENT_VARYINGS) {
         return false;
     }
     indices = g_new(uint32_t, count);
