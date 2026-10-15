@@ -753,6 +753,102 @@ static void test_v3d_qpu_color_pack_unpack(void)
     }
 }
 
+static void test_v3d_qpu_rfa_pack_modes(void)
+{
+    uint8_t code[15 * sizeof(uint64_t)];
+    uint8_t unsupported_code[2 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    static const unsigned byte_packs[] = {
+        3, 4, 5, 6, 7, 11, 12, 13, 14, 15,
+    };
+    static const uint32_t float_input[] = {
+        0x3fc00000, 0xc0000000, 0x38800000, 0x33800000,
+        0x33000000, 0x33c00000, 0x7f800000, 0xff800000,
+    };
+    static const uint16_t float_half[] = {
+        0x3e00, 0xc000, 0x0400, 0x0001, 0x0000, 0x0002, 0x7c00, 0xfc00,
+    };
+    size_t instruction = 0;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(byte_packs); i++) {
+        unsigned pack = byte_packs[i];
+        unsigned source = pack == 12 ? 20 : 0;
+
+        stq_le_p(code + instruction++ * sizeof(uint64_t),
+                 qpu_test_add(source, 0, 2 + i, false) |
+                 (uint64_t)pack << 52);
+    }
+    stq_le_p(code + instruction++ * sizeof(uint64_t),
+             qpu_test_add(18, 0, 12, false) | (9ULL << 52));
+    stq_le_p(code + instruction++ * sizeof(uint64_t),
+             qpu_test_add(19, 0, 13, false) | (10ULL << 52));
+    for (unsigned pack = 1; pack <= 2; pack++) {
+        uint64_t float_add = qpu_test_add(17, 0, 14 + pack, false);
+
+        float_add &= ~(UINT64_C(0x1f) << 24);
+        float_add |= (UINT64_C(1) << 24) | (uint64_t)pack << 52;
+        stq_le_p(code + instruction++ * sizeof(uint64_t), float_add);
+    }
+    stq_le_p(code + instruction++ * sizeof(uint64_t), 3ULL << 60);
+
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = 0x123;
+        qpu.rf[0][18][lane] = 70000;
+        qpu.rf[0][19][lane] = (uint32_t)-70000;
+        qpu.rf[0][20][lane] = UINT32_MAX;
+        qpu.rf[0][17][lane] = float_input[lane % G_N_ELEMENTS(float_input)];
+        qpu.rf[0][12][lane] = 0xa1b2c3d4;
+        qpu.rf[0][13][lane] = 0xa1b2c3d4;
+        qpu.rf[0][15][lane] = 0xa1b2c3d4;
+        qpu.rf[0][16][lane] = 0xa1b2c3d4;
+        for (unsigned i = 0; i < G_N_ELEMENTS(byte_packs); i++) {
+            qpu.rf[0][2 + i][lane] = 0xa1b2c3d4;
+        }
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), instruction,
+                                         &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        for (unsigned i = 0; i < G_N_ELEMENTS(byte_packs); i++) {
+            unsigned pack = byte_packs[i];
+            uint32_t byte = pack < 8 ? 0x23 : pack == 12 ? 0 : 0xff;
+            uint32_t expected;
+
+            if (pack == 3 || pack == 11) {
+                expected = byte * UINT32_C(0x01010101);
+            } else {
+                unsigned shift = (pack < 8 ? pack - 4 : pack - 12) * 8;
+
+                expected = (0xa1b2c3d4 & ~(UINT32_C(0xff) << shift)) |
+                           (byte << shift);
+            }
+            g_assert_cmphex(qpu.rf[0][2 + i][lane], ==, expected);
+        }
+        g_assert_cmphex(qpu.rf[0][12][lane], ==, 0xa1b27fff);
+        g_assert_cmphex(qpu.rf[0][13][lane], ==, 0x8000c3d4);
+        g_assert_cmphex(qpu.rf[0][15][lane], ==,
+                        0xa1b20000 | float_half[lane %
+                                                G_N_ELEMENTS(float_half)]);
+        g_assert_cmphex(qpu.rf[0][16][lane], ==,
+                        ((uint32_t)float_half[lane %
+                                              G_N_ELEMENTS(float_half)] << 16) |
+                        0xc3d4);
+    }
+
+    stq_le_p(unsupported_code,
+             qpu_test_add(0, 0, 2, false) | (8ULL << 52));
+    stq_le_p(unsupported_code + sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    g_assert_cmpint(bcm2835_v3d_qpu_run(unsupported_code,
+                                         sizeof(unsupported_code), 2,
+                                         &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_UNSUPPORTED);
+    g_assert_cmpuint(executed, ==, 1);
+}
+
 static void test_v3d_qpu_cross_mux_register_reads(void)
 {
     uint8_t code[2 * sizeof(uint64_t)];
@@ -2093,6 +2189,8 @@ int main(int argc, char **argv)
                    test_v3d_qpu_rfa_unpack_modes);
     qtest_add_func("/bcm2835/v3d/qpu_color_pack_unpack",
                    test_v3d_qpu_color_pack_unpack);
+    qtest_add_func("/bcm2835/v3d/qpu_rfa_pack_modes",
+                   test_v3d_qpu_rfa_pack_modes);
     qtest_add_func("/bcm2835/v3d/qpu_cross_mux_register_reads",
                    test_v3d_qpu_cross_mux_register_reads);
     qtest_add_func("/bcm2835/v3d/qpu_thread_switch_signals",
