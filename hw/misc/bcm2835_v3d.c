@@ -747,6 +747,12 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                                        unsigned uniforms_offset,
                                        unsigned attributes_offset,
                                        unsigned vpm_offset_byte,
+                                       const uint32_t (*input_vpm)[
+                                           BCM2835_V3D_QPU_VPM_ROWS]
+                                           [BCM2835_V3D_QPU_LANES],
+                                       uint32_t (*output_vpm)[
+                                           BCM2835_V3D_QPU_VPM_ROWS]
+                                           [BCM2835_V3D_QPU_LANES],
                                        BCM2835V3DVertex *vertices)
 {
     uint32_t code_address = ldl_le_p(s->shader_record + code_offset) & ~7U;
@@ -774,6 +780,10 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
         qpu.uniform_address = uniforms_address;
         qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
         qpu.uniform_opaque = s;
+        if (input_vpm) {
+            memcpy(qpu.vpm, input_vpm[first / BCM2835_V3D_QPU_LANES],
+                   sizeof(qpu.vpm));
+        }
         if (!bcm2835_v3d_load_qpu_attributes(
                 s, &qpu, indices, count, first,
                 s->shader_record[attributes_offset], vpm_offset_byte)) {
@@ -786,6 +796,10 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
         if (result != BCM2835_V3D_QPU_END) {
             g_free(code);
             return false;
+        }
+        if (output_vpm) {
+            memcpy(output_vpm[first / BCM2835_V3D_QPU_LANES], qpu.vpm,
+                   sizeof(qpu.vpm));
         }
         if (vertices) {
             if (qpu.vpm_write_total !=
@@ -1542,6 +1556,8 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
     uint32_t count = ldl_le_p(packet + 2);
     uint32_t *indices;
     BCM2835V3DVertex *vertices;
+    uint32_t (*vertex_vpm)[BCM2835_V3D_QPU_VPM_ROWS]
+                          [BCM2835_V3D_QPU_LANES] = NULL;
     bool success;
 
     if (!count) {
@@ -1588,10 +1604,23 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
         }
     }
 
-    /* CT0 runs the coordinate transform used by the tile binner. */
-    success = bcm2835_v3d_run_qpu_stage(s, indices, count, 28, 32, 26, 7,
-                                         vertices);
+    /* GL vertices are shaded before the coordinate transform consumes VPM. */
+    if (ldl_le_p(s->shader_record + 16)) {
+        vertex_vpm = g_malloc0_n(DIV_ROUND_UP(count,
+                                               BCM2835_V3D_QPU_LANES),
+                                 sizeof(*vertex_vpm));
+        success = bcm2835_v3d_run_qpu_stage(
+            s, indices, count, 16, 20, 14, 6, NULL, vertex_vpm, NULL);
+    } else {
+        success = true;
+    }
+    if (success) {
+        success = bcm2835_v3d_run_qpu_stage(
+            s, indices, count, 28, 32, 26, 7,
+            vertex_vpm, NULL, vertices);
+    }
     g_free(indices);
+    g_free(vertex_vpm);
     if (success) {
         success = bcm2835_v3d_bin_triangles(s, vertices, count);
     }
