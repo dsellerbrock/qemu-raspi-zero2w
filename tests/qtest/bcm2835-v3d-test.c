@@ -735,6 +735,53 @@ static void test_v3d_qpu_thread_switch_signals(void)
     }
 }
 
+static void test_v3d_qpu_vector_rotation(void)
+{
+    static const unsigned rotations[] = { 1, 15, 3 };
+    static const unsigned encodings[] = { 49, 63, 48 };
+    uint8_t code[4 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(encodings); i++) {
+        uint64_t instruction = (13ULL << 60) | (1ULL << 46) |
+                               (39ULL << 38) |
+                               (uint64_t)(34 + i) << 32 | (1ULL << 29) |
+                               (uint64_t)encodings[i] << 12 | 1ULL;
+
+        stq_le_p(code + i * sizeof(uint64_t), instruction);
+    }
+    stq_le_p(code + 3 * sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.acc[0][lane] = qpu_test_float_bits((float)lane);
+        qpu.acc[1][lane] = qpu_test_float_bits(1.0f);
+    }
+    qpu.acc[5][0] = rotations[2];
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned rotation = 0; rotation < G_N_ELEMENTS(rotations);
+         rotation++) {
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            unsigned source = (lane + BCM2835_V3D_QPU_LANES -
+                               rotations[rotation]) %
+                              BCM2835_V3D_QPU_LANES;
+
+            g_assert_cmphex(qpu.acc[2 + rotation][lane], ==,
+                            qpu_test_float_bits((float)source));
+        }
+    }
+
+    stq_le_p(code, (ldq_le_p(code) & ~7ULL) | 7ULL);
+    stq_le_p(code + sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, 2 * sizeof(uint64_t), 8,
+                                         &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_UNSUPPORTED);
+}
+
 static void test_v3d_qpu_sfu(void)
 {
     uint8_t code[5 * sizeof(uint64_t)];
@@ -1976,6 +2023,8 @@ int main(int argc, char **argv)
                    test_v3d_qpu_cross_mux_register_reads);
     qtest_add_func("/bcm2835/v3d/qpu_thread_switch_signals",
                    test_v3d_qpu_thread_switch_signals);
+    qtest_add_func("/bcm2835/v3d/qpu_vector_rotation",
+                   test_v3d_qpu_vector_rotation);
     qtest_add_func("/bcm2835/v3d/qpu_sfu", test_v3d_qpu_sfu);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
                    test_v3d_qpu_vpm_vector_io);

@@ -921,10 +921,10 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms,
- * horizontal 32-bit VPM access, TMU0 RGBA texture sampling, and signed 16a
- * integer unpack from register file A. shortcut: no register-file timing,
- * A-file packing or other unpack modes, vertical VPM, TMU1, different min/mag
- * spatial filters or multiple mip levels; add as guest
+ * horizontal 32-bit VPM access, MUL vector rotation, TMU0 RGBA texture
+ * sampling, and signed 16a integer unpack from register file A. shortcut:
+ * no register-file timing, A-file packing, other unpack modes, vertical VPM,
+ * TMU1, different min/mag spatial filters or multiple mip levels; add as guest
  * shaders require.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
@@ -1093,7 +1093,9 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
 
-        if (sig == QPU_SIG_SMALL_IMM && imm >= 48) {
+        if (small_imm && imm >= 48 &&
+            (add_a == QPU_MUX_B || add_b == QPU_MUX_B ||
+             mul_a == QPU_MUX_B || mul_b == QPU_MUX_B)) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
         reads_a = sig != QPU_SIG_LOAD_IMM &&
@@ -1159,6 +1161,18 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                     active_mul |= bit;
                 }
             }
+        }
+
+        /* Small-immediate values 48–63 rotate the MUL output vector. */
+        if (small_imm && imm >= 48) {
+            unsigned rotation = imm == 48 ? qpu->acc[5][0] & 0xf : imm - 48;
+            uint32_t rotated[BCM2835_V3D_QPU_LANES];
+
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                rotated[(lane + rotation) % BCM2835_V3D_QPU_LANES] =
+                    mul_result[lane];
+            }
+            memcpy(mul_result, rotated, sizeof(mul_result));
         }
 
         if (pm && pack) {
