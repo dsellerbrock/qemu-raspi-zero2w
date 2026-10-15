@@ -72,6 +72,7 @@
 #define QPU_M_NOP           0
 #define QPU_M_FMUL          1
 #define QPU_M_MUL24         2
+#define QPU_M_V8MULD        3
 #define QPU_M_V8MIN         4
 #define QPU_M_V8MAX         5
 #define QPU_M_V8ADDS        6
@@ -479,6 +480,12 @@ static bool qpu_execute_mul(unsigned op, uint32_t a, uint32_t b,
     case QPU_M_MUL24:
         *result = (uint32_t)((int32_t)(a << 8) >> 8) *
                   (uint32_t)((int32_t)(b << 8) >> 8);
+        return true;
+    case QPU_M_V8MULD:
+        *result = 0;
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            *result |= ((((a >> shift) & 0xff) * (b >> 24)) >> 8) << shift;
+        }
         return true;
     case QPU_M_V8MIN:
         *result = qpu_v8_minmax(a, b, false);
