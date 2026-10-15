@@ -754,8 +754,18 @@ static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
             qpu->io_fault = true;
             return false;
         }
-        memcpy(value, qpu->vpm[qpu->vpm_read_address],
-               sizeof(qpu->vpm[0]));
+        if (qpu->vpm_read_horizontal) {
+            memcpy(value, qpu->vpm[qpu->vpm_read_address],
+                   sizeof(qpu->vpm[0]));
+        } else {
+            unsigned y = ((qpu->vpm_read_address >> 4) & 3) *
+                         BCM2835_V3D_QPU_LANES;
+            unsigned x = qpu->vpm_read_address & 0xf;
+
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                value[lane] = qpu->vpm[y + lane][x];
+            }
+        }
         qpu->vpm_read_address = (qpu->vpm_read_address +
                                  qpu->vpm_read_stride) &
                                 (BCM2835_V3D_QPU_VPM_ROWS - 1);
@@ -1017,7 +1027,7 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
         if (lane != 0) {
             return true;
         }
-        if ((value >> 30) != 0 || !(value & (1U << 11))) {
+        if ((value >> 30) != 0) {
             qpu->io_fault = true;
             return false;
         }
@@ -1032,12 +1042,14 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
         if (regfile ^ ws) {
             qpu->vpm_write_address = address;
             qpu->vpm_write_stride = stride;
+            qpu->vpm_write_horizontal = value & (1U << 11);
             qpu->vpm_write_setup = true;
             qpu->vpm_write_history_count = 0;
             qpu->vpm_write_total = 0;
         } else {
             qpu->vpm_read_address = address;
             qpu->vpm_read_stride = stride;
+            qpu->vpm_read_horizontal = value & (1U << 11);
             qpu->vpm_read_remaining = (value >> 20) & 0xf;
             if (!qpu->vpm_read_remaining) {
                 qpu->vpm_read_remaining = BCM2835_V3D_QPU_LANES;
@@ -1081,9 +1093,10 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms,
- * horizontal 32-bit VPM access, MUL vector rotation, TMU0/TMU1 RGBA texture
- * sampling, and most register-file A pack/unpack modes. shortcut: pack mode 8
- * saturation, register-file timing, vertical VPM access, different
+ * horizontal and vertical 32-bit VPM access, MUL vector rotation,
+ * TMU0/TMU1 RGBA texture
+ * sampling, and most register-file A pack/unpack modes. shortcut: exact
+ * register-file timing, vertical 8/16-bit VPM access, VPM DMA, different
  * min/mag spatial filters or multiple mip levels; add those as guest shaders
  * require.
  */
@@ -1475,9 +1488,20 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                 qpu->vpm_write_address >= BCM2835_V3D_QPU_VPM_ROWS) {
                 return BCM2835_V3D_QPU_CODE_FAULT;
             }
-            memcpy(qpu->vpm_write_pending,
-                   qpu->vpm[qpu->vpm_write_address],
-                   sizeof(qpu->vpm_write_pending));
+            if (qpu->vpm_write_horizontal) {
+                memcpy(qpu->vpm_write_pending,
+                       qpu->vpm[qpu->vpm_write_address],
+                       sizeof(qpu->vpm_write_pending));
+            } else {
+                unsigned y = ((qpu->vpm_write_address >> 4) & 3) *
+                             BCM2835_V3D_QPU_LANES;
+                unsigned x = qpu->vpm_write_address & 0xf;
+
+                for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES;
+                     lane++) {
+                    qpu->vpm_write_pending[lane] = qpu->vpm[y + lane][x];
+                }
+            }
         }
 
         for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
@@ -1568,9 +1592,20 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                     BCM2835_V3D_QPU_VPM_WRITE_HISTORY - 1] =
                     qpu->vpm_write_address;
             }
-            memcpy(qpu->vpm[qpu->vpm_write_address],
-                   qpu->vpm_write_pending,
-                   sizeof(qpu->vpm_write_pending));
+            if (qpu->vpm_write_horizontal) {
+                memcpy(qpu->vpm[qpu->vpm_write_address],
+                       qpu->vpm_write_pending,
+                       sizeof(qpu->vpm_write_pending));
+            } else {
+                unsigned y = ((qpu->vpm_write_address >> 4) & 3) *
+                             BCM2835_V3D_QPU_LANES;
+                unsigned x = qpu->vpm_write_address & 0xf;
+
+                for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES;
+                     lane++) {
+                    qpu->vpm[y + lane][x] = qpu->vpm_write_pending[lane];
+                }
+            }
             qpu->vpm_write_address = (qpu->vpm_write_address +
                                       qpu->vpm_write_stride) &
                                      (BCM2835_V3D_QPU_VPM_ROWS - 1);

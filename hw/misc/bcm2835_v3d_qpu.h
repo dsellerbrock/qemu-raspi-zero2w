@@ -63,8 +63,10 @@ typedef struct BCM2835V3DQPUState {
     uint32_t vpm_read_address;
     uint32_t vpm_read_stride;
     uint32_t vpm_read_remaining;
+    bool vpm_read_horizontal;
     uint32_t vpm_write_address;
     uint32_t vpm_write_stride;
+    bool vpm_write_horizontal;
     uint32_t vpm_write_pending[BCM2835_V3D_QPU_LANES];
     uint8_t vpm_write_history[BCM2835_V3D_QPU_VPM_WRITE_HISTORY];
     uint8_t vpm_write_history_count;

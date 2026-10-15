@@ -1235,6 +1235,7 @@ static void test_v3d_qpu_vpm_vector_io(void)
     qpu.vpm_read_address = 2;
     qpu.vpm_read_stride = 1;
     qpu.vpm_read_remaining = 1;
+    qpu.vpm_read_horizontal = true;
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.vpm[2][lane] = lane + 0x100;
     }
@@ -1252,6 +1253,7 @@ static void test_v3d_qpu_vpm_vector_io(void)
     qpu.vpm_write_setup = true;
     qpu.vpm_write_address = 3;
     qpu.vpm_write_stride = 1;
+    qpu.vpm_write_horizontal = true;
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.rf[0][0][lane] = lane * 17;
     }
@@ -1262,6 +1264,47 @@ static void test_v3d_qpu_vpm_vector_io(void)
     g_assert_cmpuint(qpu.vpm_write_address, ==, 4);
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.vpm[3][lane], ==, lane * 17);
+    }
+}
+
+static void test_v3d_qpu_vpm_vertical_32bit(void)
+{
+    uint8_t code[3 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t address = (2U << 4) | 3U;
+    uint32_t setup_read = (1U << 20) | (1U << 12) | (2U << 8) | address;
+    uint32_t setup_write = (1U << 12) | (2U << 8) | address;
+
+    stq_le_p(code, qpu_test_load_imm(49, setup_read));
+    stq_le_p(code + 8, qpu_test_add_imm(48, 0, 0));
+    stq_le_p(code + 16, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.vpm[32 + lane][3] = 0x100 + lane;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.rf[0][0][lane], ==, 0x100 + lane);
+    }
+
+    stq_le_p(code, qpu_test_load_imm(49, setup_write) | (1ULL << 44));
+    stq_le_p(code + 8,
+             qpu_test_add_imm(0, 48, 0) | (1ULL << 44));
+    stq_le_p(code + 16, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = lane * 17;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.vpm[32 + lane][3], ==, lane * 17);
     }
 }
 
@@ -2426,6 +2469,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/v3d/qpu_sfu", test_v3d_qpu_sfu);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
                    test_v3d_qpu_vpm_vector_io);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_vertical_32bit",
+                   test_v3d_qpu_vpm_vertical_32bit);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_setup_and_write",
                    test_v3d_qpu_vpm_setup_and_write);
     qtest_add_func("/bcm2835/v3d/qpu_branch_delay_slots",
