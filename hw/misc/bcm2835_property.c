@@ -90,7 +90,13 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
             stl_le_phys(&s->dma_as, value + 16, s->fbdev->vcram_size);
             resplen = 8;
             break;
+        case RPI_FWREQ_GET_DOMAIN_STATE:
+            /* Report power domains as available; devices remain emulated on. */
+            stl_le_phys(&s->dma_as, value + 16, 1);
+            resplen = 8;
+            break;
         case RPI_FWREQ_SET_POWER_STATE:
+        case RPI_FWREQ_SET_DOMAIN_STATE:
         {
             /*
              * Assume that whatever device they asked for exists,

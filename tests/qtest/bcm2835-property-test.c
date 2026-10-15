@@ -75,6 +75,42 @@ static void test_get_clock_list_small_buffer(void)
     g_assert_cmphex(le32_to_cpu(response[6]), ==, 0xcafebabe);
 }
 
+static void test_power_domain_tags(void)
+{
+    uint32_t request[8] = { 0 };
+    uint32_t response[8];
+
+    request[0] = cpu_to_le32(sizeof(request));
+    request[2] = cpu_to_le32(RPI_FWREQ_GET_DOMAIN_STATE);
+    request[3] = cpu_to_le32(2 * sizeof(uint32_t));
+    request[5] = cpu_to_le32(1); /* ARM domain: probe for the new interface. */
+    request[6] = cpu_to_le32(UINT32_MAX);
+    memwrite(PROPERTY_BUFFER, request, sizeof(request));
+    writel(MBOX_WRITE, PROPERTY_BUFFER | MBOX_CHAN_PROPERTY);
+    g_assert_cmphex(readl(MBOX_READ), ==,
+                    PROPERTY_BUFFER | MBOX_CHAN_PROPERTY);
+    memread(PROPERTY_BUFFER, response, sizeof(response));
+
+    g_assert_cmphex(le32_to_cpu(response[1]), ==, 1U << 31);
+    g_assert_cmphex(le32_to_cpu(response[4]), ==, (1U << 31) | 8);
+    g_assert_cmphex(le32_to_cpu(response[5]), ==, 1);
+    g_assert_cmphex(le32_to_cpu(response[6]), ==, 1);
+
+    request[2] = cpu_to_le32(RPI_FWREQ_SET_DOMAIN_STATE);
+    request[5] = cpu_to_le32(6); /* HDMI domain. */
+    request[6] = cpu_to_le32(1);
+    memwrite(PROPERTY_BUFFER, request, sizeof(request));
+    writel(MBOX_WRITE, PROPERTY_BUFFER | MBOX_CHAN_PROPERTY);
+    g_assert_cmphex(readl(MBOX_READ), ==,
+                    PROPERTY_BUFFER | MBOX_CHAN_PROPERTY);
+    memread(PROPERTY_BUFFER, response, sizeof(response));
+
+    g_assert_cmphex(le32_to_cpu(response[1]), ==, 1U << 31);
+    g_assert_cmphex(le32_to_cpu(response[4]), ==, (1U << 31) | 8);
+    g_assert_cmphex(le32_to_cpu(response[5]), ==, 6);
+    g_assert_cmphex(le32_to_cpu(response[6]), ==, 1);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -83,6 +119,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/property/get_clock_list", test_get_clock_list);
     qtest_add_func("/bcm2835/property/get_clock_list_small_buffer",
                    test_get_clock_list_small_buffer);
+    qtest_add_func("/bcm2835/property/power_domain_tags",
+                   test_power_domain_tags);
     qtest_start("-machine raspi3ap -smp 4");
     ret = g_test_run();
     qtest_end();
