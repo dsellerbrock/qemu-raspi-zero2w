@@ -300,13 +300,128 @@ static uint32_t qpu_pack_mul_color(uint32_t value, unsigned pack,
     return (previous & ~(UINT32_C(0xff) << shift)) | (packed << shift);
 }
 
-static uint32_t qpu_pack_a_half(uint32_t value, uint32_t previous,
-                                unsigned pack)
+static uint32_t qpu_float_to_half_bits(uint32_t value)
 {
-    if (pack == 1) {
-        return (previous & 0xffff0000) | (value & 0xffff);
+    uint32_t sign = (value >> 16) & 0x8000;
+    uint32_t exponent = (value >> 23) & 0xff;
+    uint32_t fraction = value & 0x7fffff;
+    int half_exponent = (int)exponent - 127 + 15;
+
+    if (exponent == 0xff) {
+        return sign | 0x7c00 | (fraction ? (fraction >> 13) | 0x0200 : 0);
     }
-    return (previous & 0x0000ffff) | ((value & 0xffff) << 16);
+    if (exponent == 0) {
+        return sign;
+    }
+    if (half_exponent >= 31) {
+        return sign | 0x7c00;
+    }
+    if (half_exponent <= 0) {
+        uint32_t significand = fraction | 0x800000;
+        unsigned shift = 14 - half_exponent;
+        uint32_t rounded;
+        uint32_t remainder;
+        uint32_t halfway;
+
+        if (shift > 24) {
+            return sign;
+        }
+        rounded = significand >> shift;
+        remainder = significand & ((1U << shift) - 1);
+        halfway = 1U << (shift - 1);
+        if (remainder > halfway ||
+            (remainder == halfway && (rounded & 1))) {
+            rounded++;
+        }
+        return sign | rounded;
+    }
+
+    uint32_t half_fraction = fraction >> 13;
+    uint32_t remainder = fraction & 0x1fff;
+
+    if (remainder > 0x1000 ||
+        (remainder == 0x1000 && (half_fraction & 1))) {
+        half_fraction++;
+        if (half_fraction == 0x400) {
+            half_fraction = 0;
+            half_exponent++;
+            if (half_exponent == 31) {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    return sign | (half_exponent << 10) | half_fraction;
+}
+
+static bool qpu_pack_a(uint32_t value, uint32_t previous, unsigned pack,
+                       bool float_result, uint32_t *packed)
+{
+    uint32_t component;
+    unsigned shift;
+
+    switch (pack) {
+    case 1:
+    case 2:
+        component = float_result ? qpu_float_to_half_bits(value) :
+                                   value & 0xffff;
+        shift = (pack - 1) * 16;
+        *packed = (previous & ~(UINT32_C(0xffff) << shift)) |
+                  (component << shift);
+        return true;
+    case 3:
+        component = value & 0xff;
+        *packed = component * UINT32_C(0x01010101);
+        return true;
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+        shift = (pack - 4) * 8;
+        component = value & 0xff;
+        *packed = (previous & ~(UINT32_C(0xff) << shift)) |
+                  (component << shift);
+        return true;
+    case 9:
+    case 10:
+        if (float_result) {
+            component = qpu_float_to_half_bits(value);
+        } else {
+            int32_t integer = (int32_t)value;
+
+            integer = CLAMP(integer, INT16_MIN, INT16_MAX);
+            component = (uint16_t)integer;
+        }
+        shift = (pack - 9) * 16;
+        *packed = (previous & ~(UINT32_C(0xffff) << shift)) |
+                  (component << shift);
+        return true;
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+    case 15:
+        if ((int32_t)value < 0) {
+            component = 0;
+        } else {
+            component = MIN(value, 0xff);
+        }
+        if (pack == 11) {
+            *packed = component * UINT32_C(0x01010101);
+        } else {
+            shift = (pack - 12) * 8;
+            *packed = (previous & ~(UINT32_C(0xff) << shift)) |
+                      (component << shift);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool qpu_add_result_is_float(unsigned op)
+{
+    return (op >= QPU_A_FADD && op <= QPU_A_FMAXABS) ||
+           op == QPU_A_ITOF;
 }
 
 static bool qpu_tmu_normalize(float coordinate, unsigned wrap,
@@ -922,9 +1037,10 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms,
  * horizontal 32-bit VPM access, MUL vector rotation, TMU0 RGBA texture
- * sampling, and register-file A unpack. shortcut: no register-file timing,
- * A-file packing, vertical VPM access, TMU1, different min/mag spatial filters
- * or multiple mip levels; add those as guest shaders require.
+ * sampling, and most register-file A pack/unpack modes. shortcut: pack mode 8
+ * saturation, register-file timing, vertical VPM access, TMU1, different
+ * min/mag spatial filters or multiple mip levels; add those as guest shaders
+ * require.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -1087,7 +1203,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
              op_mul == QPU_M_FMUL);
 
         if ((pm && (pack == 1 || pack == 2 || unpack > 7 || pack > 7)) ||
-            (!pm && (unpack > 7 || pack > 2))) {
+            (!pm && (unpack > 7 || pack == 8))) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
 
@@ -1215,14 +1331,18 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             unsigned waddr = pack_add ? waddr_add : waddr_mul;
             uint16_t active = pack_add ? active_add : active_mul;
             uint32_t *result = pack_add ? add_result : mul_result;
+            bool float_result = pack_add ?
+                qpu_add_result_is_float(op_add) : op_mul == QPU_M_FMUL;
 
             if (waddr >= 32) {
                 return BCM2835_V3D_QPU_UNSUPPORTED;
             }
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
                 if (active & (1U << lane)) {
-                    result[lane] = qpu_pack_a_half(
-                        result[lane], qpu->rf[0][waddr][lane], pack);
+                    if (!qpu_pack_a(result[lane], qpu->rf[0][waddr][lane],
+                                    pack, float_result, &result[lane])) {
+                        return BCM2835_V3D_QPU_UNSUPPORTED;
+                    }
                 }
             }
         }
