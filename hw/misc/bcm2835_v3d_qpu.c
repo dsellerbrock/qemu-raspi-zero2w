@@ -43,7 +43,11 @@
 #define QPU_SIG_NONE        1
 #define QPU_SIG_THREAD_SWITCH 2
 #define QPU_SIG_PROG_END    3
+#define QPU_SIG_WAIT_FOR_SCOREBOARD 4
+#define QPU_SIG_SCOREBOARD_UNLOCK 5
 #define QPU_SIG_LAST_THREAD_SWITCH 6
+#define QPU_SIG_COLOR_LOAD  8
+#define QPU_SIG_COLOR_LOAD_END 9
 #define QPU_SIG_LOAD_TMU0   10
 #define QPU_SIG_SMALL_IMM   13
 #define QPU_SIG_LOAD_IMM    14
@@ -1050,8 +1054,11 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
             qpu->tmu0_instruction_write_mask[
                 waddr - QPU_W_TMU0_S] |= 1U << lane;
         }
-        if (waddr == 46) {
-            qpu->tlb_color_all_write_mask |= 1U << lane;
+        if (waddr == 45 || waddr == 46) {
+            /* shortcut: alias both color ports until MSAA is implemented. */
+            qpu->io[45][lane] = value;
+            qpu->io[46][lane] = value;
+            qpu->tlb_color_write_mask |= 1U << lane;
         }
         return true;
     }
@@ -1145,7 +1152,9 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         inst = ldq_le_p(code + qpu->pc * sizeof(uint64_t));
         (*executed)++;
         qpu->cycles++;
-        end = QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf) == QPU_SIG_PROG_END;
+        end = QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf) == QPU_SIG_PROG_END ||
+              QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf) ==
+              QPU_SIG_COLOR_LOAD_END;
         sig = QPU_FIELD(inst, QPU_SIG_SHIFT, 0xf);
         if (sig == 15) {
             unsigned branch_cond = QPU_FIELD(inst,
@@ -1205,11 +1214,22 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         /* shortcut: execute thread switches serially; add dual threads when needed. */
         if (sig != QPU_SIG_NONE && sig != QPU_SIG_PROG_END &&
             sig != QPU_SIG_THREAD_SWITCH &&
+            sig != QPU_SIG_WAIT_FOR_SCOREBOARD &&
+            sig != QPU_SIG_SCOREBOARD_UNLOCK &&
             sig != QPU_SIG_LAST_THREAD_SWITCH &&
+            sig != QPU_SIG_COLOR_LOAD &&
+            sig != QPU_SIG_COLOR_LOAD_END &&
             sig != QPU_SIG_LOAD_TMU0 &&
             sig != QPU_SIG_SMALL_IMM && sig != QPU_SIG_LOAD_IMM) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
+        if (((sig == QPU_SIG_WAIT_FOR_SCOREBOARD ||
+              sig == QPU_SIG_SCOREBOARD_UNLOCK ||
+              sig == QPU_SIG_COLOR_LOAD ||
+              sig == QPU_SIG_COLOR_LOAD_END) && !qpu->fragment_shader)) {
+            return BCM2835_V3D_QPU_UNSUPPORTED;
+        }
+        /* shortcut: CT1 is serial; add a scoreboard if fragment QPUs overlap. */
         op_add = QPU_FIELD(inst, QPU_OP_ADD_SHIFT, 0x1f);
         op_mul = QPU_FIELD(inst, QPU_OP_MUL_SHIFT, 7);
         cond_add = QPU_FIELD(inst, QPU_COND_ADD_SHIFT, 7);
@@ -1509,6 +1529,9 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             memcpy(qpu->acc[4], qpu->tmu0_result,
                    sizeof(qpu->tmu0_result));
             qpu->tmu0_pending = false;
+        }
+        if (sig == QPU_SIG_COLOR_LOAD || sig == QPU_SIG_COLOR_LOAD_END) {
+            memcpy(qpu->acc[4], qpu->io[45], sizeof(qpu->acc[4]));
         }
         if (writes_vpm) {
             if (qpu->vpm_write_total < UINT8_MAX) {

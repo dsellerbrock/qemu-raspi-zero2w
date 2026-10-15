@@ -1053,6 +1053,7 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
                 (s->tile_x * V3D_TILE_SIZE + pixel % V3D_TILE_SIZE) & 0x7ff;
             qpu.fragment_coord[1][lane] =
                 (s->tile_y * V3D_TILE_SIZE + pixel / V3D_TILE_SIZE) & 0x7ff;
+            qpu.io[45][lane] = s->tile_color[pixel];
             qpu.fragment_w[lane] = fragment_w[first + lane];
             for (unsigned index = 0; index < varying.count; index++) {
                 varying.partial[index][lane] =
@@ -1064,7 +1065,7 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
                                       &executed);
         if (result != BCM2835_V3D_QPU_END ||
             qpu.varying_index != varying.count ||
-            (qpu.tlb_color_all_write_mask & expected_mask) !=
+            (qpu.tlb_color_write_mask & expected_mask) !=
             expected_mask) {
             g_free(code);
             return false;

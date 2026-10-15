@@ -51,7 +51,7 @@ typedef struct BCM2835V3DQPUState {
     uint16_t z;
     uint16_t n;
     uint16_t c;
-    uint16_t tlb_color_all_write_mask;
+    uint16_t tlb_color_write_mask;
     uint32_t pc;
     uint64_t cycles;
     uint32_t uniform_address;

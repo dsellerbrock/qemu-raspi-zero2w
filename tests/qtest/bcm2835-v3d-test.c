@@ -431,6 +431,90 @@ static void test_v3d_qpu_fragment_w_register(void)
     }
 }
 
+static void test_v3d_qpu_tile_color_signals(void)
+{
+    uint8_t code[3 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint64_t instruction;
+
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.fragment_shader = true;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.io[45][lane] = 0x12340000 | lane;
+    }
+    instruction = qpu_test_add(0, 0, 39, false);
+    instruction = (instruction & ~(0xfULL << 60)) | (8ULL << 60);
+    stq_le_p(code, instruction);
+    stq_le_p(code + sizeof(uint64_t), qpu_test_read_r4(8));
+    stq_le_p(code + 2 * sizeof(uint64_t), 3ULL << 60);
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.acc[4][lane], ==, 0x12340000 | lane);
+        g_assert_cmphex(qpu.rf[0][8][lane], ==, 0x12340000 | lane);
+    }
+
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.fragment_shader = true;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.io[45][lane] = 0x56780000 | lane;
+    }
+    instruction = qpu_test_add(0, 0, 39, false);
+    instruction = (instruction & ~(0xfULL << 60)) | (9ULL << 60);
+    stq_le_p(code, instruction);
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(uint64_t), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(executed, ==, 1);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.acc[4][lane], ==, 0x56780000 | lane);
+    }
+
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][2][lane] = 0x9abc0000 | lane;
+    }
+    stq_le_p(code, qpu_test_add(2, 3, 45, false));
+    stq_le_p(code + sizeof(uint64_t), 3ULL << 60);
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, 2 * sizeof(uint64_t), 8,
+                                         &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmphex(qpu.tlb_color_write_mask, ==, UINT16_MAX);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.io[45][lane], ==, 0x9abc0000 | lane);
+        g_assert_cmphex(qpu.io[46][lane], ==, 0x9abc0000 | lane);
+    }
+}
+
+static void test_v3d_qpu_tile_buffer_signals(void)
+{
+    uint8_t code[2 * sizeof(uint64_t)];
+    static const unsigned signals[] = { 4, 5 };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(signals); i++) {
+        BCM2835V3DQPUState qpu;
+        uint32_t executed;
+        uint64_t instruction = qpu_test_add(0, 0, 39, false);
+
+        instruction = (instruction & ~(0xfULL << 60)) |
+                      ((uint64_t)signals[i] << 60);
+        stq_le_p(code, instruction);
+        stq_le_p(code + sizeof(uint64_t), 3ULL << 60);
+        bcm2835_v3d_qpu_init(&qpu);
+        qpu.fragment_shader = true;
+        g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                             &executed),
+                        ==, BCM2835_V3D_QPU_END);
+
+        bcm2835_v3d_qpu_init(&qpu);
+        g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                             &executed),
+                        ==, BCM2835_V3D_QPU_UNSUPPORTED);
+    }
+}
+
 static void test_v3d_qpu_varying_read(void)
 {
     uint8_t code[3 * sizeof(uint64_t)];
@@ -2260,6 +2344,10 @@ int main(int argc, char **argv)
                    test_v3d_qpu_tmu0_rgba_texture_sampling);
     qtest_add_func("/bcm2835/v3d/qpu_fragment_w_register",
                    test_v3d_qpu_fragment_w_register);
+    qtest_add_func("/bcm2835/v3d/qpu_tile_color_signals",
+                   test_v3d_qpu_tile_color_signals);
+    qtest_add_func("/bcm2835/v3d/qpu_tile_buffer_signals",
+                   test_v3d_qpu_tile_buffer_signals);
     qtest_add_func("/bcm2835/v3d/qpu_varying_read",
                    test_v3d_qpu_varying_read);
     qtest_add_func("/bcm2835/v3d/qpu_packed_byte_alu",
