@@ -12,7 +12,7 @@
 
 #define BCM2835_V3D_QPU_LANES 16
 #define BCM2835_V3D_QPU_VPM_ROWS 64
-#define BCM2835_V3D_QPU_VPM_WRITE_HISTORY 7
+#define BCM2835_V3D_QPU_VPM_WRITE_HISTORY BCM2835_V3D_QPU_VPM_ROWS
 
 typedef bool (*BCM2835V3DQPUReadUniform)(void *opaque, uint32_t address,
                                          uint32_t *value);
