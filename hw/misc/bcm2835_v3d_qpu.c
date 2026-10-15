@@ -354,7 +354,8 @@ static uint32_t qpu_float_to_half_bits(uint32_t value)
 }
 
 static bool qpu_pack_a(uint32_t value, uint32_t previous, unsigned pack,
-                       bool float_result, uint32_t *packed)
+                       bool float_result, bool overflow,
+                       bool overflow_negative, uint32_t *packed)
 {
     uint32_t component;
     unsigned shift;
@@ -380,6 +381,13 @@ static bool qpu_pack_a(uint32_t value, uint32_t previous, unsigned pack,
         component = value & 0xff;
         *packed = (previous & ~(UINT32_C(0xff) << shift)) |
                   (component << shift);
+        return true;
+    case 8:
+        if (float_result) {
+            return false;
+        }
+        *packed = overflow ? (overflow_negative ? INT32_MIN : INT32_MAX) :
+                             value;
         return true;
     case 9:
     case 10:
@@ -797,7 +805,8 @@ static bool qpu_mux_supported(unsigned mux, unsigned raddr, bool small_imm,
 }
 
 static bool qpu_execute_add(unsigned op, uint32_t a, uint32_t b,
-                            uint32_t *result, bool *carry)
+                            uint32_t *result, bool *carry, bool *overflow,
+                            bool *overflow_negative)
 {
     uint32_t shift = b & 31;
     int32_t sa = (int32_t)a;
@@ -806,6 +815,8 @@ static bool qpu_execute_add(unsigned op, uint32_t a, uint32_t b,
     float fb = qpu_bits_float(b);
 
     *carry = false;
+    *overflow = false;
+    *overflow_negative = false;
     switch (op) {
     case QPU_A_NOP:
         *result = 0;
@@ -841,10 +852,14 @@ static bool qpu_execute_add(unsigned op, uint32_t a, uint32_t b,
     case QPU_A_ADD:
         *result = a + b;
         *carry = *result < a;
+        *overflow = (~(a ^ b) & (a ^ *result)) >> 31;
+        *overflow_negative = sa < 0;
         break;
     case QPU_A_SUB:
         *result = a - b;
         *carry = a >= b;
+        *overflow = ((a ^ b) & (a ^ *result)) >> 31;
+        *overflow_negative = sa < 0;
         break;
     case QPU_A_SHR:
         *result = a >> shift;
@@ -855,9 +870,14 @@ static bool qpu_execute_add(unsigned op, uint32_t a, uint32_t b,
     case QPU_A_ROR:
         *result = shift ? (a >> shift) | (a << (32 - shift)) : a;
         break;
-    case QPU_A_SHL:
+    case QPU_A_SHL: {
+        int64_t shifted = (int64_t)sa * (INT64_C(1) << shift);
+
         *result = a << shift;
+        *overflow = shifted < INT32_MIN || shifted > INT32_MAX;
+        *overflow_negative = shifted < 0;
         break;
+    }
     case QPU_A_MIN:
         *result = sa < sb ? a : b;
         break;
@@ -893,8 +913,11 @@ static bool qpu_execute_add(unsigned op, uint32_t a, uint32_t b,
 }
 
 static bool qpu_execute_mul(unsigned op, uint32_t a, uint32_t b,
-                            uint32_t *result)
+                            uint32_t *result, bool *overflow,
+                            bool *overflow_negative)
 {
+    *overflow = false;
+    *overflow_negative = false;
     switch (op) {
     case QPU_M_NOP:
         *result = 0;
@@ -902,10 +925,16 @@ static bool qpu_execute_mul(unsigned op, uint32_t a, uint32_t b,
     case QPU_M_FMUL:
         *result = qpu_float_bits(qpu_bits_float(a) * qpu_bits_float(b));
         return true;
-    case QPU_M_MUL24:
-        *result = (uint32_t)((int32_t)(a << 8) >> 8) *
-                  (uint32_t)((int32_t)(b << 8) >> 8);
+    case QPU_M_MUL24: {
+        int32_t sa = (int32_t)(a << 8) >> 8;
+        int32_t sb = (int32_t)(b << 8) >> 8;
+        int64_t product = (int64_t)sa * sb;
+
+        *result = (uint32_t)product;
+        *overflow = product < INT32_MIN || product > INT32_MAX;
+        *overflow_negative = product < 0;
         return true;
+    }
     case QPU_M_V8MULD:
         *result = 0;
         for (unsigned shift = 0; shift < 32; shift += 8) {
@@ -1080,6 +1109,10 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         unsigned pack;
         uint32_t add_result[BCM2835_V3D_QPU_LANES];
         uint32_t mul_result[BCM2835_V3D_QPU_LANES];
+        bool add_overflow[BCM2835_V3D_QPU_LANES];
+        bool add_overflow_negative[BCM2835_V3D_QPU_LANES];
+        bool mul_overflow[BCM2835_V3D_QPU_LANES];
+        bool mul_overflow_negative[BCM2835_V3D_QPU_LANES];
         uint32_t instruction_uniform_address;
         uint32_t reg_a[BCM2835_V3D_QPU_LANES] = { 0 };
         uint32_t reg_b[BCM2835_V3D_QPU_LANES] = { 0 };
@@ -1203,7 +1236,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
              op_mul == QPU_M_FMUL);
 
         if ((pm && (pack == 1 || pack == 2 || unpack > 7 || pack > 7)) ||
-            (!pm && (unpack > 7 || pack == 8))) {
+            (!pm && unpack > 7)) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
 
@@ -1257,6 +1290,10 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                 add_result[lane] = (uint32_t)inst;
                 mul_result[lane] = (uint32_t)inst;
                 carry[lane] = false;
+                add_overflow[lane] = false;
+                add_overflow_negative[lane] = false;
+                mul_overflow[lane] = false;
+                mul_overflow_negative[lane] = false;
                 if (qpu_condition(qpu, cond_add, lane)) {
                     active_add |= bit;
                 }
@@ -1283,8 +1320,11 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                 uint16_t bit = 1U << lane;
 
                 if (!qpu_execute_add(op_add, aa, ab, &add_result[lane],
-                                     &carry[lane]) ||
-                    !qpu_execute_mul(op_mul, ma, mb, &mul_result[lane])) {
+                                     &carry[lane], &add_overflow[lane],
+                                     &add_overflow_negative[lane]) ||
+                    !qpu_execute_mul(op_mul, ma, mb, &mul_result[lane],
+                                     &mul_overflow[lane],
+                                     &mul_overflow_negative[lane])) {
                     return BCM2835_V3D_QPU_UNSUPPORTED;
                 }
                 if (qpu_condition(qpu, cond_add, lane)) {
@@ -1340,7 +1380,12 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
                 if (active & (1U << lane)) {
                     if (!qpu_pack_a(result[lane], qpu->rf[0][waddr][lane],
-                                    pack, float_result, &result[lane])) {
+                                    pack, float_result,
+                                    pack_add ? add_overflow[lane] :
+                                               mul_overflow[lane],
+                                    pack_add ? add_overflow_negative[lane] :
+                                               mul_overflow_negative[lane],
+                                    &result[lane])) {
                         return BCM2835_V3D_QPU_UNSUPPORTED;
                     }
                 }
