@@ -195,6 +195,15 @@ static uint64_t qpu_test_ftoi(unsigned raddr_a, unsigned waddr_add)
            (7ULL << 3) | 7ULL;
 }
 
+static uint64_t qpu_test_itof_rfa_unpack(unsigned raddr_a,
+                                         unsigned waddr_add)
+{
+    return (1ULL << 60) | (1ULL << 57) | (1ULL << 49) |
+           (uint64_t)waddr_add << 38 | (39ULL << 32) | (8ULL << 24) |
+           (uint64_t)raddr_a << 18 | (39ULL << 12) | (6ULL << 9) |
+           (6ULL << 6);
+}
+
 static uint64_t qpu_test_write_tmu(unsigned address, bool regfile_b)
 {
     return (1ULL << 60) | (1ULL << 49) |
@@ -529,6 +538,32 @@ static void test_v3d_qpu_ftoi_edge_values(void)
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.acc[1][lane], ==,
                         expected[lane % G_N_ELEMENTS(expected)]);
+    }
+}
+
+static void test_v3d_qpu_rfa_unpack_itof(void)
+{
+    uint8_t code[2 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    static const uint32_t input[] = {
+        0xfeedffff, 0x12340001, 0xabe88000, 0x80007fff,
+    };
+    static const int16_t expected[] = { -1, 1, INT16_MIN, INT16_MAX };
+
+    qpu_test_store_code(code, qpu_test_itof_rfa_unpack(0, 1));
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = input[lane % G_N_ELEMENTS(input)];
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.rf[0][1][lane], ==,
+                        qpu_test_float_bits((float)expected[
+                            lane % G_N_ELEMENTS(expected)]));
     }
 }
 
@@ -1836,6 +1871,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/v3d/qpu_v8muld", test_v3d_qpu_v8muld);
     qtest_add_func("/bcm2835/v3d/qpu_ftoi_edge_values",
                    test_v3d_qpu_ftoi_edge_values);
+    qtest_add_func("/bcm2835/v3d/qpu_rfa_unpack_itof",
+                   test_v3d_qpu_rfa_unpack_itof);
     qtest_add_func("/bcm2835/v3d/qpu_color_pack_unpack",
                    test_v3d_qpu_color_pack_unpack);
     qtest_add_func("/bcm2835/v3d/qpu_sfu", test_v3d_qpu_sfu);

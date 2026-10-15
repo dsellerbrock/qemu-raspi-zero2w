@@ -876,10 +876,10 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 
 /*
  * This bounded slice covers part of the QPU ALUs, branches, uniforms,
- * horizontal 32-bit VPM access, and TMU0 RGBA texture sampling. shortcut:
- * no register-file timing, A-file pack/unpack, r4 half-float unpack, vertical
- * VPM, TMU1, differing min/mag filters or mip levels; add as guest shaders
- * require.
+ * horizontal 32-bit VPM access, TMU0 RGBA texture sampling, and signed 16a
+ * integer unpack from register file A. shortcut: no register-file timing,
+ * A-file packing or other unpack modes, r4 half-float unpack, vertical VPM,
+ * TMU1, differing min/mag filters or mip levels; add as guest shaders require.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -925,6 +925,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         bool carry[BCM2835_V3D_QPU_LANES];
         bool reads_a;
         bool reads_b;
+        bool rfa_float_input;
         bool writes_vpm;
         uint16_t active_add = 0;
         uint16_t active_mul = 0;
@@ -1031,10 +1032,16 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         unpack = QPU_FIELD(inst, QPU_UNPACK_SHIFT, 7);
         pm = inst & (1ULL << QPU_PM_SHIFT);
         pack = QPU_FIELD(inst, QPU_PACK_SHIFT, 0xf);
+        rfa_float_input =
+            ((add_a == QPU_MUX_A || add_b == QPU_MUX_A) &&
+             op_add >= QPU_A_FADD && op_add <= QPU_A_FTOI) ||
+            ((mul_a == QPU_MUX_A || mul_b == QPU_MUX_A) &&
+             op_mul == QPU_M_FMUL);
 
         if ((pm && (unpack == 1 || unpack == 2 || pack == 1 || pack == 2 ||
                     unpack > 7 || pack > 7)) ||
-            (!pm && (unpack || pack > 2))) {
+            (!pm && (unpack > 1 || pack > 2 ||
+                     (unpack && rfa_float_input)))) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
 
@@ -1052,6 +1059,11 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         }
         if (qpu->io_fault) {
             return BCM2835_V3D_QPU_CODE_FAULT;
+        }
+        if (!pm && unpack == 1) {
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                reg_a[lane] = (uint32_t)(int32_t)(int16_t)reg_a[lane];
+            }
         }
         if (sig == QPU_SIG_LOAD_IMM) {
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
