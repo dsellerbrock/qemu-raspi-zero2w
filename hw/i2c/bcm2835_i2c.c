@@ -53,6 +53,9 @@ static void bcm2835_i2c_update_interrupt(BCM2835I2CState *s)
 static void bcm2835_i2c_begin_transfer(BCM2835I2CState *s)
 {
     int direction = s->c & BCM2835_I2C_C_READ;
+
+    s->s &= ~(BCM2835_I2C_S_DONE | BCM2835_I2C_S_RXR |
+              BCM2835_I2C_S_TXW | BCM2835_I2C_S_RXD);
     if (i2c_start_transfer(s->bus, s->a, direction)) {
         s->s |= BCM2835_I2C_S_ERR;
     }
@@ -68,14 +71,8 @@ static void bcm2835_i2c_begin_transfer(BCM2835I2CState *s)
 static void bcm2835_i2c_finish_transfer(BCM2835I2CState *s)
 {
     /*
-     * STOP is sent when DLEN counts down to zero.
-     *
-     * https://github.com/torvalds/linux/blob/v6.7/drivers/i2c/busses/i2c-bcm2835.c#L223-L261
-     * It is possible to initiate repeated starts on real hardware.
-     * However, this requires sending another ST request before the bytes in
-     * TX FIFO are shifted out.
-     *
-     * This is not emulated currently.
+     * shortcut: INTD distinguishes chained messages from the final message;
+     * replace this when byte-level FIFO and repeated-start timing are modeled.
      */
     i2c_end_transfer(s->bus);
     s->s |= BCM2835_I2C_S_DONE;
@@ -109,7 +106,7 @@ static uint64_t bcm2835_i2c_read(void *opaque, hwaddr addr, unsigned size)
             readval = i2c_recv(s->bus);
             s->dlen -= 1;
 
-            if (s->dlen == 0) {
+            if (s->dlen == 0 && (s->c & BCM2835_I2C_C_INTD)) {
                 bcm2835_i2c_finish_transfer(s);
             }
         }
@@ -150,7 +147,7 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
              * Handle special case where transfer starts with zero data length.
              * Required for zero length i2c quick messages to work.
              */
-            if (s->dlen == 0) {
+            if (s->dlen == 0 && (s->c & BCM2835_I2C_C_INTD)) {
                 bcm2835_i2c_finish_transfer(s);
             }
         }
@@ -185,7 +182,7 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
                 }
             }
 
-            if (s->dlen == 0) {
+            if (s->dlen == 0 && (s->c & BCM2835_I2C_C_INTD)) {
                 bcm2835_i2c_finish_transfer(s);
             }
         }

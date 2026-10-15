@@ -13,6 +13,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "hw/arm/bcm2835_peripherals.h"
+#include "hw/display/i2c-ddc.h"
 #include "hw/misc/bcm2835_mbox_defs.h"
 #include "hw/arm/raspi_platform.h"
 #include "system/system.h"
@@ -33,16 +34,24 @@
 /* All three I2C controllers share the same IRQ */
 #define ORGATED_I2C_IRQ_COUNT 3
 
-void create_unimp(BCMSocPeripheralBaseState *ps,
-                  UnimplementedDeviceState *uds,
-                  const char *name, hwaddr ofs, hwaddr size)
+static void create_unimp_with_priority(BCMSocPeripheralBaseState *ps,
+                                       UnimplementedDeviceState *uds,
+                                       const char *name, hwaddr ofs,
+                                       hwaddr size, int priority)
 {
     object_initialize_child(OBJECT(ps), name, uds, TYPE_UNIMPLEMENTED_DEVICE);
     qdev_prop_set_string(DEVICE(uds), "name", name);
     qdev_prop_set_uint64(DEVICE(uds), "size", size);
     sysbus_realize(SYS_BUS_DEVICE(uds), &error_fatal);
     memory_region_add_subregion_overlap(&ps->peri_mr, ofs,
-                    sysbus_mmio_get_region(SYS_BUS_DEVICE(uds), 0), -1000);
+                    sysbus_mmio_get_region(SYS_BUS_DEVICE(uds), 0), priority);
+}
+
+void create_unimp(BCMSocPeripheralBaseState *ps,
+                  UnimplementedDeviceState *uds,
+                  const char *name, hwaddr ofs, hwaddr size)
+{
+    create_unimp_with_priority(ps, uds, name, ofs, size, -1000);
 }
 
 static void bcm2835_peripherals_init(Object *obj)
@@ -191,11 +200,19 @@ static void raspi_peripherals_base_init(Object *obj)
 static void bcm2835_peripherals_realize(DeviceState *dev, Error **errp)
 {
     MemoryRegion *mphi_mr;
+    I2CSlave *ddc;
     BCM2835PeripheralState *s = BCM2835_PERIPHERALS(dev);
     BCMSocPeripheralBaseState *s_base = BCM_SOC_PERIPHERALS_BASE(dev);
     int n;
 
     bcm_soc_peripherals_common_realize(dev, errp);
+
+    ddc = i2c_slave_new(TYPE_I2CDDC, 0x50);
+    qdev_prop_set_uint32(DEVICE(ddc), "xres", 1024);
+    qdev_prop_set_uint32(DEVICE(ddc), "yres", 768);
+    if (!i2c_slave_realize_and_unref(ddc, s_base->i2c[2].bus, errp)) {
+        return;
+    }
 
     /* Extended Mass Media Controller */
     sysbus_connect_irq(SYS_BUS_DEVICE(&s_base->sdhci), 0,
@@ -547,6 +564,10 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
                  PIXV1_OFFSET, 0x100);
     create_unimp(s, &s->pixv[2], "bcm2835-pixelvalve2",
                  PIXV2_OFFSET, 0x100);
+    /* HDMI0's core window overlaps the broad DBUS stub. */
+    create_unimp_with_priority(s, &s->hdmi0, "bcm2835-hdmi0",
+                               HDMI0_OFFSET, 0x600, 0);
+    create_unimp(s, &s->hdmi0_hd, "bcm2835-hdmi0-hd", HDMI_OFFSET, 0x100);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->v3d), errp)) {
         return;
     }

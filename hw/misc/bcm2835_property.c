@@ -138,11 +138,23 @@ static void bcm2835_property_mbox_push(BCM2835PropertyState *s, uint32_t value)
             break;
 
         case RPI_FWREQ_GET_CLOCKS:
-            /* TODO: add more clock IDs if needed */
-            stl_le_phys(&s->dma_as, value + 12, 0);
-            stl_le_phys(&s->dma_as, value + 16, RPI_FIRMWARE_ARM_CLK_ID);
-            resplen = 8;
+        {
+            static const uint32_t clock_ids[] = {
+                RPI_FIRMWARE_ARM_CLK_ID,
+                RPI_FIRMWARE_PIXEL_CLK_ID,
+                RPI_FIRMWARE_M2MC_CLK_ID,
+            };
+
+            resplen = ARRAY_SIZE(clock_ids) * 2 * sizeof(uint32_t);
+            if (bufsize >= resplen) {
+                for (size_t i = 0; i < ARRAY_SIZE(clock_ids); i++) {
+                    stl_le_phys(&s->dma_as, value + 12 + i * 8, 0);
+                    stl_le_phys(&s->dma_as, value + 16 + i * 8,
+                                clock_ids[i]);
+                }
+            }
             break;
+        }
 
         case RPI_FWREQ_SET_CLOCK_RATE:
         case RPI_FWREQ_SET_MAX_CLOCK_RATE:

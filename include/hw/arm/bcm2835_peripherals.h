@@ -80,6 +80,8 @@ struct BCMSocPeripheralBaseState {
     UnimplementedDeviceState ave0;
     UnimplementedDeviceState hvs;
     UnimplementedDeviceState pixv[3];
+    UnimplementedDeviceState hdmi0;
+    UnimplementedDeviceState hdmi0_hd;
     BCM2835V3DState v3d;
     UnimplementedDeviceState bscsl;
     UnimplementedDeviceState smi;
