@@ -1039,8 +1039,8 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     uint8_t tile_list[64];
     uint8_t tile_overflow[64];
     uint8_t record[44] = { 0 };
-    uint8_t vertex_code[19 * sizeof(uint64_t)];
-    uint8_t code[19 * sizeof(uint64_t)];
+    uint8_t vertex_code[19 * sizeof(uint64_t)] = { 0 };
+    uint8_t code[19 * sizeof(uint64_t)] = { 0 };
     uint8_t fragment_code[4 * sizeof(uint64_t)];
     uint8_t vertex_data[sizeof(vertices)];
     uint8_t initial[FB_SIZE];
@@ -1050,12 +1050,12 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     size_t draw_size = 0;
     uint32_t draw_color = 0xff00ff00;
     uint32_t bin_count;
-    uint32_t vertex_setup_write = (1U << 12) | (1U << 11) | (2U << 8);
-    uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8) | 8;
-    uint32_t setup_read = (1U << 12) | (1U << 11) | (2U << 8);
+    uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8);
+    uint32_t vertex_setup_read = (1U << 12) | (1U << 11) | (2U << 8);
+    uint32_t coordinate_setup_read = vertex_setup_read | 7;
     uint64_t instructions[] = {
         qpu_test_load_imm(49, setup_write) | (1ULL << 44),
-        qpu_test_load_imm(49, setup_read | (8U << 20)),
+        qpu_test_load_imm(49, coordinate_setup_read | (8U << 20)),
         qpu_test_add_imm(48, 0, 0),
         qpu_test_add_imm(48, 1, 0),
         qpu_test_add_imm(48, 2, 0),
@@ -1069,14 +1069,13 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(3, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(4, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(5, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(6, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(7, 48, 0) | (1ULL << 44),
         3ULL << 60,
     };
     uint64_t vertex_instructions[] = {
-        qpu_test_load_imm(49, vertex_setup_write) | (1ULL << 44),
-        qpu_test_load_imm(49, setup_read | (8U << 20)),
+        qpu_test_load_imm(49, setup_write) | (1ULL << 44),
+        qpu_test_load_imm(49, vertex_setup_read | (8U << 20)),
         qpu_test_add_imm(48, 0, 0),
         qpu_test_add_imm(48, 1, 0),
         qpu_test_add_imm(48, 2, 0),
@@ -1085,14 +1084,11 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         qpu_test_add_imm(48, 5, 0),
         qpu_test_add_imm(48, 6, 0),
         qpu_test_add_imm(48, 7, 0),
-        qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(1, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(3, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(4, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
+        qpu_test_add_imm(7, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(5, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(6, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(7, 48, 0) | (1ULL << 44),
         3ULL << 60,
     };
     uint64_t fragment_instructions[] = {
@@ -1116,10 +1112,12 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     record[3] = 2;
     record[14] = 1;
     stl_le_p(record + 16, 0x6000);
+    record[26] = 1;
     record[0] = 1U << 2; /* Enable homogeneous clipping. */
     stl_le_p(record + 36, 0x7000);
     record[40] = sizeof(vertices[0]) - 1;
     record[41] = sizeof(vertices[0]);
+    record[43] = 7 * sizeof(uint32_t);
     memwrite(0x34000, record, sizeof(record));
     memwrite(0x7000, vertex_data, sizeof(vertex_data));
     for (unsigned i = 0; i < G_N_ELEMENTS(instructions); i++) {

@@ -894,10 +894,8 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                    sizeof(qpu.vpm));
         }
         if (vertices) {
-            if (qpu.vpm_write_total !=
-                    6 + s->shader_record[3] ||
-                qpu.vpm_write_history_count !=
-                    6 + s->shader_record[3]) {
+            if (qpu.vpm_write_total != 7 ||
+                qpu.vpm_write_history_count != 7) {
                 char instructions[16 * 17 + 1] = { 0 };
                 char rows[4 * BCM2835_V3D_QPU_VPM_WRITE_HISTORY + 1] = { 0 };
                 size_t instruction_size = 0;
@@ -918,16 +916,15 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                                            qpu.vpm_write_history[i]);
                 }
                 qemu_log_mask(LOG_GUEST_ERROR,
-                              "bcm2835_v3d: QPU coordinate output mismatch: shader=0x%08x varyings=%u wrote=%u history=%u expected=%u rows=[%s] code=%s\n",
-                              code_address, s->shader_record[3],
+                              "bcm2835_v3d: QPU coordinate output mismatch: shader=0x%08x wrote=%u history=%u expected=7 rows=[%s] code=%s\n",
+                              code_address,
                               qpu.vpm_write_total,
                               qpu.vpm_write_history_count,
-                              6 + s->shader_record[3], rows, instructions);
+                              rows, instructions);
                 g_free(code);
                 return false;
             }
-            for (unsigned word = 0; word <
-                 6 + s->shader_record[3]; word++) {
+            for (unsigned word = 0; word < 5; word++) {
                 uint8_t coordinate_row = qpu.vpm_write_history[word];
 
                 for (unsigned lane = 0; lane <
@@ -935,6 +932,33 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                     if (first + lane < count) {
                         vertices[first + lane].word[word] =
                             qpu.vpm[coordinate_row][lane];
+                    }
+                }
+            }
+            {
+                uint8_t reciprocal_w_row = qpu.vpm_write_history[6];
+
+                for (unsigned lane = 0; lane <
+                     BCM2835_V3D_QPU_LANES; lane++) {
+                    if (first + lane < count) {
+                        vertices[first + lane].word[
+                            5 + s->shader_record[3]] =
+                            qpu.vpm[reciprocal_w_row][lane];
+                    }
+                }
+            }
+            if (input_vpm) {
+                const uint32_t (*batch_vpm)[BCM2835_V3D_QPU_LANES] =
+                    input_vpm[first / BCM2835_V3D_QPU_LANES];
+
+                for (unsigned varying = 0; varying <
+                     s->shader_record[3]; varying++) {
+                    for (unsigned lane = 0; lane <
+                         BCM2835_V3D_QPU_LANES; lane++) {
+                        if (first + lane < count) {
+                            vertices[first + lane].word[5 + varying] =
+                                batch_vpm[3 + varying][lane];
+                        }
                     }
                 }
             }
