@@ -305,8 +305,9 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
 {
     uint8_t code[4 * sizeof(uint64_t)];
     BCM2835V3DQPUState qpu;
-    static const unsigned texture_types[] = { 16, 0, 0, 1 };
-    static const unsigned dimensions[] = { 2, 2, 32, 2 };
+    static const unsigned texture_types[] = { 16, 0, 0, 1, 0 };
+    static const unsigned dimensions[] = { 2, 2, 32, 2, 2 };
+    static const unsigned min_filters[] = { 1, 1, 1, 1, 2 };
     QPUTestTexture texture = {
         .uniform_address = 0x1000,
         .memory_base = 0x4000,
@@ -328,7 +329,8 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
         texture.config[0] = texture.memory_base | ((type & 0xf) << 4);
         texture.config[1] = (type == 16 ? 1U << 31 : 0) |
                             (size << 20) | (size << 8) |
-                            (1U << 7) | (1U << 4) | (1U << 2) | 1U;
+                            (1U << 7) | (min_filters[test] << 4) |
+                            (1U << 2) | 1U;
         texture.uniform_reads = 0;
         texture.memory_reads = 0;
         bcm2835_v3d_qpu_init(&qpu);
@@ -571,6 +573,7 @@ static void test_v3d_qpu_color_pack_unpack(void)
 {
     uint8_t pack_code[6 * sizeof(uint64_t)];
     uint8_t unpack_code[5 * sizeof(uint64_t)];
+    uint8_t half_unpack_code[3 * sizeof(uint64_t)];
     uint8_t pack_a_code[3 * sizeof(uint64_t)];
     BCM2835V3DQPUState qpu;
     uint32_t executed;
@@ -578,6 +581,15 @@ static void test_v3d_qpu_color_pack_unpack(void)
         0x3f000000, 0x3f800000, 0xbf800000, 0x40000000,
     };
     static const uint8_t output[4] = { 128, 255, 0, 255 };
+    static const uint32_t half_input[] = {
+        0xc0003c00, 0x3c000001, 0x00000000, 0xfc007c00,
+    };
+    static const uint32_t half_low[] = {
+        0x3f800000, 0x33800000, 0x00000000, 0x7f800000,
+    };
+    static const uint32_t half_high[] = {
+        0xc0000000, 0x3f800000, 0x00000000, 0xff800000,
+    };
 
     for (unsigned pack = 3; pack < 8; pack++) {
         stq_le_p(pack_code + (pack - 3) * sizeof(uint64_t),
@@ -587,6 +599,9 @@ static void test_v3d_qpu_color_pack_unpack(void)
     bcm2835_v3d_qpu_init(&qpu);
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.acc[0][lane] = input[lane % G_N_ELEMENTS(input)];
+        for (unsigned pack = 3; pack < 8; pack++) {
+            qpu.rf[1][pack - 3][lane] = 0x11223344;
+        }
     }
 
     g_assert_cmpint(bcm2835_v3d_qpu_run(pack_code, sizeof(pack_code), 8,
@@ -598,6 +613,7 @@ static void test_v3d_qpu_color_pack_unpack(void)
         for (unsigned pack = 3; pack < 8; pack++) {
             uint32_t expected = pack == 3 ?
                 (uint32_t)output[component] * UINT32_C(0x01010101) :
+                (0x11223344 & ~(UINT32_C(0xff) << ((pack - 4) * 8))) |
                 (uint32_t)output[component] << ((pack - 4) * 8);
 
             g_assert_cmphex(qpu.rf[1][pack - 3][lane], ==, expected);
@@ -628,6 +644,25 @@ static void test_v3d_qpu_color_pack_unpack(void)
         }
     }
 
+    stq_le_p(half_unpack_code, qpu_test_unpack_color(1, 4));
+    stq_le_p(half_unpack_code + sizeof(uint64_t),
+             qpu_test_unpack_color(2, 5));
+    stq_le_p(half_unpack_code + 2 * sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.acc[4][lane] = half_input[lane % G_N_ELEMENTS(half_input)];
+    }
+    g_assert_cmpint(bcm2835_v3d_qpu_run(half_unpack_code,
+                                         sizeof(half_unpack_code), 8,
+                                         &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        unsigned input_index = lane % G_N_ELEMENTS(half_input);
+
+        g_assert_cmphex(qpu.rf[0][4][lane], ==, half_low[input_index]);
+        g_assert_cmphex(qpu.rf[0][5][lane], ==, half_high[input_index]);
+    }
+
     stq_le_p(pack_a_code, qpu_test_add(0, 0, 2, false) | (1ULL << 52));
     stq_le_p(pack_a_code + sizeof(uint64_t),
              qpu_test_add(0, 0, 2, false) | (2ULL << 52));
@@ -643,6 +678,60 @@ static void test_v3d_qpu_color_pack_unpack(void)
                     ==, BCM2835_V3D_QPU_END);
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.rf[0][2][lane], ==, 0x12341234);
+    }
+}
+
+static void test_v3d_qpu_cross_mux_register_reads(void)
+{
+    uint8_t code[2 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint64_t instruction = (1ULL << 60) | (1ULL << 49) |
+                           (4ULL << 38) | (39ULL << 32) |
+                           (12ULL << 24) | (2ULL << 18) | (3ULL << 12) |
+                           (7ULL << 9) | (6ULL << 6);
+
+    stq_le_p(code, instruction);
+    stq_le_p(code + sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][2][lane] = 3;
+        qpu.rf[1][3][lane] = 5;
+    }
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8,
+                                         &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.rf[0][4][lane], ==, 8);
+    }
+}
+
+static void test_v3d_qpu_thread_switch_signals(void)
+{
+    uint8_t code[2 * sizeof(uint64_t)];
+    static const unsigned signals[] = { 2, 6 };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(signals); i++) {
+        BCM2835V3DQPUState qpu;
+        uint32_t executed;
+        uint64_t instruction = qpu_test_add(2, 3, 4, false);
+
+        instruction = (instruction & ~(0xfULL << 60)) |
+                      ((uint64_t)signals[i] << 60);
+        stq_le_p(code, instruction);
+        stq_le_p(code + sizeof(uint64_t), 3ULL << 60);
+        bcm2835_v3d_qpu_init(&qpu);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            qpu.rf[0][2][lane] = 3;
+            qpu.rf[1][3][lane] = 5;
+        }
+
+        g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                             &executed),
+                        ==, BCM2835_V3D_QPU_END);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            g_assert_cmphex(qpu.rf[0][4][lane], ==, 8);
+        }
     }
 }
 
@@ -1047,6 +1136,7 @@ static uint32_t read_u32(const uint8_t *buffer)
 
 static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
 {
+    enum { test_fb_width = 64, test_fb_height = 65 };
     static const uint32_t vertices[9][8] = {
         { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
           0xff00ff00, 0x3f800000, 0x40000000, 0x3f800000 },
@@ -1078,8 +1168,8 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     uint8_t code[19 * sizeof(uint64_t)] = { 0 };
     uint8_t fragment_code[4 * sizeof(uint64_t)];
     uint8_t vertex_data[sizeof(vertices)];
-    uint8_t initial[FB_SIZE];
-    uint8_t fb[FB_SIZE];
+    uint8_t initial[test_fb_width * test_fb_height * sizeof(uint32_t)];
+    uint8_t fb[sizeof(initial)];
     size_t render_size = 0;
     size_t bin_size = 0;
     size_t draw_size = 0;
@@ -1099,6 +1189,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         qpu_test_add_imm(48, 5, 0),
         qpu_test_add_imm(48, 6, 0),
         qpu_test_add_imm(48, 7, 0),
+        /* Mesa writes viewport XY, ZS, then 1/WC after clip coordinates. */
         qpu_test_add_imm(0, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(1, 48, 0) | (1ULL << 44),
         qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
@@ -1169,23 +1260,6 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     memwrite(0x6000, vertex_code, sizeof(vertex_code));
     memwrite(0x6400, fragment_code, sizeof(fragment_code));
 
-    render_cl[render_size++] = 113;
-    append_u32(render_cl, &render_size, FB_ADDR);
-    append_u16(render_cl, &render_size, 64);
-    append_u16(render_cl, &render_size, 64);
-    append_u16(render_cl, &render_size, 1U << 2);
-    render_cl[render_size++] = 114;
-    append_u32(render_cl, &render_size, draw_color);
-    append_u32(render_cl, &render_size, 0);
-    append_u32(render_cl, &render_size, 0);
-    render_cl[render_size++] = 103;
-    append_u16(render_cl, &render_size, 40);
-    append_u16(render_cl, &render_size, 32);
-    render_cl[render_size++] = 0;
-    memwrite(CL_ADDR, render_cl, render_size);
-    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
-    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + render_size);
-
     bin_cl[bin_size++] = 112;
     append_u32(bin_cl, &bin_size, 0x30000);
     append_u32(bin_cl, &bin_size, 0x140);
@@ -1197,8 +1271,9 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     bin_cl[bin_size++] = 64;
     append_u32(bin_cl, &bin_size, 0x34001);
     bin_cl[bin_size++] = 103;
-    append_u16(bin_cl, &bin_size, 40);
-    append_u16(bin_cl, &bin_size, 32);
+    /* VIEWPORT_OFFSET fields are signed 12.4 pixel coordinates. */
+    append_u16(bin_cl, &bin_size, 40 * 16);
+    append_u16(bin_cl, &bin_size, 32 * 16);
     bin_cl[bin_size++] = 105;
     append_u32(bin_cl, &bin_size, 0x44000000);
     append_u32(bin_cl, &bin_size, 0x44000000);
@@ -1234,10 +1309,29 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCS), ==, 0);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_SPILLUSE,
                     ==, V3D_INT_SPILLUSE);
+
+    /* CT0 bins before CT1 supplies the render target configuration. */
+    render_cl[render_size++] = 113;
+    append_u32(render_cl, &render_size, FB_ADDR);
+    append_u16(render_cl, &render_size, test_fb_width);
+    append_u16(render_cl, &render_size, test_fb_height);
+    append_u16(render_cl, &render_size, 1U << 2);
+    render_cl[render_size++] = 114;
+    append_u32(render_cl, &render_size, draw_color);
+    append_u32(render_cl, &render_size, 0);
+    append_u32(render_cl, &render_size, 0);
+    render_cl[render_size++] = 103;
+    append_u16(render_cl, &render_size, 40 * 16);
+    append_u16(render_cl, &render_size, 32 * 16);
+    render_cl[render_size++] = 0;
+    memwrite(CL_ADDR, render_cl, render_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + render_size);
+
     memread(FB_ADDR, fb, sizeof(fb));
-    g_assert_cmphex(read_u32(fb + (30 * 64 + 32) * sizeof(uint32_t)),
+    g_assert_cmphex(read_u32(fb + (30 * test_fb_width + 32) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
-    g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
+    g_assert_cmphex(read_u32(fb + (1 * test_fb_width + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
     memread(0x30000, tile_head, sizeof(tile_head));
     memread(0x30100, tile_list, sizeof(tile_list));
@@ -1289,22 +1383,25 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
 
     memread(FB_ADDR, fb, sizeof(fb));
     {
-        uint32_t bits = read_u32(fb + (40 * 64 + 50) * sizeof(uint32_t));
+        uint32_t bits = read_u32(fb + (40 * test_fb_width + 50) *
+                                 sizeof(uint32_t));
         float value;
 
         memcpy(&value, &bits, sizeof(value));
         g_assert_cmpfloat(value, >, 2.16f);
         g_assert_cmpfloat(value, <, 2.18f);
     }
-    g_assert_cmphex(read_u32(fb + (1 * 64 + 1) * sizeof(uint32_t)),
+    g_assert_cmphex(read_u32(fb + (1 * test_fb_width + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
 
-    /* Mesa clears with a four-vertex GL_TRIANGLE_FAN. */
+    /* Also clip Mesa's four-vertex fan with the negative Y scale it emits. */
     bin_count = readl(RASPI3_V3D_BASE + V3D_BFC);
+    memmove(vertex_data, vertex_data + 6 * sizeof(vertices[0]),
+            3 * sizeof(vertices[0]));
     memcpy(vertex_data + 3 * sizeof(vertices[0]), vertex_data,
            sizeof(vertices[0]));
     memwrite(0x7000, vertex_data, sizeof(vertex_data));
-    record[0] = 0;
+    record[0] = 1U << 2;
     memwrite(0x34000, record, sizeof(record));
     bin_size = 0;
     bin_cl[bin_size++] = 112;
@@ -1318,14 +1415,14 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     bin_cl[bin_size++] = 64;
     append_u32(bin_cl, &bin_size, 0x34001);
     bin_cl[bin_size++] = 103;
-    append_u16(bin_cl, &bin_size, 40);
-    append_u16(bin_cl, &bin_size, 32);
+    append_u16(bin_cl, &bin_size, 40 * 16);
+    append_u16(bin_cl, &bin_size, 32 * 16);
     bin_cl[bin_size++] = 104;
     append_u32(bin_cl, &bin_size, 0xbf800000);
     append_u32(bin_cl, &bin_size, 0x3f800000);
     bin_cl[bin_size++] = 105;
     append_u32(bin_cl, &bin_size, 0x44000000);
-    append_u32(bin_cl, &bin_size, 0x44000000);
+    append_u32(bin_cl, &bin_size, 0xc4000000);
     bin_cl[bin_size++] = 33;
     bin_cl[bin_size++] = 6;
     append_u32(bin_cl, &bin_size, 4);
@@ -1450,8 +1547,8 @@ static void test_v3d_ct1_compressed_xy_triangle_encodings(void)
     cl[cl_size++] = 0;
     cl[cl_size++] = 0;
     cl[cl_size++] = 103;
-    append_u16(cl, &cl_size, 32);
-    append_u16(cl, &cl_size, 32);
+    append_u16(cl, &cl_size, 32 * 16);
+    append_u16(cl, &cl_size, 32 * 16);
     cl[cl_size++] = 56;
     cl[cl_size++] = 0x32; /* 32-bit XY triangle coordinates. */
     cl[cl_size++] = 64;
@@ -1875,6 +1972,10 @@ int main(int argc, char **argv)
                    test_v3d_qpu_rfa_unpack_itof);
     qtest_add_func("/bcm2835/v3d/qpu_color_pack_unpack",
                    test_v3d_qpu_color_pack_unpack);
+    qtest_add_func("/bcm2835/v3d/qpu_cross_mux_register_reads",
+                   test_v3d_qpu_cross_mux_register_reads);
+    qtest_add_func("/bcm2835/v3d/qpu_thread_switch_signals",
+                   test_v3d_qpu_thread_switch_signals);
     qtest_add_func("/bcm2835/v3d/qpu_sfu", test_v3d_qpu_sfu);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
                    test_v3d_qpu_vpm_vector_io);

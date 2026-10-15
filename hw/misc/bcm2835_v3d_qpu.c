@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "qemu/host-utils.h"
+#include "qemu/log.h"
 #include "bcm2835_v3d_qpu.h"
 #include <math.h>
 
@@ -40,7 +41,9 @@
 #define QPU_BRANCH_WADDR_MUL_SHIFT 36
 
 #define QPU_SIG_NONE        1
+#define QPU_SIG_THREAD_SWITCH 2
 #define QPU_SIG_PROG_END    3
+#define QPU_SIG_LAST_THREAD_SWITCH 6
 #define QPU_SIG_LOAD_TMU0   10
 #define QPU_SIG_SMALL_IMM   13
 #define QPU_SIG_LOAD_IMM    14
@@ -231,12 +234,42 @@ static uint32_t qpu_v8_minmax(uint32_t a, uint32_t b, bool maximum)
     return result;
 }
 
+static uint32_t qpu_half_to_float_bits(uint16_t value)
+{
+    uint32_t sign = (uint32_t)(value & 0x8000) << 16;
+    uint32_t exponent = (value >> 10) & 0x1f;
+    uint32_t fraction = value & 0x3ff;
+
+    if (exponent == 0) {
+        int32_t exp = -14;
+
+        if (!fraction) {
+            return sign;
+        }
+        while (!(fraction & 0x400)) {
+            fraction <<= 1;
+            exp--;
+        }
+        fraction &= 0x3ff;
+        return sign | ((uint32_t)(exp + 127) << 23) | (fraction << 13);
+    }
+    if (exponent == 0x1f) {
+        return sign | 0x7f800000 | (fraction << 13) |
+               (fraction ? 0x00400000 : 0);
+    }
+    return sign | ((exponent + 112) << 23) | (fraction << 13);
+}
+
 static uint32_t qpu_unpack_r4(uint32_t value, unsigned unpack)
 {
     unsigned shift;
 
     if (unpack == 0) {
         return value;
+    }
+    if (unpack == 1 || unpack == 2) {
+        shift = (unpack - 1) * 16;
+        return qpu_half_to_float_bits((uint16_t)(value >> shift));
     }
     if (unpack == 3) {
         value = (value >> 24) & 0xff;
@@ -246,7 +279,8 @@ static uint32_t qpu_unpack_r4(uint32_t value, unsigned unpack)
     return qpu_float_bits(((value >> shift) & 0xff) / 255.0f);
 }
 
-static uint32_t qpu_pack_mul_color(uint32_t value, unsigned pack)
+static uint32_t qpu_pack_mul_color(uint32_t value, unsigned pack,
+                                  uint32_t previous)
 {
     float channel = qpu_bits_float(value);
     uint32_t packed;
@@ -261,7 +295,9 @@ static uint32_t qpu_pack_mul_color(uint32_t value, unsigned pack)
     if (pack == 3) {
         return packed * UINT32_C(0x01010101);
     }
-    return packed << ((pack - 4) * 8);
+    unsigned shift = (pack - 4) * 8;
+
+    return (previous & ~(UINT32_C(0xff) << shift)) | (packed << shift);
 }
 
 static uint32_t qpu_pack_a_half(uint32_t value, uint32_t previous,
@@ -422,6 +458,9 @@ static BCM2835V3DQPUResult qpu_tmu0_fetch(BCM2835V3DQPUState *qpu,
     uint32_t config1 = 0;
 
     if (qpu->tmu0_pending) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: QPU TMU0 fetch while previous result pending at pc=%u\n",
+                      qpu->pc);
         return BCM2835_V3D_QPU_UNSUPPORTED;
     }
 
@@ -455,15 +494,18 @@ static BCM2835V3DQPUResult qpu_tmu0_fetch(BCM2835V3DQPUState *qpu,
         linear_filter = mag_filter == 0;
         base = qpu->tmu0_config0 & 0xfffff000;
 
-        /* shortcut: equal min/mag LOD0 filters only; add derivatives and
-         * mip levels when Mesa output exercises them.
-         */
+        /* shortcut: one mip level only; add LOD selection for multiple levels. */
         if ((type != 0 && type != 1 && type != 16) ||
             ((qpu->tmu0_config0 >> 10) & 3) ||
             (qpu->tmu0_config0 & 0x20f) ||
             (config1 & (1U << 19)) ||
-            min_filter > 1 || min_filter != mag_filter ||
+            min_filter > 5 ||
+            (linear_filter != (min_filter == 0 || min_filter >= 4)) ||
             wrap_s == 3 || wrap_t == 3) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: unsupported TMU0 type=%u size=%ux%u wrap=%u/%u filter=%u/%u cfg=%08x/%08x\n",
+                          type, width, height, wrap_s, wrap_t, min_filter,
+                          mag_filter, qpu->tmu0_config0, config1);
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
         width = width ? width : 2048;
@@ -481,8 +523,10 @@ static BCM2835V3DQPUResult qpu_tmu0_fetch(BCM2835V3DQPUState *qpu,
                 qpu->tmu0_result[lane] = 0;
                 continue;
             }
-            if (!(qpu->tmu0_t_mask & (1U << lane)) ||
-                !qpu_tmu0_sample(
+            if (!(qpu->tmu0_t_mask & (1U << lane))) {
+                return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+            if (!qpu_tmu0_sample(
                     qpu, type, memory_format, base, width, height,
                     wrap_s, wrap_t, linear_filter,
                     qpu_bits_float(qpu->io[QPU_W_TMU0_S][lane]),
@@ -532,10 +576,11 @@ static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
 
     if (address == QPU_R_UNIFORM) {
         uint32_t uniform;
+        uint32_t uniform_address = qpu->uniform_address;
 
         if (!qpu->read_uniform ||
             !qpu->read_uniform(qpu->uniform_opaque,
-                               qpu->uniform_address, &uniform) ||
+                               uniform_address, &uniform) ||
             qpu->uniform_address > UINT32_MAX - sizeof(uint32_t)) {
             qpu->io_fault = true;
             return false;
@@ -878,8 +923,9 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
  * This bounded slice covers part of the QPU ALUs, branches, uniforms,
  * horizontal 32-bit VPM access, TMU0 RGBA texture sampling, and signed 16a
  * integer unpack from register file A. shortcut: no register-file timing,
- * A-file packing or other unpack modes, r4 half-float unpack, vertical VPM,
- * TMU1, differing min/mag filters or mip levels; add as guest shaders require.
+ * A-file packing or other unpack modes, vertical VPM, TMU1, different min/mag
+ * spatial filters or multiple mip levels; add as guest
+ * shaders require.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -1008,7 +1054,10 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             }
             continue;
         }
+        /* shortcut: execute thread switches serially; add dual threads when needed. */
         if (sig != QPU_SIG_NONE && sig != QPU_SIG_PROG_END &&
+            sig != QPU_SIG_THREAD_SWITCH &&
+            sig != QPU_SIG_LAST_THREAD_SWITCH &&
             sig != QPU_SIG_LOAD_TMU0 &&
             sig != QPU_SIG_SMALL_IMM && sig != QPU_SIG_LOAD_IMM) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
@@ -1038,8 +1087,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             ((mul_a == QPU_MUX_A || mul_b == QPU_MUX_A) &&
              op_mul == QPU_M_FMUL);
 
-        if ((pm && (unpack == 1 || unpack == 2 || pack == 1 || pack == 2 ||
-                    unpack > 7 || pack > 7)) ||
+        if ((pm && (pack == 1 || pack == 2 || unpack > 7 || pack > 7)) ||
             (!pm && (unpack > 1 || pack > 2 ||
                      (unpack && rfa_float_input)))) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
@@ -1049,9 +1097,11 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
         reads_a = sig != QPU_SIG_LOAD_IMM &&
-                  (add_a == QPU_MUX_A || mul_a == QPU_MUX_A);
+                  (add_a == QPU_MUX_A || add_b == QPU_MUX_A ||
+                   mul_a == QPU_MUX_A || mul_b == QPU_MUX_A);
         reads_b = sig != QPU_SIG_LOAD_IMM && !small_imm &&
-                  (add_b == QPU_MUX_B || mul_b == QPU_MUX_B);
+                  (add_a == QPU_MUX_B || add_b == QPU_MUX_B ||
+                   mul_a == QPU_MUX_B || mul_b == QPU_MUX_B);
         instruction_uniform_address = qpu->uniform_address;
         if ((reads_a && !qpu_read_register(qpu, false, raddr_a, reg_a)) ||
             (reads_b && !qpu_read_register(qpu, true, raddr_b, reg_b))) {
@@ -1113,7 +1163,20 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
 
         if (pm && pack) {
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
-                mul_result[lane] = qpu_pack_mul_color(mul_result[lane], pack);
+                uint32_t previous;
+
+                if (waddr_mul < 32) {
+                    previous = qpu->rf[1 ^ ws][waddr_mul][lane];
+                } else if (waddr_mul >= QPU_W_ACC0 &&
+                           waddr_mul < QPU_W_ACC0 + 6) {
+                    previous = qpu->acc[waddr_mul - QPU_W_ACC0][lane];
+                } else if (waddr_mul == QPU_W_NOP) {
+                    previous = 0;
+                } else {
+                    return BCM2835_V3D_QPU_UNSUPPORTED;
+                }
+                mul_result[lane] = qpu_pack_mul_color(mul_result[lane],
+                                                       pack, previous);
             }
         }
         if (!pm && pack) {
