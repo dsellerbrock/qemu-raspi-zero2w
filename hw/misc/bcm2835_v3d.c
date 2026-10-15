@@ -242,23 +242,21 @@ static void bcm2835_v3d_store_pixel(uint8_t *dst, unsigned color_format,
     }
 }
 
-static uint64_t bcm2835_v3d_tile_pixel_addr(BCM2835V3DState *s,
-                                            uint32_t base,
-                                            unsigned memory_format,
-                                            unsigned bytes_per_pixel,
-                                            unsigned x, unsigned y)
+static uint64_t bcm2835_v3d_memory_pixel_addr(uint32_t base,
+                                              unsigned memory_format,
+                                              unsigned bytes_per_pixel,
+                                              unsigned image_width,
+                                              unsigned global_x,
+                                              unsigned global_y)
 {
-    uint32_t global_x = (uint32_t)s->tile_x * V3D_TILE_SIZE + x;
-    uint32_t global_y = (uint32_t)s->tile_y * V3D_TILE_SIZE + y;
-
     if (memory_format == 0) {
         return (uint64_t)base +
-               ((uint64_t)global_y * s->render_width + global_x) *
+               ((uint64_t)global_y * image_width + global_x) *
                bytes_per_pixel;
     }
 
     if (memory_format == 2) {
-        uint32_t stride = DIV_ROUND_UP(s->render_width, 4) * 4 *
+        uint32_t stride = DIV_ROUND_UP(image_width, 4) * 4 *
                           bytes_per_pixel;
 
         return (uint64_t)base + (global_y & ~3U) * (uint64_t)stride +
@@ -269,7 +267,7 @@ static uint64_t bcm2835_v3d_tile_pixel_addr(BCM2835V3DState *s,
     {
         static const uint8_t even_stile_map[4] = { 0, 3, 1, 2 };
         static const uint8_t odd_stile_map[4] = { 2, 1, 3, 0 };
-        uint32_t tile_stride = DIV_ROUND_UP(s->render_width,
+        uint32_t tile_stride = DIV_ROUND_UP(image_width,
                                             V3D_T_MEMORY_TILE_SIZE);
         uint32_t memory_tile_x = global_x / V3D_T_MEMORY_TILE_SIZE;
         uint32_t memory_tile_y = global_y / V3D_T_MEMORY_TILE_SIZE;
@@ -300,6 +298,20 @@ static uint64_t bcm2835_v3d_tile_pixel_addr(BCM2835V3DState *s,
                utile_in_stile * utile_bytes +
                pixel_in_utile * bytes_per_pixel;
     }
+}
+
+static uint64_t bcm2835_v3d_tile_pixel_addr(BCM2835V3DState *s,
+                                            uint32_t base,
+                                            unsigned memory_format,
+                                            unsigned bytes_per_pixel,
+                                            unsigned x, unsigned y)
+{
+    unsigned global_x = (uint32_t)s->tile_x * V3D_TILE_SIZE + x;
+    unsigned global_y = (uint32_t)s->tile_y * V3D_TILE_SIZE + y;
+
+    return bcm2835_v3d_memory_pixel_addr(base, memory_format,
+                                          bytes_per_pixel, s->render_width,
+                                          global_x, global_y);
 }
 
 static uint64_t bcm2835_v3d_tile_utile_addr(BCM2835V3DState *s,
@@ -666,6 +678,29 @@ static bool bcm2835_v3d_qpu_read_uniform(void *opaque, uint32_t address,
     return true;
 }
 
+static bool bcm2835_v3d_qpu_read_texture(void *opaque, uint32_t base,
+                                          unsigned memory_format,
+                                          unsigned width, unsigned height,
+                                          unsigned x, unsigned y,
+                                          uint32_t *value)
+{
+    BCM2835V3DState *s = opaque;
+    uint8_t pixel[sizeof(uint32_t)];
+    uint64_t address;
+
+    if (memory_format > 2 || x >= width || y >= height) {
+        return false;
+    }
+    address = bcm2835_v3d_memory_pixel_addr(base, memory_format,
+                                             sizeof(uint32_t), width, x, y);
+    if (address + sizeof(pixel) > UINT32_MAX + 1ULL ||
+        !bcm2835_v3d_dma_read(s, address, pixel, sizeof(pixel))) {
+        return false;
+    }
+    *value = ldl_le_p(pixel);
+    return true;
+}
+
 static bool bcm2835_v3d_qpu_read_varying(
     void *opaque, unsigned index,
     uint32_t partial[BCM2835_V3D_QPU_LANES],
@@ -803,6 +838,10 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
         qpu.uniform_address = uniforms_address;
         qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
         qpu.uniform_opaque = s;
+        qpu.read_memory = bcm2835_v3d_qpu_read_uniform;
+        qpu.memory_opaque = s;
+        qpu.read_texture = bcm2835_v3d_qpu_read_texture;
+        qpu.texture_opaque = s;
         if (input_vpm) {
             memcpy(qpu.vpm, input_vpm[first / BCM2835_V3D_QPU_LANES],
                    sizeof(qpu.vpm));

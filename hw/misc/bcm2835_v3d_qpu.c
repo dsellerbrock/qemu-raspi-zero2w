@@ -41,8 +41,11 @@
 
 #define QPU_SIG_NONE        1
 #define QPU_SIG_PROG_END    3
+#define QPU_SIG_LOAD_TMU0   10
 #define QPU_SIG_SMALL_IMM   13
 #define QPU_SIG_LOAD_IMM    14
+
+#define QPU_T_MEMORY_TILE_SIZE 32
 
 #define QPU_A_NOP           0
 #define QPU_A_FADD          1
@@ -104,6 +107,10 @@
 #define QPU_W_SFU_RECIPSQRT  53
 #define QPU_W_SFU_EXP        54
 #define QPU_W_SFU_LOG        55
+#define QPU_W_TMU0_S         56
+#define QPU_W_TMU0_T         57
+#define QPU_W_TMU0_R         58
+#define QPU_W_TMU0_B         59
 
 static uint32_t qpu_float_bits(float value)
 {
@@ -255,6 +262,249 @@ static uint32_t qpu_pack_mul_color(uint32_t value, unsigned pack)
         return packed * UINT32_C(0x01010101);
     }
     return packed << ((pack - 4) * 8);
+}
+
+static bool qpu_tmu_normalize(float coordinate, unsigned wrap,
+                              float *normalized)
+{
+    if (!isfinite(coordinate)) {
+        return false;
+    }
+
+    switch (wrap) {
+    case 0: /* repeat */
+        coordinate -= floorf(coordinate);
+        break;
+    case 1: /* clamp */
+        coordinate = MAX(0.0f, MIN(coordinate, 1.0f));
+        break;
+    case 2: /* mirror */
+        coordinate = fmodf(coordinate, 2.0f);
+        if (coordinate < 0.0f) {
+            coordinate += 2.0f;
+        }
+        if (coordinate > 1.0f) {
+            coordinate = 2.0f - coordinate;
+        }
+        break;
+    default: /* border color */
+        return false;
+    }
+
+    *normalized = coordinate;
+    return true;
+}
+
+static unsigned qpu_tmu_wrap_index(int index, unsigned size, unsigned wrap)
+{
+    if (wrap == 1) {
+        return CLAMP(index, 0, (int)size - 1);
+    }
+    if (wrap == 2) {
+        int period = size * 2;
+
+        index %= period;
+        if (index < 0) {
+            index += period;
+        }
+        return index < (int)size ? index : period - 1 - index;
+    }
+    index %= (int)size;
+    return index < 0 ? index + size : index;
+}
+
+static bool qpu_tmu0_read_texel(BCM2835V3DQPUState *qpu, unsigned type,
+                                unsigned memory_format, uint32_t base,
+                                unsigned width, unsigned height,
+                                unsigned x, unsigned y, uint32_t *value)
+{
+    uint64_t address;
+
+    if (qpu->tmu0_config0 & (1U << 8)) {
+        y = height - 1 - y;
+    }
+    if (type == 16) {
+        address = (uint64_t)base + ((uint64_t)y * width + x) * 4;
+        return qpu->read_memory && address <= UINT32_MAX &&
+               qpu->read_memory(qpu->memory_opaque, address, value);
+    }
+    if (!qpu->read_texture ||
+        !qpu->read_texture(qpu->texture_opaque, base, memory_format,
+                           width, height, x, y, value)) {
+        return false;
+    }
+    if (type == 1) {
+        *value |= UINT32_C(0xff000000);
+    }
+    return true;
+}
+
+static uint32_t qpu_tmu0_blend(uint32_t c00, uint32_t c10,
+                               uint32_t c01, uint32_t c11,
+                               float fx, float fy)
+{
+    uint32_t result = 0;
+
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+        float top = ((c00 >> shift) & 0xff) * (1.0f - fx) +
+                    ((c10 >> shift) & 0xff) * fx;
+        float bottom = ((c01 >> shift) & 0xff) * (1.0f - fx) +
+                       ((c11 >> shift) & 0xff) * fx;
+        unsigned channel = floorf(top * (1.0f - fy) + bottom * fy + 0.5f);
+
+        result |= MIN(channel, 0xffU) << shift;
+    }
+    return result;
+}
+
+static bool qpu_tmu0_sample(BCM2835V3DQPUState *qpu, unsigned type,
+                            unsigned memory_format, uint32_t base,
+                            unsigned width, unsigned height,
+                            unsigned wrap_s, unsigned wrap_t,
+                            bool linear_filter, float s, float t,
+                            uint32_t *value)
+{
+    float normalized_s, normalized_t;
+    float x, y;
+    int x0, y0;
+    unsigned x1, y1;
+    uint32_t c00, c10, c01, c11;
+
+    if (!qpu_tmu_normalize(s, wrap_s, &normalized_s) ||
+        !qpu_tmu_normalize(t, wrap_t, &normalized_t)) {
+        return false;
+    }
+    if (!linear_filter) {
+        unsigned ix = MIN((unsigned)(normalized_s * width), width - 1);
+        unsigned iy = MIN((unsigned)(normalized_t * height), height - 1);
+
+        return qpu_tmu0_read_texel(qpu, type, memory_format, base,
+                                   width, height, ix, iy, value);
+    }
+
+    x = normalized_s * width - 0.5f;
+    y = normalized_t * height - 0.5f;
+    x0 = floorf(x);
+    y0 = floorf(y);
+    x1 = x0 + 1;
+    y1 = y0 + 1;
+    if (!qpu_tmu0_read_texel(qpu, type, memory_format, base, width, height,
+                             qpu_tmu_wrap_index(x0, width, wrap_s),
+                             qpu_tmu_wrap_index(y0, height, wrap_t), &c00) ||
+        !qpu_tmu0_read_texel(qpu, type, memory_format, base, width, height,
+                             qpu_tmu_wrap_index(x1, width, wrap_s),
+                             qpu_tmu_wrap_index(y0, height, wrap_t), &c10) ||
+        !qpu_tmu0_read_texel(qpu, type, memory_format, base, width, height,
+                             qpu_tmu_wrap_index(x0, width, wrap_s),
+                             qpu_tmu_wrap_index(y1, height, wrap_t), &c01) ||
+        !qpu_tmu0_read_texel(qpu, type, memory_format, base, width, height,
+                             qpu_tmu_wrap_index(x1, width, wrap_s),
+                             qpu_tmu_wrap_index(y1, height, wrap_t), &c11)) {
+        return false;
+    }
+    *value = qpu_tmu0_blend(c00, c10, c01, c11,
+                            x - x0, y - y0);
+    return true;
+}
+
+static BCM2835V3DQPUResult qpu_tmu0_fetch(BCM2835V3DQPUState *qpu,
+                                          uint16_t lanes)
+{
+    uint32_t config1 = 0;
+
+    if (qpu->tmu0_pending) {
+        return BCM2835_V3D_QPU_UNSUPPORTED;
+    }
+
+    if (qpu->tmu0_has_t) {
+        unsigned type;
+        unsigned memory_format;
+        unsigned width;
+        unsigned height;
+        unsigned wrap_s;
+        unsigned wrap_t;
+        unsigned min_filter;
+        unsigned mag_filter;
+        bool linear_filter;
+        uint32_t base;
+
+        if (!qpu->read_uniform ||
+            qpu->uniform_address > UINT32_MAX - sizeof(uint32_t) ||
+            !qpu->read_uniform(qpu->uniform_opaque,
+                               qpu->uniform_address, &config1)) {
+            return BCM2835_V3D_QPU_CODE_FAULT;
+        }
+        qpu->uniform_address += sizeof(uint32_t);
+        type = ((qpu->tmu0_config0 >> 4) & 0xf) |
+               ((config1 >> 27) & 0x10);
+        width = (config1 >> 8) & 0x7ff;
+        height = (config1 >> 20) & 0x7ff;
+        wrap_s = config1 & 3;
+        wrap_t = (config1 >> 2) & 3;
+        min_filter = (config1 >> 4) & 7;
+        mag_filter = (config1 >> 7) & 1;
+        linear_filter = mag_filter == 0;
+        base = qpu->tmu0_config0 & 0xfffff000;
+
+        /* shortcut: equal min/mag LOD0 filters only; add derivatives and
+         * mip levels when Mesa output exercises them.
+         */
+        if ((type != 0 && type != 1 && type != 16) ||
+            ((qpu->tmu0_config0 >> 10) & 3) ||
+            (qpu->tmu0_config0 & 0x20f) ||
+            (config1 & (1U << 19)) ||
+            min_filter > 1 || min_filter != mag_filter ||
+            wrap_s == 3 || wrap_t == 3) {
+            return BCM2835_V3D_QPU_UNSUPPORTED;
+        }
+        width = width ? width : 2048;
+        height = height ? height : 2048;
+        memory_format = type == 16 ? 0 :
+                        (width < QPU_T_MEMORY_TILE_SIZE ||
+                         height < QPU_T_MEMORY_TILE_SIZE) ? 2 : 1;
+        if ((type == 16 && !qpu->read_memory) ||
+            (type != 16 && !qpu->read_texture)) {
+            return BCM2835_V3D_QPU_CODE_FAULT;
+        }
+
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            if (!(lanes & (1U << lane))) {
+                qpu->tmu0_result[lane] = 0;
+                continue;
+            }
+            if (!(qpu->tmu0_t_mask & (1U << lane)) ||
+                !qpu_tmu0_sample(
+                    qpu, type, memory_format, base, width, height,
+                    wrap_s, wrap_t, linear_filter,
+                    qpu_bits_float(qpu->io[QPU_W_TMU0_S][lane]),
+                    qpu_bits_float(qpu->tmu0_t[lane]),
+                    &qpu->tmu0_result[lane])) {
+                return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+        }
+        qpu->tmu0_has_t = false;
+        qpu->tmu0_t_mask = 0;
+    } else {
+        if (!qpu->read_memory) {
+            return BCM2835_V3D_QPU_CODE_FAULT;
+        }
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            uint32_t address;
+
+            if (!(lanes & (1U << lane))) {
+                qpu->tmu0_result[lane] = 0;
+                continue;
+            }
+            address = qpu->io[QPU_W_TMU0_S][lane] & ~3U;
+            if (!qpu->read_memory(qpu->memory_opaque, address,
+                                  &qpu->tmu0_result[lane])) {
+                return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+        }
+    }
+
+    qpu->tmu0_pending = true;
+    return BCM2835_V3D_QPU_END;
 }
 
 static bool qpu_read_register(BCM2835V3DQPUState *qpu, bool regfile_b,
@@ -597,6 +847,10 @@ static bool qpu_write(BCM2835V3DQPUState *qpu, unsigned waddr, bool regfile,
     }
     if (waddr >= 38 && waddr < 64) {
         qpu->io[waddr][lane] = value;
+        if (waddr >= QPU_W_TMU0_S && waddr <= QPU_W_TMU0_B) {
+            qpu->tmu0_instruction_write_mask[
+                waddr - QPU_W_TMU0_S] |= 1U << lane;
+        }
         if (waddr == 46) {
             qpu->tlb_color_all_write_mask |= 1U << lane;
         }
@@ -611,10 +865,11 @@ void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu)
 }
 
 /*
- * This bounded slice covers part of the QPU ALUs, branches, uniforms, and
- * horizontal 32-bit VPM access. shortcut: no register-file timing, A-file
- * pack/unpack, r4 half-float unpack, V8MULD, vertical VPM, or TMU; add each
- * as guest shader coverage requires it.
+ * This bounded slice covers part of the QPU ALUs, branches, uniforms,
+ * horizontal 32-bit VPM access, and TMU0 RGBA texture sampling. shortcut:
+ * no register-file timing, A-file pack/unpack, r4 half-float unpack, vertical
+ * VPM, TMU1, differing min/mag filters or mip levels; add as guest shaders
+ * require.
  */
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
@@ -654,6 +909,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         unsigned pack;
         uint32_t add_result[BCM2835_V3D_QPU_LANES];
         uint32_t mul_result[BCM2835_V3D_QPU_LANES];
+        uint32_t instruction_uniform_address;
         uint32_t reg_a[BCM2835_V3D_QPU_LANES] = { 0 };
         uint32_t reg_b[BCM2835_V3D_QPU_LANES] = { 0 };
         bool carry[BCM2835_V3D_QPU_LANES];
@@ -666,6 +922,8 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         bool mul_sfu_write;
 
         qpu->varying_c_pending_valid = false;
+        memset(qpu->tmu0_instruction_write_mask, 0,
+               sizeof(qpu->tmu0_instruction_write_mask));
         for (unsigned i = 0; i < G_N_ELEMENTS(qpu->sfu_pending); i++) {
             if (qpu->sfu_pending[i] &&
                 qpu->sfu_ready_at[i] <= qpu->cycles) {
@@ -740,6 +998,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
             continue;
         }
         if (sig != QPU_SIG_NONE && sig != QPU_SIG_PROG_END &&
+            sig != QPU_SIG_LOAD_TMU0 &&
             sig != QPU_SIG_SMALL_IMM && sig != QPU_SIG_LOAD_IMM) {
             return BCM2835_V3D_QPU_UNSUPPORTED;
         }
@@ -776,6 +1035,7 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                   (add_a == QPU_MUX_A || mul_a == QPU_MUX_A);
         reads_b = sig != QPU_SIG_LOAD_IMM && !small_imm &&
                   (add_b == QPU_MUX_B || mul_b == QPU_MUX_B);
+        instruction_uniform_address = qpu->uniform_address;
         if ((reads_a && !qpu_read_register(qpu, false, raddr_a, reg_a)) ||
             (reads_b && !qpu_read_register(qpu, true, raddr_b, reg_b))) {
             return BCM2835_V3D_QPU_CODE_FAULT;
@@ -905,6 +1165,53 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
         }
         if (qpu->io_fault) {
             return BCM2835_V3D_QPU_CODE_FAULT;
+        }
+        if (qpu->tmu0_instruction_write_mask[2] ||
+            qpu->tmu0_instruction_write_mask[3] ||
+            (qpu->tmu0_instruction_write_mask[0] &&
+             qpu->tmu0_instruction_write_mask[1]) ||
+            (waddr_add == waddr_mul && waddr_add >= QPU_W_TMU0_S &&
+             waddr_add <= QPU_W_TMU0_B && (active_add & active_mul))) {
+            return BCM2835_V3D_QPU_UNSUPPORTED;
+        }
+        if (qpu->tmu0_instruction_write_mask[1]) {
+            if (qpu->tmu0_has_t ||
+                qpu->uniform_address != instruction_uniform_address ||
+                !qpu->read_uniform ||
+                qpu->uniform_address > UINT32_MAX - sizeof(uint32_t) ||
+                !qpu->read_uniform(qpu->uniform_opaque,
+                                   qpu->uniform_address,
+                                   &qpu->tmu0_config0)) {
+                return qpu->tmu0_has_t ? BCM2835_V3D_QPU_UNSUPPORTED :
+                                         BCM2835_V3D_QPU_CODE_FAULT;
+            }
+            qpu->uniform_address += sizeof(uint32_t);
+            qpu->tmu0_t_mask =
+                qpu->tmu0_instruction_write_mask[1];
+            memcpy(qpu->tmu0_t, qpu->io[QPU_W_TMU0_T],
+                   sizeof(qpu->tmu0_t));
+            qpu->tmu0_has_t = true;
+        }
+        if (qpu->tmu0_instruction_write_mask[0]) {
+            BCM2835V3DQPUResult result;
+
+            if (qpu->tmu0_has_t &&
+                qpu->uniform_address != instruction_uniform_address) {
+                return BCM2835_V3D_QPU_UNSUPPORTED;
+            }
+            result = qpu_tmu0_fetch(
+                qpu, qpu->tmu0_instruction_write_mask[0]);
+            if (result != BCM2835_V3D_QPU_END) {
+                return result;
+            }
+        }
+        if (sig == QPU_SIG_LOAD_TMU0) {
+            if (!qpu->tmu0_pending) {
+                return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+            memcpy(qpu->acc[4], qpu->tmu0_result,
+                   sizeof(qpu->tmu0_result));
+            qpu->tmu0_pending = false;
         }
         if (writes_vpm) {
             if (qpu->vpm_write_total < UINT8_MAX) {

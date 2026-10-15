@@ -16,6 +16,13 @@
 
 typedef bool (*BCM2835V3DQPUReadUniform)(void *opaque, uint32_t address,
                                          uint32_t *value);
+typedef bool (*BCM2835V3DQPUReadMemory)(void *opaque, uint32_t address,
+                                        uint32_t *value);
+typedef bool (*BCM2835V3DQPUReadTexture)(void *opaque, uint32_t base,
+                                         unsigned memory_format,
+                                         unsigned width, unsigned height,
+                                         unsigned x, unsigned y,
+                                         uint32_t *value);
 typedef bool (*BCM2835V3DQPUReadVarying)(
     void *opaque, unsigned index,
     uint32_t partial[BCM2835_V3D_QPU_LANES],
@@ -34,6 +41,13 @@ typedef struct BCM2835V3DQPUState {
     uint32_t sfu_result[3][BCM2835_V3D_QPU_LANES];
     uint64_t sfu_ready_at[3];
     bool sfu_pending[3];
+    uint32_t tmu0_t[BCM2835_V3D_QPU_LANES];
+    uint32_t tmu0_result[BCM2835_V3D_QPU_LANES];
+    uint32_t tmu0_config0;
+    uint16_t tmu0_t_mask;
+    uint16_t tmu0_instruction_write_mask[4];
+    bool tmu0_has_t;
+    bool tmu0_pending;
     uint16_t z;
     uint16_t n;
     uint16_t c;
@@ -56,6 +70,10 @@ typedef struct BCM2835V3DQPUState {
     bool io_fault;
     BCM2835V3DQPUReadUniform read_uniform;
     void *uniform_opaque;
+    BCM2835V3DQPUReadMemory read_memory;
+    void *memory_opaque;
+    BCM2835V3DQPUReadTexture read_texture;
+    void *texture_opaque;
     BCM2835V3DQPUReadVarying read_varying;
     void *varying_opaque;
 } BCM2835V3DQPUState;

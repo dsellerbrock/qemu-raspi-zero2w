@@ -60,6 +60,16 @@ typedef struct QPUTestUniform {
     unsigned reads;
 } QPUTestUniform;
 
+typedef struct QPUTestTexture {
+    uint32_t uniform_address;
+    uint32_t config[2];
+    uint32_t memory_base;
+    uint32_t texels[4];
+    unsigned memory_format;
+    unsigned uniform_reads;
+    unsigned memory_reads;
+} QPUTestTexture;
+
 typedef struct QPUTestVarying {
     uint32_t partial[BCM2835_V3D_QPU_LANES];
     uint32_t c[BCM2835_V3D_QPU_LANES];
@@ -77,6 +87,71 @@ static bool qpu_test_read_uniform(void *opaque, uint32_t address,
     *value = uniform->value;
     uniform->reads++;
     return true;
+}
+
+static bool qpu_test_read_texture_uniform(void *opaque, uint32_t address,
+                                          uint32_t *value)
+{
+    QPUTestTexture *texture = opaque;
+    uint32_t offset;
+
+    if (address < texture->uniform_address) {
+        return false;
+    }
+    offset = address - texture->uniform_address;
+    if (offset >= sizeof(texture->config) ||
+        offset % sizeof(uint32_t)) {
+        return false;
+    }
+    *value = texture->config[offset / sizeof(uint32_t)];
+    texture->uniform_reads++;
+    return true;
+}
+
+static bool qpu_test_read_texture_memory(void *opaque, uint32_t address,
+                                         uint32_t *value)
+{
+    QPUTestTexture *texture = opaque;
+    uint32_t offset;
+
+    if (address < texture->memory_base) {
+        return false;
+    }
+    offset = address - texture->memory_base;
+    if (offset >= sizeof(texture->texels) || offset % sizeof(uint32_t)) {
+        return false;
+    }
+    *value = texture->texels[offset / sizeof(uint32_t)];
+    texture->memory_reads++;
+    return true;
+}
+
+static bool qpu_test_read_texture(void *opaque, uint32_t base,
+                                  unsigned memory_format,
+                                  unsigned width, unsigned height,
+                                  unsigned x, unsigned y, uint32_t *value)
+{
+    QPUTestTexture *texture = opaque;
+
+    if (base != texture->memory_base || width != height ||
+        (width != 2 && width != 32) || x >= width || y >= height ||
+        memory_format > 2 ||
+        (memory_format && memory_format != (width < 32 ? 2 : 1))) {
+        return false;
+    }
+    texture->memory_format = memory_format;
+    *value = texture->texels[(y >= height / 2 ? 2 : 0) +
+                             (x >= width / 2 ? 1 : 0)];
+    texture->memory_reads++;
+    return true;
+}
+
+static uint32_t qpu_test_float_bits(float value)
+{
+    uint32_t bits;
+
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
 }
 
 static bool qpu_test_read_varying(void *opaque, unsigned index,
@@ -110,6 +185,16 @@ static uint64_t qpu_test_add(unsigned raddr_a, unsigned raddr_b,
            (uint64_t)raddr_a << 18 |
            (uint64_t)raddr_b << 12 | (6ULL << 9) | (7ULL << 6) |
            (7ULL << 3) | 7ULL;
+}
+
+static uint64_t qpu_test_write_tmu(unsigned address, bool regfile_b)
+{
+    return (1ULL << 60) | (1ULL << 49) |
+           (uint64_t)address << 38 | (39ULL << 32) | (12ULL << 24) |
+           (uint64_t)(regfile_b ? 39 : 0) << 18 |
+           (uint64_t)(regfile_b ? 0 : 39) << 12 |
+           (uint64_t)(regfile_b ? 5 : 6) << 9 |
+           (uint64_t)(regfile_b ? 7 : 5) << 6 | (7ULL << 3) | 7ULL;
 }
 
 static uint64_t qpu_test_fmul(unsigned raddr_a, unsigned raddr_b,
@@ -196,6 +281,99 @@ static void test_v3d_qpu_uniform_read(void)
     g_assert_cmphex(qpu.uniform_address, ==, 0x1004);
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.rf[0][0][lane], ==, uniform.value + 1);
+    }
+}
+
+static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
+{
+    uint8_t code[4 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    static const unsigned texture_types[] = { 16, 0, 0, 1 };
+    static const unsigned dimensions[] = { 2, 2, 32, 2 };
+    QPUTestTexture texture = {
+        .uniform_address = 0x1000,
+        .memory_base = 0x4000,
+        .texels = {
+            0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00,
+        },
+    };
+    uint32_t executed;
+
+    stq_le_p(code, qpu_test_write_tmu(57, false));
+    stq_le_p(code + sizeof(uint64_t), qpu_test_write_tmu(56, true));
+    stq_le_p(code + 2 * sizeof(uint64_t), 10ULL << 60); /* Load TMU0. */
+    stq_le_p(code + 3 * sizeof(uint64_t), 3ULL << 60); /* Program End. */
+    for (unsigned test = 0; test < G_N_ELEMENTS(texture_types); test++) {
+        unsigned type = texture_types[test];
+        unsigned size = dimensions[test];
+        unsigned memory_format = type == 16 ? 0 : size < 32 ? 2 : 1;
+
+        texture.config[0] = texture.memory_base | ((type & 0xf) << 4);
+        texture.config[1] = (type == 16 ? 1U << 31 : 0) |
+                            (size << 20) | (size << 8) |
+                            (1U << 7) | (1U << 4) | (1U << 2) | 1U;
+        texture.uniform_reads = 0;
+        texture.memory_reads = 0;
+        bcm2835_v3d_qpu_init(&qpu);
+        qpu.uniform_address = texture.uniform_address;
+        qpu.read_uniform = qpu_test_read_texture_uniform;
+        qpu.uniform_opaque = &texture;
+        qpu.read_memory = qpu_test_read_texture_memory;
+        qpu.memory_opaque = &texture;
+        qpu.read_texture = qpu_test_read_texture;
+        qpu.texture_opaque = &texture;
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            qpu.rf[0][0][lane] = qpu_test_float_bits(
+                lane & 1 ? 0.75f : 0.25f);
+            qpu.rf[1][0][lane] = qpu_test_float_bits(
+                lane & 2 ? 0.75f : 0.25f);
+        }
+
+        g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                             &executed),
+                        ==, BCM2835_V3D_QPU_END);
+        g_assert_cmpuint(texture.uniform_reads, ==, 2);
+        g_assert_cmpuint(texture.memory_reads, ==,
+                         BCM2835_V3D_QPU_LANES);
+        g_assert_cmpuint(texture.memory_format, ==, memory_format);
+        g_assert_cmphex(qpu.uniform_address, ==, 0x1008);
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            unsigned x = lane & 2 ? size - 1 : 0;
+            unsigned y = lane & 1 ? size - 1 : 0;
+            uint32_t expected = texture.texels[
+                (y >= size / 2 ? 2 : 0) + (x >= size / 2 ? 1 : 0)];
+
+            if (type == 1) {
+                expected |= UINT32_C(0xff000000);
+            }
+            g_assert_cmphex(qpu.acc[4][lane], ==, expected);
+        }
+    }
+
+    texture.config[0] = texture.memory_base;
+    texture.config[1] = (2U << 20) | (2U << 8) | (1U << 2) | 1U;
+    texture.uniform_reads = 0;
+    texture.memory_reads = 0;
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.uniform_address = texture.uniform_address;
+    qpu.read_uniform = qpu_test_read_texture_uniform;
+    qpu.uniform_opaque = &texture;
+    qpu.read_memory = qpu_test_read_texture_memory;
+    qpu.memory_opaque = &texture;
+    qpu.read_texture = qpu_test_read_texture;
+    qpu.texture_opaque = &texture;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = qpu_test_float_bits(0.5f);
+        qpu.rf[1][0][lane] = qpu_test_float_bits(0.5f);
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(texture.memory_reads, ==,
+                     4 * BCM2835_V3D_QPU_LANES);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.acc[4][lane], ==, 0x77889966);
     }
 }
 
@@ -1524,6 +1702,8 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/bcm2835/v3d/qpu_uniform_read",
                    test_v3d_qpu_uniform_read);
+    qtest_add_func("/bcm2835/v3d/qpu_tmu0_rgba_texture_sampling",
+                   test_v3d_qpu_tmu0_rgba_texture_sampling);
     qtest_add_func("/bcm2835/v3d/qpu_fragment_w_register",
                    test_v3d_qpu_fragment_w_register);
     qtest_add_func("/bcm2835/v3d/qpu_varying_read",
