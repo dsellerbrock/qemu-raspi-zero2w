@@ -26,6 +26,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/i2c/i2c.h"
+#include "qemu/fifo8.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_I2C "bcm2835-i2c"
@@ -67,6 +68,7 @@ struct BCM2835I2CState {
     MemoryRegion iomem;
     I2CBus *bus;
     qemu_irq irq;
+    Fifo8 rx_fifo;
 
     uint32_t c;
     uint32_t s;

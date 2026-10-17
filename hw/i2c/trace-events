@@ -61,3 +61,8 @@ pca954x_read_data(uint8_t value) "PCA954X read data: 0x%02x"
 
 imx_i2c_read(const char *id, const char *reg, uint64_t ofs, uint64_t value) "%s:[%s (0x%" PRIx64 ")] -> 0x%02" PRIx64
 imx_i2c_write(const char *id, const char *reg, uint64_t ofs, uint64_t value) "%s:[%s (0x%" PRIx64 ")] <- 0x%02" PRIx64
+
+# bcm2835_i2c.c
+bcm2835_i2c_read(const char *id, uint64_t offset, uint32_t value, uint32_t control, uint32_t status, uint32_t dlen) "%s offset=0x%" PRIx64 " value=0x%08x C=0x%08x S=0x%08x DLEN=0x%08x"
+bcm2835_i2c_write(const char *id, uint64_t offset, uint32_t value, uint32_t control, uint32_t status, uint32_t dlen) "%s offset=0x%" PRIx64 " value=0x%08x C=0x%08x S=0x%08x DLEN=0x%08x"
+bcm2835_i2c_irq(int level, uint32_t control, uint32_t status, uint32_t dlen) "level=%d C=0x%08x S=0x%08x DLEN=0x%08x"

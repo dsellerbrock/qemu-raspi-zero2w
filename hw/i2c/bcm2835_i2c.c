@@ -29,6 +29,9 @@
 #include "hw/i2c/bcm2835_i2c.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
+#include "trace.h"
+
+#define BCM2835_I2C_FIFO_SIZE 16
 
 static void bcm2835_i2c_update_interrupt(BCM2835I2CState *s)
 {
@@ -47,7 +50,59 @@ static void bcm2835_i2c_update_interrupt(BCM2835I2CState *s)
     if (s->c & BCM2835_I2C_C_INTD && s->s & BCM2835_I2C_S_DONE) {
         do_interrupt = 1;
     }
+    trace_bcm2835_i2c_irq(do_interrupt, s->c, s->s, s->dlen);
     qemu_set_irq(s->irq, do_interrupt);
+}
+
+static void bcm2835_i2c_update_fifo_status(BCM2835I2CState *s)
+{
+    s->s &= ~(BCM2835_I2C_S_RXF | BCM2835_I2C_S_RXD |
+              BCM2835_I2C_S_RXR | BCM2835_I2C_S_TXW);
+    s->s |= BCM2835_I2C_S_TXD | BCM2835_I2C_S_TXE;
+
+    if (!fifo8_is_empty(&s->rx_fifo)) {
+        s->s |= BCM2835_I2C_S_RXD;
+    }
+    if (fifo8_is_full(&s->rx_fifo)) {
+        s->s |= BCM2835_I2C_S_RXF;
+        /* shortcut: assume the RXR threshold is full FIFO until silicon data says otherwise. */
+        if (s->c & BCM2835_I2C_C_READ) {
+            s->s |= BCM2835_I2C_S_RXR;
+        }
+    }
+    if ((s->s & BCM2835_I2C_S_TA) &&
+        !(s->c & BCM2835_I2C_C_READ) && s->dlen) {
+        s->s |= BCM2835_I2C_S_TXW;
+    }
+}
+
+static void bcm2835_i2c_finish_transfer(BCM2835I2CState *s);
+
+static void bcm2835_i2c_fill_rx_fifo(BCM2835I2CState *s)
+{
+    while (s->dlen && !fifo8_is_full(&s->rx_fifo)) {
+        fifo8_push(&s->rx_fifo, i2c_recv(s->bus));
+        s->dlen--;
+    }
+
+    if (!s->dlen && (s->s & BCM2835_I2C_S_TA) &&
+        (s->c & BCM2835_I2C_C_INTD)) {
+        bcm2835_i2c_finish_transfer(s);
+    }
+}
+
+static void bcm2835_i2c_abort_transfer(BCM2835I2CState *s)
+{
+    if (s->s & BCM2835_I2C_S_TA) {
+        i2c_end_transfer(s->bus);
+        s->dlen = s->last_dlen;
+    }
+    fifo8_reset(&s->rx_fifo);
+    /* The datasheet leaves DONE after a CLEAR abort unspecified; abort is not completion. */
+    s->s &= ~(BCM2835_I2C_S_TA | BCM2835_I2C_S_RXF |
+              BCM2835_I2C_S_RXD | BCM2835_I2C_S_RXR |
+              BCM2835_I2C_S_TXW);
+    s->s |= BCM2835_I2C_S_TXD | BCM2835_I2C_S_TXE;
 }
 
 static void bcm2835_i2c_begin_transfer(BCM2835I2CState *s)
@@ -55,31 +110,34 @@ static void bcm2835_i2c_begin_transfer(BCM2835I2CState *s)
     int direction = s->c & BCM2835_I2C_C_READ;
 
     s->s &= ~(BCM2835_I2C_S_DONE | BCM2835_I2C_S_RXR |
-              BCM2835_I2C_S_TXW | BCM2835_I2C_S_RXD);
+              BCM2835_I2C_S_TXW | BCM2835_I2C_S_RXD |
+              BCM2835_I2C_S_RXF);
     if (i2c_start_transfer(s->bus, s->a, direction)) {
-        s->s |= BCM2835_I2C_S_ERR;
+        i2c_end_transfer(s->bus);
+        s->s |= BCM2835_I2C_S_ERR | BCM2835_I2C_S_DONE;
+        s->s &= ~BCM2835_I2C_S_TA;
+        s->dlen = 0;
+        return;
     }
     s->s |= BCM2835_I2C_S_TA;
 
     if (direction) {
-        s->s |= BCM2835_I2C_S_RXR | BCM2835_I2C_S_RXD;
-    } else {
-        s->s |= BCM2835_I2C_S_TXW;
+        bcm2835_i2c_fill_rx_fifo(s);
+    } else if (!s->dlen && (s->c & BCM2835_I2C_C_INTD)) {
+        bcm2835_i2c_finish_transfer(s);
     }
 }
 
 static void bcm2835_i2c_finish_transfer(BCM2835I2CState *s)
 {
     /*
-     * shortcut: INTD distinguishes chained messages from the final message;
-     * replace this when byte-level FIFO and repeated-start timing are modeled.
+     * shortcut: bytes move synchronously through the FIFOs; replace this when
+     * byte-level bus timing is modeled.
      */
     i2c_end_transfer(s->bus);
     s->s |= BCM2835_I2C_S_DONE;
 
-    /* Ensure RXD is cleared, otherwise the driver registers an error */
-    s->s &= ~(BCM2835_I2C_S_TA | BCM2835_I2C_S_RXR |
-              BCM2835_I2C_S_TXW | BCM2835_I2C_S_RXD);
+    s->s &= ~(BCM2835_I2C_S_TA | BCM2835_I2C_S_TXW);
 }
 
 static uint64_t bcm2835_i2c_read(void *opaque, hwaddr addr, unsigned size)
@@ -101,15 +159,14 @@ static uint64_t bcm2835_i2c_read(void *opaque, hwaddr addr, unsigned size)
         readval = s->a;
         break;
     case BCM2835_I2C_FIFO:
-        /* We receive I2C messages directly instead of using FIFOs */
-        if (s->s & BCM2835_I2C_S_TA) {
-            readval = i2c_recv(s->bus);
-            s->dlen -= 1;
-
-            if (s->dlen == 0 && (s->c & BCM2835_I2C_C_INTD)) {
-                bcm2835_i2c_finish_transfer(s);
+        if (!fifo8_is_empty(&s->rx_fifo)) {
+            readval = fifo8_pop(&s->rx_fifo);
+            if ((s->s & BCM2835_I2C_S_TA) &&
+                (s->c & BCM2835_I2C_C_READ)) {
+                bcm2835_i2c_fill_rx_fifo(s);
             }
         }
+        bcm2835_i2c_update_fifo_status(s);
         bcm2835_i2c_update_interrupt(s);
         break;
     case BCM2835_I2C_DIV:
@@ -126,6 +183,8 @@ static uint64_t bcm2835_i2c_read(void *opaque, hwaddr addr, unsigned size)
                       "%s: Bad offset 0x%" HWADDR_PRIx "\n", __func__, addr);
     }
 
+    trace_bcm2835_i2c_read(DEVICE(s)->canonical_path, addr, readval,
+                           s->c, s->s, s->dlen);
     return readval;
 }
 
@@ -138,20 +197,19 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
     switch (addr) {
     case BCM2835_I2C_C:
         /* ST is a one-shot operation; it must read back as 0 */
-        s->c = writeval & ~BCM2835_I2C_C_ST;
+        s->c = writeval & ~(BCM2835_I2C_C_ST | BCM2835_I2C_C_CLEAR);
 
-        /* Start transfer */
-        if (writeval & (BCM2835_I2C_C_ST | BCM2835_I2C_C_I2CEN)) {
-            bcm2835_i2c_begin_transfer(s);
-            /*
-             * Handle special case where transfer starts with zero data length.
-             * Required for zero length i2c quick messages to work.
-             */
-            if (s->dlen == 0 && (s->c & BCM2835_I2C_C_INTD)) {
-                bcm2835_i2c_finish_transfer(s);
-            }
+        if (writeval & BCM2835_I2C_C_CLEAR) {
+            bcm2835_i2c_abort_transfer(s);
         }
 
+        /* Start transfer */
+        if ((writeval & BCM2835_I2C_C_ST) &&
+            (s->c & BCM2835_I2C_C_I2CEN)) {
+            bcm2835_i2c_begin_transfer(s);
+        }
+
+        bcm2835_i2c_update_fifo_status(s);
         bcm2835_i2c_update_interrupt(s);
         break;
     case BCM2835_I2C_S:
@@ -163,6 +221,8 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
         /* Clear DONE, CLKT and ERR by writing 1 */
         s->s &= ~(writeval & (BCM2835_I2C_S_DONE |
                   BCM2835_I2C_S_ERR | BCM2835_I2C_S_CLKT));
+        bcm2835_i2c_update_fifo_status(s);
+        bcm2835_i2c_update_interrupt(s);
         break;
     case BCM2835_I2C_DLEN:
         s->dlen = writeval;
@@ -172,20 +232,19 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
         s->a = writeval;
         break;
     case BCM2835_I2C_FIFO:
-        /* We send I2C messages directly instead of using FIFOs */
-        if (s->s & BCM2835_I2C_S_TA) {
-            if (s->s & BCM2835_I2C_S_TXD) {
-                if (!i2c_send(s->bus, writeval & 0xff)) {
-                    s->dlen -= 1;
-                } else {
-                    s->s |= BCM2835_I2C_S_ERR;
-                }
+        if ((s->s & BCM2835_I2C_S_TA) &&
+            !(s->c & BCM2835_I2C_C_READ) && s->dlen) {
+            if (!i2c_send(s->bus, writeval & 0xff)) {
+                s->dlen--;
+            } else {
+                s->s |= BCM2835_I2C_S_ERR;
             }
 
             if (s->dlen == 0 && (s->c & BCM2835_I2C_C_INTD)) {
                 bcm2835_i2c_finish_transfer(s);
             }
         }
+        bcm2835_i2c_update_fifo_status(s);
         bcm2835_i2c_update_interrupt(s);
         break;
     case BCM2835_I2C_DIV:
@@ -201,6 +260,9 @@ static void bcm2835_i2c_write(void *opaque, hwaddr addr,
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: Bad offset 0x%" HWADDR_PRIx "\n", __func__, addr);
     }
+
+    trace_bcm2835_i2c_write(DEVICE(s)->canonical_path, addr, writeval,
+                            s->c, s->s, s->dlen);
 }
 
 static const MemoryRegionOps bcm2835_i2c_ops = {
@@ -222,11 +284,14 @@ static void bcm2835_i2c_realize(DeviceState *dev, Error **errp)
                           TYPE_BCM2835_I2C, 0x24);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    fifo8_create(&s->rx_fifo, BCM2835_I2C_FIFO_SIZE);
 }
 
 static void bcm2835_i2c_reset(DeviceState *dev)
 {
     BCM2835I2CState *s = BCM2835_I2C(dev);
+
+    fifo8_reset(&s->rx_fifo);
 
     /* Reset values according to BCM2835 Peripheral Documentation */
     s->c = 0x0;
@@ -236,11 +301,18 @@ static void bcm2835_i2c_reset(DeviceState *dev)
     s->div = 0x5dc;
     s->del = 0x00300030;
     s->clkt = 0x40;
+    s->last_dlen = 0;
+    qemu_set_irq(s->irq, 0);
+}
+
+static bool bcm2835_i2c_rx_fifo_needed(void *opaque, int version_id)
+{
+    return version_id >= 2;
 }
 
 static const VMStateDescription vmstate_bcm2835_i2c = {
     .name = TYPE_BCM2835_I2C,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(c, BCM2835I2CState),
@@ -251,6 +323,8 @@ static const VMStateDescription vmstate_bcm2835_i2c = {
         VMSTATE_UINT32(del, BCM2835I2CState),
         VMSTATE_UINT32(clkt, BCM2835I2CState),
         VMSTATE_UINT32(last_dlen, BCM2835I2CState),
+        VMSTATE_FIFO8_TEST(rx_fifo, BCM2835I2CState,
+                           bcm2835_i2c_rx_fifo_needed),
         VMSTATE_END_OF_LIST()
     }
 };
