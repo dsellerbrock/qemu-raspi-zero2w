@@ -56,6 +56,8 @@ meson_options_help() {
   printf "%s\n" '                           dtrace/ftrace/log/nop/simple/syslog/ust)'
   printf "%s\n" '  --enable-tsan            enable thread sanitizer'
   printf "%s\n" '  --enable-ubsan           enable undefined behaviour sanitizer'
+  printf "%s\n" '  --enable-v3d-wgpu        Enable optional wgpu-native acceleration for the'
+  printf "%s\n" '                           Raspberry Pi V3D model'
   printf "%s\n" '  --firmwarepath=VALUES    search PATH for firmware files [share/qemu-'
   printf "%s\n" '                           firmware]'
   printf "%s\n" '  --iasl=VALUE             Path to ACPI disassembler'
@@ -531,6 +533,8 @@ _meson_option_parse() {
     --disable-ubsan) printf "%s" -Dubsan=false ;;
     --enable-usb-redir) printf "%s" -Dusb_redir=enabled ;;
     --disable-usb-redir) printf "%s" -Dusb_redir=disabled ;;
+    --enable-v3d-wgpu) printf "%s" -Dv3d_wgpu=true ;;
+    --disable-v3d-wgpu) printf "%s" -Dv3d_wgpu=false ;;
     --enable-valgrind) printf "%s" -Dvalgrind=enabled ;;
     --disable-valgrind) printf "%s" -Dvalgrind=disabled ;;
     --enable-vde) printf "%s" -Dvde=enabled ;;

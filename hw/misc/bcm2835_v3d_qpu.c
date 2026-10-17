@@ -540,7 +540,9 @@ static bool qpu_tmu_sample(BCM2835V3DQPUState *qpu, uint32_t config0,
                            uint32_t base, unsigned width, unsigned height,
                            unsigned wrap_s, unsigned wrap_t,
                            bool linear_filter, float s, float t,
-                           uint32_t *value)
+                           uint32_t *value,
+                           BCM2835V3DQPUTMUSample *sample,
+                           bool compute_reference)
 {
     float normalized_s, normalized_t;
     float x, y;
@@ -580,7 +582,14 @@ static bool qpu_tmu_sample(BCM2835V3DQPUState *qpu, uint32_t config0,
                             qpu_tmu_wrap_index(y1, height, wrap_t), &c11)) {
         return false;
     }
-    *value = qpu_tmu_blend(c00, c10, c01, c11, x - x0, y - y0);
+    sample->texel[0] = c00;
+    sample->texel[1] = c10;
+    sample->texel[2] = c01;
+    sample->texel[3] = c11;
+    sample->fraction_s = qpu_float_bits(x - x0);
+    sample->fraction_t = qpu_float_bits(y - y0);
+    *value = compute_reference ?
+             qpu_tmu_blend(c00, c10, c01, c11, x - x0, y - y0) : 0;
     return true;
 }
 
@@ -609,6 +618,8 @@ static BCM2835V3DQPUResult qpu_tmu_fetch(BCM2835V3DQPUState *qpu,
         unsigned mag_filter;
         bool linear_filter;
         uint32_t base;
+        BCM2835V3DQPUTMUSample samples[BCM2835_V3D_QPU_LANES] = { 0 };
+        uint16_t sample_mask = 0;
 
         if (!qpu->read_uniform ||
             qpu->uniform_address > UINT32_MAX - sizeof(uint32_t) ||
@@ -665,8 +676,41 @@ static BCM2835V3DQPUResult qpu_tmu_fetch(BCM2835V3DQPUState *qpu,
                     wrap_s, wrap_t, linear_filter,
                     qpu_bits_float(qpu->io[s_addr][lane]),
                     qpu_bits_float(tmu->t[lane]),
-                    &tmu->result[lane])) {
+                    &tmu->result[lane], &samples[lane],
+                    !qpu->filter_texture || qpu->filter_texture_verify)) {
                 return BCM2835_V3D_QPU_CODE_FAULT;
+            }
+            if (linear_filter) {
+                sample_mask |= 1U << lane;
+            }
+        }
+        if (sample_mask && qpu->filter_texture) {
+            uint32_t filtered[BCM2835_V3D_QPU_LANES];
+            const uint32_t *reference = qpu->filter_texture_verify ?
+                                        tmu->result : NULL;
+
+            /* shortcut: keep texel reads and QPU ALU on CPU; offload bilinear mix. */
+            if (qpu->filter_texture(qpu->filter_texture_opaque, samples,
+                                    sample_mask, reference, filtered)) {
+                for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES;
+                     lane++) {
+                    if (sample_mask & (1U << lane)) {
+                        tmu->result[lane] = filtered[lane];
+                    }
+                }
+            } else if (!qpu->filter_texture_verify) {
+                for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES;
+                     lane++) {
+                    if (sample_mask & (1U << lane)) {
+                        const BCM2835V3DQPUTMUSample *sample = &samples[lane];
+
+                        tmu->result[lane] = qpu_tmu_blend(
+                            sample->texel[0], sample->texel[1],
+                            sample->texel[2], sample->texel[3],
+                            qpu_bits_float(sample->fraction_s),
+                            qpu_bits_float(sample->fraction_t));
+                    }
+                }
             }
         }
         tmu->has_t = false;

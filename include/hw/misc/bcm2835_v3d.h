@@ -22,6 +22,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835V3DState, BCM2835_V3D)
 struct BCM2835V3DState {
     SysBusDevice parent_obj;
 
+    void *wgpu_context;
+    bool wgpu_verify;
     MemoryRegion iomem;
     MemoryRegion *dma_mr;
     AddressSpace dma_as;

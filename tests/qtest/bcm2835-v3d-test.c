@@ -70,6 +70,12 @@ typedef struct QPUTestTexture {
     unsigned memory_reads;
 } QPUTestTexture;
 
+typedef struct QPUTestTextureFilter {
+    unsigned calls;
+    uint16_t lanes;
+    BCM2835V3DQPUTMUSample first;
+} QPUTestTextureFilter;
+
 typedef struct QPUTestVarying {
     uint32_t partial[BCM2835_V3D_QPU_LANES];
     uint32_t c[BCM2835_V3D_QPU_LANES];
@@ -143,6 +149,24 @@ static bool qpu_test_read_texture(void *opaque, uint32_t base,
     *value = texture->texels[(y >= height / 2 ? 2 : 0) +
                              (x >= width / 2 ? 1 : 0)];
     texture->memory_reads++;
+    return true;
+}
+
+static bool qpu_test_filter_texture(
+    void *opaque, const BCM2835V3DQPUTMUSample samples[BCM2835_V3D_QPU_LANES],
+    uint16_t lanes, const uint32_t software_result[BCM2835_V3D_QPU_LANES],
+    uint32_t result[BCM2835_V3D_QPU_LANES])
+{
+    QPUTestTextureFilter *filter = opaque;
+
+    if (!software_result) {
+        return false;
+    }
+    filter->calls++;
+    filter->lanes = lanes;
+    filter->first = samples[0];
+    memcpy(result, software_result,
+           BCM2835_V3D_QPU_LANES * sizeof(result[0]));
     return true;
 }
 
@@ -324,6 +348,7 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
             0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00,
         },
     };
+    QPUTestTextureFilter filter = { 0 };
     uint32_t executed;
 
     stq_le_p(code, qpu_test_write_tmu(57, false));
@@ -390,6 +415,9 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
     qpu.memory_opaque = &texture;
     qpu.read_texture = qpu_test_read_texture;
     qpu.texture_opaque = &texture;
+    qpu.filter_texture = qpu_test_filter_texture;
+    qpu.filter_texture_opaque = &filter;
+    qpu.filter_texture_verify = true;
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.rf[0][0][lane] = qpu_test_float_bits(0.5f);
         qpu.rf[1][0][lane] = qpu_test_float_bits(0.5f);
@@ -400,6 +428,16 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
                     ==, BCM2835_V3D_QPU_END);
     g_assert_cmpuint(texture.memory_reads, ==,
                      4 * BCM2835_V3D_QPU_LANES);
+    g_assert_cmpuint(filter.calls, ==, 1);
+    g_assert_cmphex(filter.lanes, ==, UINT16_MAX);
+    g_assert_cmphex(filter.first.texel[0], ==, texture.texels[0]);
+    g_assert_cmphex(filter.first.texel[1], ==, texture.texels[1]);
+    g_assert_cmphex(filter.first.texel[2], ==, texture.texels[2]);
+    g_assert_cmphex(filter.first.texel[3], ==, texture.texels[3]);
+    g_assert_cmphex(filter.first.fraction_s, ==,
+                    qpu_test_float_bits(0.5f));
+    g_assert_cmphex(filter.first.fraction_t, ==,
+                    qpu_test_float_bits(0.5f));
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.acc[4][lane], ==, 0x77889966);
     }

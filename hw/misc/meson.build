@@ -97,6 +97,9 @@ system_ss.add(when: 'CONFIG_RASPI', if_true: files(
   'bcm2835_v3d_qpu.c',
   'bcm2835_v3d.c',
 ))
+if get_option('v3d_wgpu')
+  system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_v3d_wgpu.c'))
+endif
 system_ss.add(when: 'CONFIG_SLAVIO', if_true: files('slavio_misc.c'))
 system_ss.add(when: 'CONFIG_ZYNQ', if_true: files('zynq_slcr.c'))
 system_ss.add(when: 'CONFIG_XLNX_ZYNQ_DDRC', if_true: files('xlnx-zynq-ddrc.c'))

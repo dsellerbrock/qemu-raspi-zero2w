@@ -45,3 +45,6 @@
 [submodule "tests/lcitool/libvirt-ci"]
 	path = tests/lcitool/libvirt-ci
 	url = https://gitlab.com/libvirt/libvirt-ci.git
+[submodule "third-party/wgpu-native"]
+	path = third-party/wgpu-native
+	url = https://github.com/gfx-rs/wgpu-native.git

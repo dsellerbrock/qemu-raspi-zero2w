@@ -19,11 +19,22 @@ typedef bool (*BCM2835V3DQPUReadUniform)(void *opaque, uint32_t address,
                                          uint32_t *value);
 typedef bool (*BCM2835V3DQPUReadMemory)(void *opaque, uint32_t address,
                                         uint32_t *value);
+typedef bool (*BCM2835V3DQPUWriteMemory)(void *opaque, uint32_t address,
+                                         uint32_t value);
 typedef bool (*BCM2835V3DQPUReadTexture)(void *opaque, uint32_t base,
                                          unsigned memory_format,
                                          unsigned width, unsigned height,
                                          unsigned x, unsigned y,
                                          uint32_t *value);
+typedef struct BCM2835V3DQPUTMUSample {
+    uint32_t texel[4];
+    uint32_t fraction_s;
+    uint32_t fraction_t;
+} BCM2835V3DQPUTMUSample;
+typedef bool (*BCM2835V3DQPUFilterTexture)(
+    void *opaque, const BCM2835V3DQPUTMUSample samples[BCM2835_V3D_QPU_LANES],
+    uint16_t lanes, const uint32_t software_result[BCM2835_V3D_QPU_LANES],
+    uint32_t result[BCM2835_V3D_QPU_LANES]);
 typedef bool (*BCM2835V3DQPUReadVarying)(
     void *opaque, unsigned index,
     uint32_t partial[BCM2835_V3D_QPU_LANES],
@@ -63,24 +74,40 @@ typedef struct BCM2835V3DQPUState {
     uint32_t vpm_read_address;
     uint32_t vpm_read_stride;
     uint32_t vpm_read_remaining;
+    uint8_t vpm_read_size;
+    bool vpm_read_laned;
     bool vpm_read_horizontal;
     uint32_t vpm_write_address;
     uint32_t vpm_write_stride;
+    uint8_t vpm_write_size;
+    bool vpm_write_laned;
     bool vpm_write_horizontal;
     uint32_t vpm_write_pending[BCM2835_V3D_QPU_LANES];
     uint8_t vpm_write_history[BCM2835_V3D_QPU_VPM_WRITE_HISTORY];
     uint8_t vpm_write_history_count;
     uint8_t vpm_write_total;
+    uint32_t vpm_dma_load_setup;
+    uint32_t vpm_dma_store_setup;
+    uint32_t vpm_dma_load_pitch;
+    uint32_t vpm_dma_store_stride;
     bool vpm_read_setup;
     bool vpm_write_setup;
+    bool vpm_dma_load_setup_valid;
+    bool vpm_dma_store_setup_valid;
+    bool vpm_dma_load_pitch_valid;
+    bool vpm_dma_store_blockmode;
     bool varying_c_pending_valid;
     bool io_fault;
     BCM2835V3DQPUReadUniform read_uniform;
     void *uniform_opaque;
     BCM2835V3DQPUReadMemory read_memory;
     void *memory_opaque;
+    BCM2835V3DQPUWriteMemory write_memory;
     BCM2835V3DQPUReadTexture read_texture;
     void *texture_opaque;
+    BCM2835V3DQPUFilterTexture filter_texture;
+    void *filter_texture_opaque;
+    bool filter_texture_verify;
     BCM2835V3DQPUReadVarying read_varying;
     void *varying_opaque;
 } BCM2835V3DQPUState;

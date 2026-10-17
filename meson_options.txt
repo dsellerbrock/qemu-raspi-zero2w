@@ -18,6 +18,8 @@ option('tls_priority', type : 'string', value : 'NORMAL',
        description: 'Default TLS protocol/cipher priority string')
 option('default_devices', type : 'boolean', value : true,
        description: 'Include a default selection of devices in emulators')
+option('v3d_wgpu', type : 'boolean', value : false,
+       description: 'Enable optional wgpu-native acceleration for the Raspberry Pi V3D model')
 option('audio_drv_list', type: 'array', value: ['default'],
        choices: ['alsa', 'coreaudio', 'default', 'dsound', 'jack', 'oss', 'pa', 'pipewire', 'sdl', 'sndio'],
        description: 'Set audio driver list')

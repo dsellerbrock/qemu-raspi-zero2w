@@ -1060,6 +1060,9 @@ if enable_modules
 elif get_option('plugins')
   gmodule = dependency('gmodule-no-export-2.0', version: glib_req_ver, required: true,
                        method: 'pkg-config')
+elif get_option('v3d_wgpu')
+  gmodule = dependency('gmodule-no-export-2.0', version: glib_req_ver, required: true,
+                       method: 'pkg-config')
 else
   gmodule = not_found
 endif
@@ -2264,6 +2267,9 @@ endif
 #################
 
 config_host_data = configuration_data()
+if get_option('v3d_wgpu')
+  config_host_data.set('CONFIG_V3D_WGPU', true)
+endif
 
 config_host_data.set('CONFIG_HAVE_RUST', have_rust)
 audio_drivers_selected = []

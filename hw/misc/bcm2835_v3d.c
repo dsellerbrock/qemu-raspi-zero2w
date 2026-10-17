@@ -14,6 +14,9 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "system/dma.h"
+#ifdef CONFIG_V3D_WGPU
+#include "bcm2835_v3d_wgpu.h"
+#endif
 #include <math.h>
 
 #define V3D_IDENT0             0x000
@@ -682,6 +685,20 @@ static bool bcm2835_v3d_qpu_read_uniform(void *opaque, uint32_t address,
     return true;
 }
 
+static bool bcm2835_v3d_qpu_write_memory(void *opaque, uint32_t address,
+                                          uint32_t value)
+{
+    BCM2835V3DState *s = opaque;
+    uint8_t bytes[sizeof(uint32_t)];
+
+    if ((uint64_t)address + sizeof(bytes) > UINT32_MAX + 1ULL) {
+        return false;
+    }
+    stl_le_p(bytes, value);
+    return dma_memory_write(&s->dma_as, address, bytes, sizeof(bytes),
+                            MEMTXATTRS_UNSPECIFIED) == MEMTX_OK;
+}
+
 static bool bcm2835_v3d_qpu_read_texture(void *opaque, uint32_t base,
                                           unsigned memory_format,
                                           unsigned width, unsigned height,
@@ -704,6 +721,18 @@ static bool bcm2835_v3d_qpu_read_texture(void *opaque, uint32_t base,
     *value = ldl_le_p(pixel);
     return true;
 }
+
+#ifdef CONFIG_V3D_WGPU
+static bool bcm2835_v3d_qpu_filter_texture(
+    void *opaque,
+    const BCM2835V3DQPUTMUSample samples[BCM2835_V3D_QPU_LANES],
+    uint16_t lanes, const uint32_t software_result[BCM2835_V3D_QPU_LANES],
+    uint32_t result[BCM2835_V3D_QPU_LANES])
+{
+    return bcm2835_v3d_wgpu_filter_texture(opaque, samples, lanes,
+                                           software_result, result);
+}
+#endif
 
 static bool bcm2835_v3d_qpu_read_varying(
     void *opaque, unsigned index,
@@ -1034,11 +1063,30 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
         uint16_t expected_mask = batch == BCM2835_V3D_QPU_LANES ?
                                  UINT16_MAX : (1U << batch) - 1;
         BCM2835V3DQPUResult result;
+        bool wgpu_rendered = false;
+#ifdef CONFIG_V3D_WGPU
+        uint32_t wgpu_uniforms[4];
+        uint32_t wgpu_colors[BCM2835_V3D_QPU_LANES];
+        uint32_t wgpu_input_colors[BCM2835_V3D_QPU_LANES];
+        bool wgpu_uniforms_readable = false;
+#endif
 
         bcm2835_v3d_qpu_init(&qpu);
         qpu.uniform_address = uniforms_address;
         qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
         qpu.uniform_opaque = s;
+        qpu.read_memory = bcm2835_v3d_qpu_read_uniform;
+        qpu.memory_opaque = s;
+        qpu.write_memory = bcm2835_v3d_qpu_write_memory;
+        qpu.read_texture = bcm2835_v3d_qpu_read_texture;
+        qpu.texture_opaque = s;
+#ifdef CONFIG_V3D_WGPU
+        if (s->wgpu_context) {
+            qpu.filter_texture = bcm2835_v3d_qpu_filter_texture;
+            qpu.filter_texture_opaque = s->wgpu_context;
+            qpu.filter_texture_verify = s->wgpu_verify;
+        }
+#endif
         qpu.fragment_shader = true;
         if (s->shader_record[3]) {
             varying.count = s->shader_record[3];
@@ -1054,24 +1102,76 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
             qpu.fragment_coord[1][lane] =
                 (s->tile_y * V3D_TILE_SIZE + pixel / V3D_TILE_SIZE) & 0x7ff;
             qpu.io[45][lane] = s->tile_color[pixel];
+#ifdef CONFIG_V3D_WGPU
+            wgpu_input_colors[lane] = s->tile_color[pixel];
+#endif
             qpu.fragment_w[lane] = fragment_w[first + lane];
             for (unsigned index = 0; index < varying.count; index++) {
                 varying.partial[index][lane] =
                     varying_partial[(first + lane) * varying.count + index];
             }
         }
-        result = bcm2835_v3d_qpu_run(code, code_size,
-                                      V3D_QPU_INSTRUCTION_BUDGET, &qpu,
-                                      &executed);
-        if (result != BCM2835_V3D_QPU_END ||
-            qpu.varying_index != varying.count ||
-            (qpu.tlb_color_write_mask & expected_mask) !=
-            expected_mask) {
-            g_free(code);
-            return false;
+#ifdef CONFIG_V3D_WGPU
+        if (s->wgpu_context &&
+            bcm2835_v3d_wgpu_supports(code, code_size)) {
+            wgpu_uniforms_readable = true;
+            for (unsigned i = 0; i < G_N_ELEMENTS(wgpu_uniforms); i++) {
+                uint64_t address = (uint64_t)uniforms_address + i * 4;
+
+                if (address > UINT32_MAX ||
+                    !bcm2835_v3d_qpu_read_uniform(s, address,
+                                                  &wgpu_uniforms[i])) {
+                    wgpu_uniforms_readable = false;
+                    break;
+                }
+            }
+            if (wgpu_uniforms_readable && !s->wgpu_verify) {
+                wgpu_rendered = bcm2835_v3d_wgpu_run(
+                    s->wgpu_context, code, code_size, wgpu_uniforms, batch,
+                    wgpu_input_colors, NULL, wgpu_colors);
+            }
+        }
+#endif
+        if (!wgpu_rendered) {
+            result = bcm2835_v3d_qpu_run(code, code_size,
+                                          V3D_QPU_INSTRUCTION_BUDGET, &qpu,
+                                          &executed);
+            if (result != BCM2835_V3D_QPU_END ||
+                qpu.varying_index != varying.count ||
+                (qpu.tlb_color_write_mask & expected_mask) !=
+                expected_mask) {
+                uint64_t instruction = 0;
+
+                if ((uint64_t)qpu.pc * sizeof(uint64_t) + sizeof(uint64_t) <=
+                    code_size) {
+                    instruction = ldq_le_p(code + qpu.pc * sizeof(uint64_t));
+                }
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm2835_v3d: fragment QPU 0x%08x result=%u pc=%u instruction=0x%016" PRIx64 " varying=%u/%u color-mask=0x%04x expected=0x%04x\n",
+                              code_address, result, qpu.pc, instruction,
+                              qpu.varying_index, varying.count,
+                              qpu.tlb_color_write_mask, expected_mask);
+                g_free(code);
+                return false;
+            }
+#ifdef CONFIG_V3D_WGPU
+            if (s->wgpu_context && s->wgpu_verify &&
+                wgpu_uniforms_readable &&
+                bcm2835_v3d_wgpu_run(s->wgpu_context, code, code_size,
+                                     wgpu_uniforms, batch,
+                                     wgpu_input_colors, qpu.io[46],
+                                     wgpu_colors)) {
+                memcpy(qpu.io[46], wgpu_colors,
+                       batch * sizeof(wgpu_colors[0]));
+            }
+#endif
         }
         for (unsigned lane = 0; lane < batch; lane++) {
-            s->tile_color[pixels[first + lane]] = qpu.io[46][lane];
+            s->tile_color[pixels[first + lane]] =
+#ifdef CONFIG_V3D_WGPU
+                wgpu_rendered ? wgpu_colors[lane] :
+#endif
+                qpu.io[46][lane];
         }
     }
     g_free(code);
@@ -2705,7 +2805,27 @@ static void bcm2835_v3d_realize(DeviceState *dev, Error **errp)
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_V3D "-memory");
+#ifdef CONFIG_V3D_WGPU
+    const char *library = g_getenv("QEMU_V3D_WGPU_LIBRARY");
+    const char *verify = g_getenv("QEMU_V3D_WGPU_VERIFY");
+
+    if (library && *library) {
+        s->wgpu_context = bcm2835_v3d_wgpu_new(library);
+        s->wgpu_verify = verify && *verify;
+    }
+#endif
     bcm2835_v3d_reset(dev);
+}
+
+static void bcm2835_v3d_unrealize(DeviceState *dev)
+{
+    BCM2835V3DState *s = BCM2835_V3D(dev);
+
+#ifdef CONFIG_V3D_WGPU
+    bcm2835_v3d_wgpu_free(s->wgpu_context);
+    s->wgpu_context = NULL;
+#endif
+    address_space_destroy(&s->dma_as);
 }
 
 static int bcm2835_v3d_post_load(void *opaque, int version_id)
@@ -2860,6 +2980,7 @@ static void bcm2835_v3d_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = bcm2835_v3d_realize;
+    dc->unrealize = bcm2835_v3d_unrealize;
     device_class_set_legacy_reset(dc, bcm2835_v3d_reset);
     dc->vmsd = &vmstate_bcm2835_v3d;
 }
