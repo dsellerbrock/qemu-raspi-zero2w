@@ -491,7 +491,8 @@ static void dwc2_wakeup(USBPort *port)
 
     if (s->hprt0 & HPRT0_SUSP) {
         s->hprt0 |= HPRT0_RES;
-        dwc2_raise_global_irq(s, GINTSTS_PRTINT);
+        /* Remote wakeup detected: the core reports WkUpInt to the host. */
+        dwc2_raise_global_irq(s, GINTSTS_PRTINT | GINTSTS_WKUPINT);
     }
 
     qemu_bh_schedule(s->async_bh);
@@ -905,8 +906,16 @@ static void dwc2_hreg0_write(void *ptr, hwaddr addr, int index, uint64_t val,
         /* don't allow clearing of read-only bits */
         val |= old & (HPRT0_SPD_MASK | HPRT0_LNSTS_MASK | HPRT0_OVRCURRACT |
                       HPRT0_CONNSTS);
-        /* don't allow clearing of self-clearing bits */
-        val |= old & (HPRT0_SUSP | HPRT0_RES);
+        /*
+         * PRTSUSP can be set by software but only the core clears it.
+         * PRTRES is software read/write: software drives resume signalling
+         * and then clears PRTRES. The core clears PRTSUSP when resume
+         * signalling ends or a port reset is driven.
+         */
+        val |= old & HPRT0_SUSP;
+        if (((old & HPRT0_RES) && !(val & HPRT0_RES)) || (val & HPRT0_RST)) {
+            val &= ~HPRT0_SUSP;
+        }
         /* don't allow setting of self-setting bits */
         if (!(old & HPRT0_ENA) && (val & HPRT0_ENA)) {
             val &= ~HPRT0_ENA;
