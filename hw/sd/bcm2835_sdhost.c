@@ -101,10 +101,22 @@ DECLARE_INSTANCE_CHECKER(SDBus, BCM2835_SDHOST_BUS,
 
 #define SDDATA_FIFO_WORDS        16
 
+static bool sdhost_fifo_err_logged;
+static uint64_t sdhost_fifo_overflows, sdhost_fifo_underflows;
+
 static void bcm2835_sdhost_update_irq(BCM2835SDHostState *s)
 {
-    uint32_t irq = s->status &
-        (SDHSTS_BUSY_IRPT | SDHSTS_BLOCK_IRPT | SDHSTS_SDIO_IRPT);
+    uint32_t irq = 0;
+
+    if (s->config & SDHCFG_BUSY_IRPT_EN) {
+        irq |= s->status & SDHSTS_BUSY_IRPT;
+    }
+    if (s->config & SDHCFG_BLOCK_IRPT_EN) {
+        irq |= s->status & SDHSTS_BLOCK_IRPT;
+    }
+    if (s->config & (SDHCFG_SDIO_IRPT_EN | SDHCFG_DATA_IRPT_EN)) {
+        irq |= s->status & SDHSTS_SDIO_IRPT;
+    }
     trace_bcm2835_sdhost_update_irq(irq);
     qemu_set_irq(s->irq, !!irq);
 }
@@ -155,6 +167,17 @@ static void bcm2835_sdhost_fifo_push(BCM2835SDHostState *s, uint32_t value)
 
     if (s->fifo_len == BCM2835_SDHOST_FIFO_LEN) {
         /* FIFO overflow */
+        sdhost_fifo_overflows++;
+        if (!sdhost_fifo_err_logged) {
+            sdhost_fifo_err_logged = true;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_sdhost: FIFO OVERFLOW word dropped "
+                          "cmd=0x%04x(CMD%u) datacnt=%u hbct=%u hblc=%u "
+                          "cfg=0x%x status=0x%x card_ready=%d total=%" PRIu64 "\n",
+                          s->cmd, s->cmd & SDCMD_CMD_MASK, s->datacnt,
+                          s->hbct, s->hblc, s->config, s->status,
+                          sdbus_data_ready(&s->sdbus), sdhost_fifo_overflows);
+        }
         return;
     }
     n = (s->fifo_pos + s->fifo_len) & (BCM2835_SDHOST_FIFO_LEN - 1);
@@ -168,6 +191,17 @@ static uint32_t bcm2835_sdhost_fifo_pop(BCM2835SDHostState *s)
 
     if (s->fifo_len == 0) {
         /* FIFO underflow */
+        sdhost_fifo_underflows++;
+        if (!sdhost_fifo_err_logged) {
+            sdhost_fifo_err_logged = true;
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_sdhost: FIFO UNDERFLOW read returns 0 "
+                          "cmd=0x%04x(CMD%u) datacnt=%u hbct=%u hblc=%u "
+                          "cfg=0x%x status=0x%x card_ready=%d total=%" PRIu64 "\n",
+                          s->cmd, s->cmd & SDCMD_CMD_MASK, s->datacnt,
+                          s->hbct, s->hblc, s->config, s->status,
+                          sdbus_data_ready(&s->sdbus), sdhost_fifo_underflows);
+        }
         return 0;
     }
     value = s->fifo[s->fifo_pos];
@@ -179,6 +213,7 @@ static uint32_t bcm2835_sdhost_fifo_pop(BCM2835SDHostState *s)
 static void bcm2835_sdhost_fifo_run(BCM2835SDHostState *s)
 {
     uint32_t value = 0;
+    uint32_t datacnt_before = s->datacnt;
     int n;
     int is_read;
     int is_write;
@@ -187,23 +222,21 @@ static void bcm2835_sdhost_fifo_run(BCM2835SDHostState *s)
     is_write = (s->cmd & SDCMD_WRITE_CMD) != 0;
     if (s->datacnt != 0 && (is_write || sdbus_data_ready(&s->sdbus))) {
         if (is_read) {
-            n = 0;
-            while (s->datacnt && s->fifo_len < BCM2835_SDHOST_FIFO_LEN) {
-                value |= (uint32_t)sdbus_read_byte(&s->sdbus) << (n * 8);
-                s->datacnt--;
-                n++;
-                if (n == 4) {
+            uint8_t data[BCM2835_SDHOST_FIFO_LEN * sizeof(uint32_t)];
+            unsigned bytes = MIN(s->datacnt,
+                                 (BCM2835_SDHOST_FIFO_LEN - s->fifo_len) *
+                                 sizeof(uint32_t));
+
+            sdbus_read_data(&s->sdbus, data, bytes);
+            for (unsigned i = 0; i < bytes; i++) {
+                value |= (uint32_t)data[i] << ((i & 3) * 8);
+                if ((i & 3) == 3 || i + 1 == bytes) {
                     bcm2835_sdhost_fifo_push(s, value);
-                    s->status |= SDHSTS_DATA_FLAG;
-                    if (s->config & SDHCFG_DATA_IRPT_EN) {
-                        s->status |= SDHSTS_SDIO_IRPT;
-                    }
-                    n = 0;
                     value = 0;
                 }
             }
-            if (n != 0) {
-                bcm2835_sdhost_fifo_push(s, value);
+            s->datacnt -= bytes;
+            if (bytes) {
                 s->status |= SDHSTS_DATA_FLAG;
                 if (s->config & SDHCFG_DATA_IRPT_EN) {
                     s->status |= SDHSTS_SDIO_IRPT;
@@ -231,7 +264,7 @@ static void bcm2835_sdhost_fifo_run(BCM2835SDHostState *s)
             s->edm |= SDEDM_FSM_DATAMODE;
             trace_bcm2835_sdhost_edm_change("datacnt 0", s->edm);
         }
-        if (is_write) {
+        if (is_write && s->datacnt != datacnt_before) {
             /* set block interrupt at end of each block transfer */
             if (s->hbct && s->datacnt % s->hbct == 0 &&
                 (s->config & SDHCFG_BLOCK_IRPT_EN)) {
@@ -317,6 +350,7 @@ static void bcm2835_sdhost_write(void *opaque, hwaddr offset,
     case SDCMD:
         s->cmd = value;
         if (value & SDCMD_NEW_FLAG) {
+            sdhost_fifo_err_logged = false;
             bcm2835_sdhost_send_command(s);
             bcm2835_sdhost_fifo_run(s);
             s->cmd &= ~SDCMD_NEW_FLAG;
