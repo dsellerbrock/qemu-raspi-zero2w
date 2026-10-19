@@ -2811,6 +2811,7 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
     const uint8_t dummy_byte = 0x00;
     unsigned int partition_access;
     uint32_t io_len;
+    uint8_t *value = buf;
 
     if (!sd->blk || !blk_is_inserted(sd->blk)) {
         memset(buf, dummy_byte, length);
@@ -2850,14 +2851,16 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
         break;
 
     case 18:  /* CMD18:  READ_MULTIPLE_BLOCK */
-        if (!io_len) {
-            *(uint8_t *)buf = dummy_byte;
-            return 1;
-        }
+        /*
+         * We will only read one byte at a time. We will be called again with
+         * the remaining buffer.
+         */
+        length = 1;
+
         if (sd->data_offset == 0) {
             if (!address_in_range(sd, "READ_MULTIPLE_BLOCK",
                                   sd->data_start, io_len)) {
-                memset(buf, dummy_byte, length);
+                *value = dummy_byte;
                 return length;
             }
             partition_access = sd->ext_csd[EXT_CSD_PART_CONFIG]
@@ -2868,9 +2871,7 @@ static size_t sd_read_data(SDState *sd, void *buf, size_t length)
                 sd_blk_read(sd, sd->data_start, io_len);
             }
         }
-        length = MIN(length, io_len - sd->data_offset);
-        memcpy(buf, sd->data + sd->data_offset, length);
-        sd->data_offset += length;
+        *value = sd->data[sd->data_offset++];
 
         if (sd->data_offset >= io_len) {
             sd->data_start += io_len;

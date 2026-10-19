@@ -222,21 +222,23 @@ static void bcm2835_sdhost_fifo_run(BCM2835SDHostState *s)
     is_write = (s->cmd & SDCMD_WRITE_CMD) != 0;
     if (s->datacnt != 0 && (is_write || sdbus_data_ready(&s->sdbus))) {
         if (is_read) {
-            uint8_t data[BCM2835_SDHOST_FIFO_LEN * sizeof(uint32_t)];
-            unsigned bytes = MIN(s->datacnt,
-                                 (BCM2835_SDHOST_FIFO_LEN - s->fifo_len) *
-                                 sizeof(uint32_t));
-
-            sdbus_read_data(&s->sdbus, data, bytes);
-            for (unsigned i = 0; i < bytes; i++) {
-                value |= (uint32_t)data[i] << ((i & 3) * 8);
-                if ((i & 3) == 3 || i + 1 == bytes) {
+            n = 0;
+            while (s->datacnt && s->fifo_len < BCM2835_SDHOST_FIFO_LEN) {
+                value |= (uint32_t)sdbus_read_byte(&s->sdbus) << (n * 8);
+                s->datacnt--;
+                n++;
+                if (n == 4) {
                     bcm2835_sdhost_fifo_push(s, value);
+                    s->status |= SDHSTS_DATA_FLAG;
+                    if (s->config & SDHCFG_DATA_IRPT_EN) {
+                        s->status |= SDHSTS_SDIO_IRPT;
+                    }
+                    n = 0;
                     value = 0;
                 }
             }
-            s->datacnt -= bytes;
-            if (bytes) {
+            if (n != 0) {
+                bcm2835_sdhost_fifo_push(s, value);
                 s->status |= SDHSTS_DATA_FLAG;
                 if (s->config & SDHCFG_DATA_IRPT_EN) {
                     s->status |= SDHSTS_SDIO_IRPT;
