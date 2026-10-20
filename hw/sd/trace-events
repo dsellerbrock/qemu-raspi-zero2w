@@ -12,6 +12,7 @@ bcm2835_sdhost_read(uint64_t offset, uint64_t data, unsigned size) "offset 0x%" 
 bcm2835_sdhost_write(uint64_t offset, uint64_t data, unsigned size) "offset 0x%" PRIx64 " data 0x%" PRIx64 " size %u"
 bcm2835_sdhost_edm_change(const char *why, uint32_t edm) "(%s) EDM now 0x%x"
 bcm2835_sdhost_update_irq(uint32_t irq) "IRQ bits 0x%x"
+bcm2835_sdhost_state(const char *where, uint32_t cmd, uint32_t datacnt, uint32_t fifo_len, uint32_t config, uint32_t status, uint32_t edm) "%s cmd=0x%08x datacnt=%u fifo=%u config=0x%x status=0x%x edm=0x%x"
 
 # core.c
 sdbus_command(const char *bus_name, uint8_t cmd, uint32_t arg) "@%s CMD%02d arg 0x%08x"

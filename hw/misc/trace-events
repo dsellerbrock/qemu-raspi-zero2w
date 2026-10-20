@@ -442,3 +442,14 @@ iommu_testdev_dma_read(uint64_t gva, uint32_t len) "gva=0x%" PRIx64 " len=%u"
 iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actual=0x%x"
 iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
 iommu_testdev_dma_armed(bool armed) "armed=%d"
+
+# bcm2835_v3d.c
+bcm2835_v3d_thread_start(unsigned thread, uint32_t ca, uint32_t ea) "thread=%u CA=0x%08x EA=0x%08x"
+bcm2835_v3d_thread_end(unsigned thread, uint32_t ca, uint32_t cs, int64_t elapsed_us) "thread=%u CA=0x%08x CS=0x%08x elapsed_us=%" PRId64
+bcm2835_v3d_thread_slice(unsigned thread, int64_t elapsed_us) "thread=%u elapsed_us=%" PRId64
+bcm2835_v3d_rasterize_triangle(unsigned candidates, unsigned covered, int64_t elapsed_us) "candidates=%u covered=%u elapsed_us=%" PRId64
+bcm2835_v3d_qpu_sample_batch(unsigned fragments, int64_t elapsed_us) "fragments=%u elapsed_us=%" PRId64
+bcm2835_v3d_wgpu_scatter(unsigned fragments, unsigned tile_groups, int64_t elapsed_us) "fragments=%u tile_groups=%u elapsed_us=%" PRId64
+bcm2835_v3d_wgpu_dispatch(const char *shader, unsigned batch, int64_t elapsed_us) "shader=%s batch=%u elapsed_us=%" PRId64
+bcm2835_v3d_wgpu_poll(unsigned batch, int64_t elapsed_us) "batch=%u elapsed_us=%" PRId64
+bcm2835_v3d_qpu_texture_cache(uint32_t hits, uint32_t misses) "hits=%u misses=%u"

@@ -1,5 +1,9 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# bcm2835_dma.c
+bcm2835_dma_irq(uint32_t chan, uint32_t level, uint32_t cs, uint32_t int_status) "chan %u irq %u cs 0x%08x int_status 0x%08x"
+bcm2835_dma_state(uint32_t chan, const char *where, uint32_t cs, uint32_t conblk_ad, uint32_t ti, uint32_t remaining, bool dreq) "chan %u %s cs 0x%08x cb 0x%08x ti 0x%08x remaining %u dreq %u"
+
 # rc4030.c
 jazzio_read(uint64_t addr, uint32_t ret) "read reg[0x%"PRIx64"] = 0x%x"
 jazzio_write(uint64_t addr, uint32_t val) "write reg[0x%"PRIx64"] = 0x%x"

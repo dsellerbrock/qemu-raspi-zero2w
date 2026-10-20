@@ -13,7 +13,9 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "system/dma.h"
+#include "trace.h"
 #ifdef CONFIG_V3D_WGPU
 #include "bcm2835_v3d_wgpu.h"
 #endif
@@ -198,11 +200,22 @@ static void bcm2835_v3d_update_semaphore(BCM2835V3DState *s, unsigned thread)
                         V3D_CS_SEMA_MASK;
 }
 
+static bool bcm2835_v3d_wgpu_batch_flush_pending(BCM2835V3DState *s);
+static void bcm2835_v3d_wgpu_batch_free(BCM2835V3DState *s);
+
 static bool bcm2835_v3d_dma_read(BCM2835V3DState *s, uint32_t addr,
                                  void *buf, size_t len)
 {
-    return dma_memory_read(&s->dma_as, addr, buf, len,
-                           MEMTXATTRS_UNSPECIFIED) == MEMTX_OK;
+    MemTxResult result = dma_memory_read(&s->dma_as, addr, buf, len,
+                                          MEMTXATTRS_UNSPECIFIED);
+
+    if (result != MEMTX_OK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: DMA read at 0x%08x len %zu failed: 0x%x\n",
+                      addr, len, result);
+        return false;
+    }
+    return true;
 }
 
 static uint16_t bcm2835_v3d_pack_bgr565(uint32_t rgba)
@@ -358,7 +371,8 @@ static bool bcm2835_v3d_copy_tile(BCM2835V3DState *s, uint32_t base,
     uint32_t height = MIN(V3D_TILE_SIZE, s->render_height -
                           MIN(y0, s->render_height));
 
-    if (memory_format > 2 || (color_format != 0 && color_format != 2)) {
+    if (memory_format > 2 || color_format > 2 ||
+        (to_guest && color_format == 1)) {
         return false;
     }
     if (!width || !height) {
@@ -459,8 +473,8 @@ static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
                                             const uint8_t *packet,
                                             bool store)
 {
-    uint64_t params = ldl_le_p(packet + 1) |
-                      ((uint64_t)lduw_le_p(packet + 5) << 32);
+    uint64_t params = (uint32_t)ldl_le_p(packet + 1) |
+                      ((uint64_t)(uint16_t)lduw_le_p(packet + 5) << 32);
     uint32_t base = ((params >> 20) & 0x0fffffff) << 4;
     unsigned buffer = params & 7;
     unsigned memory_format = (params >> 4) & 3;
@@ -472,7 +486,7 @@ static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
     }
     /* shortcut: color only/single sample; add depth, MSAA, and dither later. */
     if (buffer != 1 || mode != 0 || memory_format > 2 ||
-        (color_format != 0 && color_format != 2) ||
+        color_format > 2 || (store && color_format == 1) ||
         !s->render_config_valid || !s->render_width || !s->render_height) {
         return false;
     }
@@ -510,6 +524,14 @@ static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
 static void bcm2835_v3d_thread_error(BCM2835V3DState *s, unsigned thread,
                                      uint32_t addr, const char *reason)
 {
+#ifdef CONFIG_V3D_WGPU
+    if (thread == 1 && s->wgpu_batch) {
+        /* Finish queued pixels before reporting an unrelated list error. */
+        if (!bcm2835_v3d_wgpu_batch_flush_pending(s)) {
+            bcm2835_v3d_wgpu_batch_free(s);
+        }
+    }
+#endif
     qemu_log_mask(LOG_GUEST_ERROR,
                   "bcm2835_v3d: CT%u stopped at 0x%08x: %s\n",
                   thread, addr, reason);
@@ -561,6 +583,7 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
 }
 
 static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread);
+static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread);
 
 static bool bcm2835_v3d_validate_vertex_arrays(BCM2835V3DState *s,
                                                uint32_t max_index)
@@ -722,18 +745,6 @@ static bool bcm2835_v3d_qpu_read_texture(void *opaque, uint32_t base,
     return true;
 }
 
-#ifdef CONFIG_V3D_WGPU
-static bool bcm2835_v3d_qpu_filter_texture(
-    void *opaque,
-    const BCM2835V3DQPUTMUSample samples[BCM2835_V3D_QPU_LANES],
-    uint16_t lanes, const uint32_t software_result[BCM2835_V3D_QPU_LANES],
-    uint32_t result[BCM2835_V3D_QPU_LANES])
-{
-    return bcm2835_v3d_wgpu_filter_texture(opaque, samples, lanes,
-                                           software_result, result);
-}
-#endif
-
 static bool bcm2835_v3d_qpu_read_varying(
     void *opaque, unsigned index,
     uint32_t partial[BCM2835_V3D_QPU_LANES],
@@ -876,6 +887,7 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
         qpu.uniform_opaque = s;
         qpu.read_memory = bcm2835_v3d_qpu_read_uniform;
         qpu.memory_opaque = s;
+        qpu.write_memory = bcm2835_v3d_qpu_write_memory;
         qpu.read_texture = bcm2835_v3d_qpu_read_texture;
         qpu.texture_opaque = s;
         if (input_vpm) {
@@ -953,7 +965,7 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                 g_free(code);
                 return false;
             }
-            for (unsigned word = 0; word < 5; word++) {
+            for (unsigned word = 0; word < 4; word++) {
                 uint8_t coordinate_row = qpu.vpm_write_history[word];
 
                 for (unsigned lane = 0; lane <
@@ -964,16 +976,14 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                     }
                 }
             }
-            {
-                uint8_t reciprocal_w_row = qpu.vpm_write_history[6];
-
-                for (unsigned lane = 0; lane <
-                     BCM2835_V3D_QPU_LANES; lane++) {
-                    if (first + lane < count) {
-                        vertices[first + lane].word[
-                            5 + s->shader_record[3]] =
-                            qpu.vpm[reciprocal_w_row][lane];
-                    }
+            /* Mesa emits packed viewport XY at row 4 and reciprocal W at 6. */
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                if (first + lane < count) {
+                    vertices[first + lane].word[4] =
+                        qpu.vpm[qpu.vpm_write_history[4]][lane];
+                    vertices[first + lane].word[
+                        5 + s->shader_record[3]] =
+                        qpu.vpm[qpu.vpm_write_history[6]][lane];
                 }
             }
             if (input_vpm) {
@@ -1038,21 +1048,798 @@ static int64_t bcm2835_v3d_edge(int32_t ax, int32_t ay,
            (int64_t)(py - ay) * (bx - ax);
 }
 
+static int64_t bcm2835_v3d_ceil_div(int64_t numerator, int64_t denominator)
+{
+    return numerator / denominator + (numerator % denominator > 0);
+}
+
+static int64_t bcm2835_v3d_floor_div(int64_t numerator, int64_t denominator)
+{
+    return numerator / denominator - (numerator % denominator < 0);
+}
+
+static void bcm2835_v3d_init_fragment_qpu(
+    BCM2835V3DState *s, BCM2835V3DQPUState *qpu,
+    BCM2835V3DFragmentVarying *varying, const uint16_t *pixels,
+    const uint32_t *varying_partial, const uint32_t *fragment_w,
+    uint32_t uniform_address, unsigned varying_count,
+    unsigned first, unsigned batch)
+{
+    bcm2835_v3d_qpu_init(qpu);
+    qpu->uniform_address = uniform_address;
+    qpu->read_uniform = bcm2835_v3d_qpu_read_uniform;
+    qpu->uniform_opaque = s;
+    qpu->read_memory = bcm2835_v3d_qpu_read_uniform;
+    qpu->memory_opaque = s;
+    qpu->write_memory = bcm2835_v3d_qpu_write_memory;
+    qpu->read_texture = bcm2835_v3d_qpu_read_texture;
+    qpu->texture_opaque = s;
+    qpu->fragment_shader = true;
+    if (varying_count) {
+        varying->count = varying_count;
+        qpu->read_varying = bcm2835_v3d_qpu_read_varying;
+        qpu->varying_opaque = varying;
+    }
+    for (unsigned lane = 0; lane < batch; lane++) {
+        unsigned pixel = pixels[first + lane];
+
+        qpu->fragment_coord[0][lane] =
+            (s->tile_x * V3D_TILE_SIZE + pixel % V3D_TILE_SIZE) & 0x7ff;
+        qpu->fragment_coord[1][lane] =
+            (s->tile_y * V3D_TILE_SIZE + pixel / V3D_TILE_SIZE) & 0x7ff;
+        qpu->io[45][lane] = s->tile_color[pixel];
+        qpu->fragment_w[lane] = fragment_w[first + lane];
+        for (unsigned index = 0; index < varying->count; index++) {
+            varying->partial[index][lane] =
+                varying_partial[(first + lane) * varying->count + index];
+        }
+    }
+}
+
+#define BCM2835_V3D_WGPU_TILES_PER_SLICE 4
+
+#ifdef CONFIG_V3D_WGPU
+#define BCM2835_V3D_QPU_READ_CACHE_ENTRIES 4096
+G_STATIC_ASSERT((BCM2835_V3D_QPU_READ_CACHE_ENTRIES &
+                 (BCM2835_V3D_QPU_READ_CACHE_ENTRIES - 1)) == 0);
+
+typedef struct BCM2835V3DQPUReadCacheEntry {
+    uint32_t address;
+    uint32_t value;
+    bool valid;
+} BCM2835V3DQPUReadCacheEntry;
+
+typedef struct BCM2835V3DQPUReadCache {
+    BCM2835V3DState *s;
+    BCM2835V3DQPUReadCacheEntry entries[
+        BCM2835_V3D_QPU_READ_CACHE_ENTRIES];
+    uint32_t texture_hits;
+    uint32_t texture_misses;
+} BCM2835V3DQPUReadCache;
+
+static bool bcm2835_v3d_qpu_read_cached(BCM2835V3DQPUReadCache *cache,
+                                         uint32_t address, uint32_t *value)
+{
+    unsigned index = ((address >> 2) ^ (address >> 12)) &
+                     (BCM2835_V3D_QPU_READ_CACHE_ENTRIES - 1);
+    BCM2835V3DQPUReadCacheEntry *entry = &cache->entries[index];
+
+    if (entry->valid && entry->address == address) {
+        *value = entry->value;
+        cache->texture_hits++;
+        return true;
+    }
+
+    if ((uint64_t)address + sizeof(uint32_t) > UINT32_MAX + 1ULL) {
+        return false;
+    }
+    cache->texture_misses++;
+    uint8_t bytes[sizeof(uint32_t)];
+
+    if (!bcm2835_v3d_dma_read(cache->s, address, bytes, sizeof(bytes))) {
+        return false;
+    }
+    *value = ldl_le_p(bytes);
+    entry->address = address;
+    entry->value = *value;
+    entry->valid = true;
+    return true;
+}
+
+static bool bcm2835_v3d_qpu_read_memory_cached(void *opaque,
+                                                uint32_t address,
+                                                uint32_t *value)
+{
+    return bcm2835_v3d_qpu_read_cached(opaque, address, value);
+}
+
+static bool bcm2835_v3d_qpu_read_texture_cached(
+    void *opaque, uint32_t base, unsigned memory_format,
+    unsigned width, unsigned height, unsigned x, unsigned y,
+    uint32_t *value)
+{
+    BCM2835V3DQPUReadCache *cache = opaque;
+    uint64_t address;
+
+    if (memory_format > 2 || x >= width || y >= height) {
+        return false;
+    }
+    address = bcm2835_v3d_memory_pixel_addr(base, memory_format,
+                                            sizeof(uint32_t), width, x, y);
+    if (address + sizeof(uint32_t) > UINT32_MAX + 1ULL) {
+        return false;
+    }
+    return bcm2835_v3d_qpu_read_cached(cache, address, value);
+}
+#endif
+
+typedef struct BCM2835V3DWGPUTileBatch {
+    uint8_t x;
+    uint8_t y;
+    bool stored;
+    uint32_t pending_pixels;
+    uint8_t store_packet[7];
+    uint64_t blend_pixels[BCM2835_V3D_WGPU_MAX_TILE_PIXELS / 64];
+    uint32_t colors[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+} BCM2835V3DWGPUTileBatch;
+
+typedef struct BCM2835V3DWGPUFragmentBatch {
+    uint8_t *code;
+    uint32_t code_size;
+    uint32_t uniform_address;
+    uint32_t uniforms[6];
+    unsigned varying_count;
+    unsigned deferred_stores;
+    GArray *pixels;
+    GArray *tile_ids;
+    GArray *tiles;
+    GArray *input_colors;
+    GArray *tmu0_colors;
+    GArray *varying_partial;
+    GArray *fragment_w;
+} BCM2835V3DWGPUFragmentBatch;
+
+#ifdef CONFIG_V3D_WGPU
+typedef enum BCM2835V3DWGPUQueueResult {
+    BCM2835_V3D_WGPU_NOT_QUEUED,
+    BCM2835_V3D_WGPU_QUEUED,
+    BCM2835_V3D_WGPU_QUEUE_ERROR,
+} BCM2835V3DWGPUQueueResult;
+
+static int bcm2835_v3d_wgpu_batch_find_tile(
+    BCM2835V3DWGPUFragmentBatch *batch, uint8_t x, uint8_t y)
+{
+    for (unsigned i = 0; batch->tiles && i < batch->tiles->len; i++) {
+        BCM2835V3DWGPUTileBatch *tile =
+            &g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch, i);
+
+        if (tile->x == x && tile->y == y) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool bcm2835_v3d_wgpu_batch_defer_across_tile(
+    BCM2835V3DState *s, uint8_t next_x, uint8_t next_y)
+{
+    BCM2835V3DWGPUFragmentBatch *batch = s->wgpu_batch;
+    int index;
+
+    if (s->pending_tile_load || !batch ||
+        (index = bcm2835_v3d_wgpu_batch_find_tile(
+                     batch, s->tile_x, s->tile_y)) < 0 ||
+        (next_x == s->tile_x && next_y == s->tile_y)) {
+        return false;
+    }
+    return g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch,
+                         index).stored;
+}
+
+static bool bcm2835_v3d_wgpu_batch_defer_store(
+    BCM2835V3DState *s, const uint8_t packet[7])
+{
+    BCM2835V3DWGPUFragmentBatch *batch = s->wgpu_batch;
+    int index;
+    BCM2835V3DWGPUTileBatch *tile;
+    uint64_t params;
+
+    if (!batch || !batch->pixels || !batch->pixels->len ||
+        (index = bcm2835_v3d_wgpu_batch_find_tile(
+                     batch, s->tile_x, s->tile_y)) < 0) {
+        return false;
+    }
+    params = (uint32_t)ldl_le_p(packet + 1) |
+             ((uint64_t)(uint16_t)lduw_le_p(packet + 5) << 32);
+    if ((params & 7) != 1 || (params & (1ULL << 16)) ||
+        ((params >> 6) & 3) != 0 || ((params >> 4) & 3) > 2 ||
+        ((params >> 8) & 3) > 2 || ((params >> 8) & 3) == 1 ||
+        (params & (1ULL << 19)) || !s->render_config_valid ||
+        !s->render_width || !s->render_height) {
+        return false;
+    }
+    tile = &g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch, index);
+    if (!tile->pending_pixels || tile->stored) {
+        return false;
+    }
+    memcpy(tile->store_packet, packet, sizeof(tile->store_packet));
+    tile->stored = true;
+    batch->deferred_stores++;
+    return true;
+}
+
+static int bcm2835_v3d_wgpu_batch_add_tile(
+    BCM2835V3DState *s, BCM2835V3DWGPUFragmentBatch *batch)
+{
+    BCM2835V3DWGPUTileBatch tile = {
+        .x = s->tile_x,
+        .y = s->tile_y,
+    };
+
+    if (!batch->tiles) {
+        batch->tiles = g_array_sized_new(
+            FALSE, FALSE, sizeof(tile),
+            MIN(BCM2835_V3D_WGPU_MAX_BATCH_TILES, 64));
+    }
+    if (batch->tiles->len >= BCM2835_V3D_WGPU_MAX_BATCH_TILES) {
+        return -1;
+    }
+    memcpy(tile.colors, s->tile_color, sizeof(tile.colors));
+    g_array_append_val(batch->tiles, tile);
+    return batch->tiles->len - 1;
+}
+
+static bool bcm2835_v3d_wgpu_batch_commit_stores(
+    BCM2835V3DState *s, BCM2835V3DWGPUFragmentBatch *batch)
+{
+    uint8_t active_x = s->tile_x;
+    uint8_t active_y = s->tile_y;
+    uint32_t active_colors[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+    bool active_valid = s->tile_color_valid;
+    int active_index = bcm2835_v3d_wgpu_batch_find_tile(
+        batch, active_x, active_y);
+
+    if (active_index >= 0) {
+        BCM2835V3DWGPUTileBatch *tile =
+            &g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch,
+                           active_index);
+
+        memcpy(active_colors, tile->colors, sizeof(active_colors));
+        active_valid = true;
+    } else {
+        memcpy(active_colors, s->tile_color, sizeof(active_colors));
+    }
+
+    for (unsigned i = 0; batch->tiles && i < batch->tiles->len; i++) {
+        BCM2835V3DWGPUTileBatch *tile =
+            &g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch, i);
+
+        if (!tile->stored) {
+            continue;
+        }
+        s->tile_x = tile->x;
+        s->tile_y = tile->y;
+        s->tile_color_valid = true;
+        memcpy(s->tile_color, tile->colors, sizeof(s->tile_color));
+        if (!bcm2835_v3d_tile_buffer_packet(s, tile->store_packet, true)) {
+            s->tile_x = active_x;
+            s->tile_y = active_y;
+            memcpy(s->tile_color, active_colors, sizeof(s->tile_color));
+            s->tile_color_valid = active_valid;
+            return false;
+        }
+        if ((int)i == active_index) {
+            active_valid = s->tile_color_valid;
+        }
+    }
+
+    s->tile_x = active_x;
+    s->tile_y = active_y;
+    memcpy(s->tile_color, active_colors, sizeof(s->tile_color));
+    s->tile_color_valid = active_valid;
+    g_clear_pointer(&batch->tiles, g_array_unref);
+    if (batch->pixels) {
+        g_array_set_size(batch->pixels, 0);
+        g_array_set_size(batch->tile_ids, 0);
+        if (batch->input_colors) {
+            g_array_set_size(batch->input_colors, 0);
+        }
+        g_array_set_size(batch->tmu0_colors, 0);
+        g_array_set_size(batch->varying_partial, 0);
+        g_array_set_size(batch->fragment_w, 0);
+    }
+    batch->deferred_stores = 0;
+    return true;
+}
+
+static bool bcm2835_v3d_wgpu_batch_flush(
+    BCM2835V3DState *s, BCM2835V3DWGPUFragmentBatch *batch)
+{
+    unsigned count = batch->pixels ? batch->pixels->len : 0;
+    uint16_t *pixels;
+    uint32_t *input_colors = NULL;
+    g_autofree uint32_t *colors = NULL;
+    int64_t scatter_start_us;
+    unsigned tile_groups = 0;
+    bool colors_ready = false;
+
+    pixels = count ? (uint16_t *)batch->pixels->data : NULL;
+    if (count) {
+        g_assert(batch->tile_ids && batch->tiles &&
+                 batch->tile_ids->len == count);
+        if (bcm2835_v3d_wgpu_needs_color_load(batch->code,
+                                               batch->code_size)) {
+            if (!batch->input_colors ||
+                batch->input_colors->len != count) {
+                return false;
+            }
+            input_colors = (uint32_t *)batch->input_colors->data;
+        }
+    }
+    if (count && count < BCM2835_V3D_WGPU_MIN_BATCH_PIXELS) {
+        /* shortcut: exact translated shaders only; extend for new kernels. */
+        colors = g_new(uint32_t, count);
+        colors_ready = bcm2835_v3d_wgpu_run_software(
+            batch->code, batch->code_size, batch->uniforms, count,
+            input_colors, (uint32_t *)batch->tmu0_colors->data, colors);
+    }
+    if (!colors_ready && count >= BCM2835_V3D_WGPU_MIN_BATCH_PIXELS) {
+        colors = g_new(uint32_t, count);
+        colors_ready = bcm2835_v3d_wgpu_run(
+            s->wgpu_context, batch->code, batch->code_size, batch->uniforms,
+            count, input_colors, (uint32_t *)batch->tmu0_colors->data,
+            NULL, colors);
+    }
+    if (colors_ready) {
+        uint16_t *tile_ids = (uint16_t *)batch->tile_ids->data;
+
+        scatter_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        for (unsigned first = 0; first < count;) {
+            uint16_t tile_id = tile_ids[first];
+            BCM2835V3DWGPUTileBatch *tile;
+            unsigned end = first + 1;
+
+            if (tile_id >= batch->tiles->len) {
+                return false;
+            }
+            tile = &g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch,
+                                  tile_id);
+            while (end < count && tile_ids[end] == tile_id) {
+                end++;
+            }
+            for (unsigned i = first; i < end; i++) {
+                tile->colors[pixels[i]] = colors[i];
+            }
+            tile_groups++;
+            first = end;
+        }
+        trace_bcm2835_v3d_wgpu_scatter(
+            count, tile_groups,
+            qemu_clock_get_us(QEMU_CLOCK_REALTIME) - scatter_start_us);
+    } else if (count) {
+        uint8_t saved_x = s->tile_x;
+        uint8_t saved_y = s->tile_y;
+        bool saved_valid = s->tile_color_valid;
+        uint32_t saved_colors[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+
+        memcpy(saved_colors, s->tile_color, sizeof(saved_colors));
+        /* Small or failed GPU batches replay through the reference QPU. */
+        for (unsigned first = 0; first < count;) {
+            uint16_t tile_id = g_array_index(batch->tile_ids, uint16_t, first);
+            BCM2835V3DWGPUTileBatch *tile;
+            BCM2835V3DQPUState qpu;
+            BCM2835V3DFragmentVarying varying = { 0 };
+            uint32_t executed;
+            unsigned size = 0;
+            uint16_t expected_mask;
+
+            if (tile_id >= batch->tiles->len) {
+                return false;
+            }
+            tile = &g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch,
+                                  tile_id);
+            while (size < BCM2835_V3D_QPU_LANES && first + size < count &&
+                   g_array_index(batch->tile_ids, uint16_t, first + size) ==
+                       tile_id) {
+                size++;
+            }
+            expected_mask = size == BCM2835_V3D_QPU_LANES ?
+                            UINT16_MAX : (1U << size) - 1;
+            s->tile_x = tile->x;
+            s->tile_y = tile->y;
+            s->tile_color_valid = true;
+            memcpy(s->tile_color, tile->colors, sizeof(s->tile_color));
+            bcm2835_v3d_init_fragment_qpu(
+                s, &qpu, &varying, pixels,
+                (uint32_t *)batch->varying_partial->data,
+                (uint32_t *)batch->fragment_w->data,
+                batch->uniform_address, batch->varying_count, first, size);
+            if (bcm2835_v3d_qpu_run(batch->code, batch->code_size,
+                                    V3D_QPU_INSTRUCTION_BUDGET, &qpu,
+                                    &executed) != BCM2835_V3D_QPU_END ||
+                qpu.varying_index != varying.count ||
+                (qpu.tlb_color_write_mask & expected_mask) != expected_mask) {
+                s->tile_x = saved_x;
+                s->tile_y = saved_y;
+                s->tile_color_valid = saved_valid;
+                memcpy(s->tile_color, saved_colors, sizeof(s->tile_color));
+                return false;
+            }
+            for (unsigned lane = 0; lane < size; lane++) {
+                tile->colors[pixels[first + lane]] = qpu.io[46][lane];
+            }
+            first += size;
+        }
+        s->tile_x = saved_x;
+        s->tile_y = saved_y;
+        s->tile_color_valid = saved_valid;
+        memcpy(s->tile_color, saved_colors, sizeof(s->tile_color));
+    }
+
+    return bcm2835_v3d_wgpu_batch_commit_stores(s, batch);
+}
+
+static BCM2835V3DWGPUQueueResult bcm2835_v3d_wgpu_batch_queue(
+    BCM2835V3DState *s, BCM2835V3DWGPUFragmentBatch *batch,
+    const uint8_t *code, uint32_t code_size, const uint32_t uniforms[6],
+    const uint16_t *pixels, const uint32_t *varying_partial,
+    const uint32_t *fragment_w, unsigned count)
+{
+    uint32_t samples[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+    uint16_t tile_ids[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+    g_autofree BCM2835V3DQPUReadCache *read_cache = NULL;
+    unsigned varying_count = s->shader_record[3];
+    unsigned queued = batch->pixels ? batch->pixels->len : 0;
+    BCM2835V3DQPUState sampler;
+    int tile_index;
+    int64_t sample_start_us;
+    bool needs_color_load = bcm2835_v3d_wgpu_needs_color_load(code,
+                                                               code_size);
+    bool same_shader = queued && batch->code_size == code_size &&
+        batch->varying_count == varying_count &&
+        !memcmp(batch->code, code, code_size) &&
+        !memcmp(batch->uniforms, uniforms, sizeof(batch->uniforms));
+
+    if (count > G_N_ELEMENTS(samples)) {
+        return BCM2835_V3D_WGPU_NOT_QUEUED;
+    }
+    if (queued && (!same_shader ||
+                   queued + count > BCM2835_V3D_WGPU_MAX_BATCH_PIXELS)) {
+        if (!bcm2835_v3d_wgpu_batch_flush(s, batch)) {
+            return BCM2835_V3D_WGPU_QUEUE_ERROR;
+        }
+        queued = 0;
+    }
+    tile_index = bcm2835_v3d_wgpu_batch_find_tile(
+        batch, s->tile_x, s->tile_y);
+    if ((tile_index >= 0 &&
+         g_array_index(batch->tiles, BCM2835V3DWGPUTileBatch,
+                       tile_index).stored) ||
+        (tile_index < 0 && batch->tiles &&
+         batch->tiles->len >= BCM2835_V3D_WGPU_MAX_BATCH_TILES)) {
+        if (!bcm2835_v3d_wgpu_batch_flush(s, batch)) {
+            return BCM2835_V3D_WGPU_QUEUE_ERROR;
+        }
+        queued = 0;
+        tile_index = -1;
+    }
+    if (needs_color_load && tile_index >= 0) {
+        uint64_t seen[BCM2835_V3D_WGPU_MAX_TILE_PIXELS / 64] = { 0 };
+        BCM2835V3DWGPUTileBatch *tile = &g_array_index(
+            batch->tiles, BCM2835V3DWGPUTileBatch, tile_index);
+        bool overlap = false;
+        bool duplicate = false;
+
+        for (unsigned i = 0; i < count; i++) {
+            unsigned pixel = pixels[i];
+            unsigned word = pixel / 64;
+            uint64_t bit = UINT64_C(1) << (pixel % 64);
+
+            if (word >= G_N_ELEMENTS(seen)) {
+                return BCM2835_V3D_WGPU_NOT_QUEUED;
+            }
+            duplicate |= (seen[word] & bit) != 0;
+            overlap |= (tile->blend_pixels[word] & bit) != 0;
+            seen[word] |= bit;
+        }
+        if (duplicate) {
+            if (queued && !bcm2835_v3d_wgpu_batch_flush(s, batch)) {
+                return BCM2835_V3D_WGPU_QUEUE_ERROR;
+            }
+            return BCM2835_V3D_WGPU_NOT_QUEUED;
+        }
+        /* shortcut: overlaps split batches; chain on measured overdraw. */
+        if (overlap) {
+            if (!bcm2835_v3d_wgpu_batch_flush(s, batch)) {
+                return BCM2835_V3D_WGPU_QUEUE_ERROR;
+            }
+            queued = 0;
+            tile_index = -1;
+        }
+    }
+
+    /* shortcut: no tile-time writes; add invalidation if guests require them. */
+    read_cache = g_new0(BCM2835V3DQPUReadCache, 1);
+    read_cache->s = s;
+
+    sampler.read_memory = bcm2835_v3d_qpu_read_memory_cached;
+    sampler.memory_opaque = read_cache;
+    sampler.read_texture = bcm2835_v3d_qpu_read_texture_cached;
+    sampler.texture_opaque = read_cache;
+    sample_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (!bcm2835_v3d_qpu_sample_tmu0_batch(
+            &sampler, uniforms[0], uniforms[1], varying_partial,
+            fragment_w, varying_count, count, samples)) {
+        return BCM2835_V3D_WGPU_NOT_QUEUED;
+    }
+    trace_bcm2835_v3d_qpu_sample_batch(
+        count, qemu_clock_get_us(QEMU_CLOCK_REALTIME) - sample_start_us);
+    trace_bcm2835_v3d_qpu_texture_cache(read_cache->texture_hits,
+                                        read_cache->texture_misses);
+
+    if (!batch->pixels) {
+        batch->pixels = g_array_sized_new(FALSE, FALSE, sizeof(uint16_t),
+                                          BCM2835_V3D_WGPU_MAX_BATCH_PIXELS);
+        batch->tmu0_colors = g_array_sized_new(FALSE, FALSE,
+                                               sizeof(uint32_t),
+                                               BCM2835_V3D_WGPU_MAX_BATCH_PIXELS);
+        batch->varying_partial = g_array_sized_new(
+            FALSE, FALSE, sizeof(uint32_t),
+            BCM2835_V3D_WGPU_MAX_BATCH_PIXELS * varying_count);
+        batch->fragment_w = g_array_sized_new(
+            FALSE, FALSE, sizeof(uint32_t),
+            BCM2835_V3D_WGPU_MAX_BATCH_PIXELS);
+        batch->tile_ids = g_array_sized_new(
+            FALSE, FALSE, sizeof(uint16_t),
+            BCM2835_V3D_WGPU_MAX_BATCH_PIXELS);
+    }
+    if (needs_color_load && !batch->input_colors) {
+        batch->input_colors = g_array_sized_new(
+            FALSE, FALSE, sizeof(uint32_t),
+            BCM2835_V3D_WGPU_MAX_BATCH_PIXELS);
+    }
+    if (tile_index < 0) {
+        tile_index = bcm2835_v3d_wgpu_batch_add_tile(s, batch);
+        if (tile_index < 0) {
+            return BCM2835_V3D_WGPU_NOT_QUEUED;
+        }
+    }
+    if (!queued) {
+        g_free(batch->code);
+        batch->code = g_memdup2(code, code_size);
+        batch->code_size = code_size;
+        batch->uniform_address = ldl_le_p(s->shader_record + 8);
+        memcpy(batch->uniforms, uniforms, sizeof(batch->uniforms));
+        batch->varying_count = varying_count;
+    }
+    g_array_append_vals(batch->pixels, pixels, count);
+    for (unsigned i = 0; i < count; i++) {
+        tile_ids[i] = tile_index;
+    }
+    g_array_append_vals(batch->tile_ids, tile_ids, count);
+    g_array_append_vals(batch->tmu0_colors, samples, count);
+    BCM2835V3DWGPUTileBatch *tile = &g_array_index(
+        batch->tiles, BCM2835V3DWGPUTileBatch, tile_index);
+    if (needs_color_load) {
+        uint32_t inputs[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+
+        for (unsigned i = 0; i < count; i++) {
+            inputs[i] = tile->colors[pixels[i]];
+            tile->blend_pixels[pixels[i] / 64] |=
+                UINT64_C(1) << (pixels[i] % 64);
+        }
+        g_array_append_vals(batch->input_colors, inputs, count);
+    }
+    tile->pending_pixels += count;
+    g_array_append_vals(batch->fragment_w, fragment_w, count);
+    if (varying_count) {
+        g_array_append_vals(batch->varying_partial, varying_partial,
+                            count * varying_count);
+    }
+    g_assert(batch->pixels->len == batch->tile_ids->len);
+    g_assert(batch->tiles->len <= BCM2835_V3D_WGPU_MAX_BATCH_TILES);
+    return BCM2835_V3D_WGPU_QUEUED;
+}
+#endif
+
+static void bcm2835_v3d_wgpu_batch_clear(
+    BCM2835V3DWGPUFragmentBatch *batch)
+{
+#ifdef CONFIG_V3D_WGPU
+    g_free(batch->code);
+    g_clear_pointer(&batch->pixels, g_array_unref);
+    g_clear_pointer(&batch->tile_ids, g_array_unref);
+    g_clear_pointer(&batch->tiles, g_array_unref);
+    g_clear_pointer(&batch->input_colors, g_array_unref);
+    g_clear_pointer(&batch->tmu0_colors, g_array_unref);
+    g_clear_pointer(&batch->varying_partial, g_array_unref);
+    g_clear_pointer(&batch->fragment_w, g_array_unref);
+#else
+    (void)batch;
+#endif
+}
+
+static bool bcm2835_v3d_wgpu_batch_flush_pending(BCM2835V3DState *s)
+{
+#ifdef CONFIG_V3D_WGPU
+    BCM2835V3DWGPUFragmentBatch *batch = s->wgpu_batch;
+
+    return !batch || bcm2835_v3d_wgpu_batch_flush(s, batch);
+#else
+    return true;
+#endif
+}
+
+static void bcm2835_v3d_wgpu_batch_free(BCM2835V3DState *s)
+{
+#ifdef CONFIG_V3D_WGPU
+    BCM2835V3DWGPUFragmentBatch *batch = s->wgpu_batch;
+
+    if (batch) {
+        bcm2835_v3d_wgpu_batch_clear(batch);
+        g_free(batch);
+        s->wgpu_batch = NULL;
+    }
+#endif
+}
+
+static bool bcm2835_v3d_wgpu_batch_flush_before(
+    BCM2835V3DState *s, unsigned thread, uint32_t addr)
+{
+    if (thread != 1 || bcm2835_v3d_wgpu_batch_flush_pending(s)) {
+        return true;
+    }
+    bcm2835_v3d_wgpu_batch_free(s);
+    bcm2835_v3d_thread_error(s, thread, addr,
+                             "fragment shader batch could not be committed");
+    return false;
+}
+
 static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
                                              const uint16_t *pixels,
                                              const uint32_t *varying_partial,
                                              const uint32_t *fragment_w,
-                                             unsigned count)
+                                             unsigned count,
+                                             BCM2835V3DWGPUFragmentBatch *batch)
 {
+#ifndef CONFIG_V3D_WGPU
+    (void)batch;
+#endif
     uint32_t code_address = ldl_le_p(s->shader_record + 4) & ~7U;
     uint32_t uniforms_address = ldl_le_p(s->shader_record + 8);
     uint8_t *code;
     uint32_t code_size;
+#ifdef CONFIG_V3D_WGPU
+    uint32_t wgpu_uniforms[6];
+    uint32_t wgpu_colors[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+    uint32_t wgpu_input_colors[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+    uint32_t wgpu_tmu0_colors[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+    uint32_t wgpu_software_colors[BCM2835_V3D_WGPU_MAX_TILE_PIXELS];
+    bool wgpu_uniforms_readable = false;
+    bool wgpu_shader_supported = false;
+    bool wgpu_shader_needs_tmu0 = false;
+    bool wgpu_shader_can_batch = false;
+#endif
 
     if (!code_address || !count ||
         !bcm2835_v3d_load_qpu_program(s, code_address, &code, &code_size)) {
         return false;
     }
+
+#ifdef CONFIG_V3D_WGPU
+    if (count <= BCM2835_V3D_WGPU_MAX_TILE_PIXELS && s->wgpu_context) {
+        wgpu_shader_supported =
+            bcm2835_v3d_wgpu_supports(code, code_size);
+        wgpu_shader_needs_tmu0 =
+            bcm2835_v3d_wgpu_needs_tmu0(code, code_size);
+        wgpu_shader_can_batch =
+            bcm2835_v3d_wgpu_can_batch(code, code_size);
+        if (!wgpu_shader_supported) {
+            bcm2835_v3d_wgpu_report_unsupported(
+                s->wgpu_context, code_address, code, code_size);
+        }
+    }
+    if (wgpu_shader_supported) {
+        wgpu_uniforms_readable = true;
+        for (unsigned i = 0; i < G_N_ELEMENTS(wgpu_uniforms); i++) {
+            uint64_t address = (uint64_t)uniforms_address + i * 4;
+
+            if (address > UINT32_MAX ||
+                !bcm2835_v3d_qpu_read_uniform(s, address,
+                                              &wgpu_uniforms[i])) {
+                wgpu_uniforms_readable = false;
+                break;
+            }
+        }
+        if (wgpu_uniforms_readable) {
+            if (!wgpu_shader_can_batch && batch->pixels &&
+                batch->pixels->len &&
+                !bcm2835_v3d_wgpu_batch_flush(s, batch)) {
+                g_free(code);
+                return false;
+            }
+            if (s->wgpu_verify || !wgpu_shader_can_batch) {
+                for (unsigned i = 0; i < count; i++) {
+                    wgpu_input_colors[i] = s->tile_color[pixels[i]];
+                }
+            }
+            if (!s->wgpu_verify && wgpu_shader_can_batch) {
+                BCM2835V3DWGPUQueueResult queued =
+                    bcm2835_v3d_wgpu_batch_queue(
+                        s, batch, code, code_size, wgpu_uniforms, pixels,
+                        varying_partial, fragment_w, count);
+
+                if (queued == BCM2835_V3D_WGPU_QUEUED) {
+                    g_free(code);
+                    return true;
+                }
+                if (queued == BCM2835_V3D_WGPU_QUEUE_ERROR) {
+                    g_free(code);
+                    return false;
+                }
+                if (bcm2835_v3d_wgpu_needs_color_load(code, code_size)) {
+                    for (unsigned i = 0; i < count; i++) {
+                        wgpu_input_colors[i] = s->tile_color[pixels[i]];
+                    }
+                }
+            }
+            /* shortcut: other independent shaders wait for tile batching. */
+            if (!s->wgpu_verify &&
+                bcm2835_v3d_wgpu_needs_color_load(code, code_size)) {
+                bool samples_ready = true;
+
+                if (wgpu_shader_needs_tmu0) {
+                    for (unsigned first = 0; first < count;
+                         first += BCM2835_V3D_QPU_LANES) {
+                        BCM2835V3DQPUState qpu;
+                        BCM2835V3DFragmentVarying varying = { 0 };
+                        uint32_t executed;
+                        uint32_t batch = MIN(count - first,
+                                             BCM2835_V3D_QPU_LANES);
+                        BCM2835V3DQPUResult result;
+
+                        bcm2835_v3d_init_fragment_qpu(
+                            s, &qpu, &varying, pixels, varying_partial,
+                            fragment_w, uniforms_address,
+                            s->shader_record[3], first, batch);
+                        result = bcm2835_v3d_qpu_run_until_tmu0(
+                            code, code_size, V3D_QPU_INSTRUCTION_BUDGET,
+                            &qpu, &executed);
+                        if (result != BCM2835_V3D_QPU_TMU0_LOADED ||
+                            qpu.varying_index != varying.count) {
+                            samples_ready = false;
+                            break;
+                        }
+                        for (unsigned lane = 0; lane < batch; lane++) {
+                            wgpu_tmu0_colors[first + lane] =
+                                qpu.acc[4][lane];
+                        }
+                    }
+                }
+                if (samples_ready &&
+                    bcm2835_v3d_wgpu_run(
+                        s->wgpu_context, code, code_size, wgpu_uniforms,
+                        count, wgpu_input_colors,
+                        wgpu_shader_needs_tmu0 ? wgpu_tmu0_colors : NULL,
+                        NULL, wgpu_colors)) {
+                    for (unsigned i = 0; i < count; i++) {
+                        s->tile_color[pixels[i]] = wgpu_colors[i];
+                    }
+                    g_free(code);
+                    return true;
+                }
+            }
+        }
+    }
+#endif
+
+#ifdef CONFIG_V3D_WGPU
+    if (batch->pixels && batch->pixels->len &&
+        !bcm2835_v3d_wgpu_batch_flush(s, batch)) {
+        g_free(code);
+        return false;
+    }
+#endif
 
     for (unsigned first = 0; first < count;
          first += BCM2835_V3D_QPU_LANES) {
@@ -1063,117 +1850,59 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
         uint16_t expected_mask = batch == BCM2835_V3D_QPU_LANES ?
                                  UINT16_MAX : (1U << batch) - 1;
         BCM2835V3DQPUResult result;
-        bool wgpu_rendered = false;
-#ifdef CONFIG_V3D_WGPU
-        uint32_t wgpu_uniforms[4];
-        uint32_t wgpu_colors[BCM2835_V3D_QPU_LANES];
-        uint32_t wgpu_input_colors[BCM2835_V3D_QPU_LANES];
-        bool wgpu_uniforms_readable = false;
-#endif
 
-        bcm2835_v3d_qpu_init(&qpu);
-        qpu.uniform_address = uniforms_address;
-        qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
-        qpu.uniform_opaque = s;
-        qpu.read_memory = bcm2835_v3d_qpu_read_uniform;
-        qpu.memory_opaque = s;
-        qpu.write_memory = bcm2835_v3d_qpu_write_memory;
-        qpu.read_texture = bcm2835_v3d_qpu_read_texture;
-        qpu.texture_opaque = s;
-#ifdef CONFIG_V3D_WGPU
-        if (s->wgpu_context) {
-            qpu.filter_texture = bcm2835_v3d_qpu_filter_texture;
-            qpu.filter_texture_opaque = s->wgpu_context;
-            qpu.filter_texture_verify = s->wgpu_verify;
+        bcm2835_v3d_init_fragment_qpu(s, &qpu, &varying, pixels,
+                                      varying_partial, fragment_w,
+                                      uniforms_address, s->shader_record[3],
+                                      first, batch);
+        result = bcm2835_v3d_qpu_run(code, code_size,
+                                      V3D_QPU_INSTRUCTION_BUDGET, &qpu,
+                                      &executed);
+        if (result != BCM2835_V3D_QPU_END ||
+            qpu.varying_index != varying.count ||
+            (qpu.tlb_color_write_mask & expected_mask) !=
+            expected_mask) {
+            uint64_t instruction = 0;
+
+            if ((uint64_t)qpu.pc * sizeof(uint64_t) + sizeof(uint64_t) <=
+                code_size) {
+                instruction = ldq_le_p(code + qpu.pc * sizeof(uint64_t));
+            }
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: fragment QPU 0x%08x result=%u pc=%u instruction=0x%016" PRIx64 " varying=%u/%u color-mask=0x%04x expected=0x%04x\n",
+                          code_address, result, qpu.pc, instruction,
+                          qpu.varying_index, varying.count,
+                          qpu.tlb_color_write_mask, expected_mask);
+            g_free(code);
+            return false;
         }
-#endif
-        qpu.fragment_shader = true;
-        if (s->shader_record[3]) {
-            varying.count = s->shader_record[3];
-            qpu.read_varying = bcm2835_v3d_qpu_read_varying;
-            qpu.varying_opaque = &varying;
-        }
-        /* shortcut: fragment W/Z inputs wait for interpolated depth support. */
         for (unsigned lane = 0; lane < batch; lane++) {
-            unsigned pixel = pixels[first + lane];
-
-            qpu.fragment_coord[0][lane] =
-                (s->tile_x * V3D_TILE_SIZE + pixel % V3D_TILE_SIZE) & 0x7ff;
-            qpu.fragment_coord[1][lane] =
-                (s->tile_y * V3D_TILE_SIZE + pixel / V3D_TILE_SIZE) & 0x7ff;
-            qpu.io[45][lane] = s->tile_color[pixel];
-#ifdef CONFIG_V3D_WGPU
-            wgpu_input_colors[lane] = s->tile_color[pixel];
-#endif
-            qpu.fragment_w[lane] = fragment_w[first + lane];
-            for (unsigned index = 0; index < varying.count; index++) {
-                varying.partial[index][lane] =
-                    varying_partial[(first + lane) * varying.count + index];
-            }
-        }
-#ifdef CONFIG_V3D_WGPU
-        if (s->wgpu_context &&
-            bcm2835_v3d_wgpu_supports(code, code_size)) {
-            wgpu_uniforms_readable = true;
-            for (unsigned i = 0; i < G_N_ELEMENTS(wgpu_uniforms); i++) {
-                uint64_t address = (uint64_t)uniforms_address + i * 4;
-
-                if (address > UINT32_MAX ||
-                    !bcm2835_v3d_qpu_read_uniform(s, address,
-                                                  &wgpu_uniforms[i])) {
-                    wgpu_uniforms_readable = false;
-                    break;
-                }
-            }
-            if (wgpu_uniforms_readable && !s->wgpu_verify) {
-                wgpu_rendered = bcm2835_v3d_wgpu_run(
-                    s->wgpu_context, code, code_size, wgpu_uniforms, batch,
-                    wgpu_input_colors, NULL, wgpu_colors);
-            }
-        }
-#endif
-        if (!wgpu_rendered) {
-            result = bcm2835_v3d_qpu_run(code, code_size,
-                                          V3D_QPU_INSTRUCTION_BUDGET, &qpu,
-                                          &executed);
-            if (result != BCM2835_V3D_QPU_END ||
-                qpu.varying_index != varying.count ||
-                (qpu.tlb_color_write_mask & expected_mask) !=
-                expected_mask) {
-                uint64_t instruction = 0;
-
-                if ((uint64_t)qpu.pc * sizeof(uint64_t) + sizeof(uint64_t) <=
-                    code_size) {
-                    instruction = ldq_le_p(code + qpu.pc * sizeof(uint64_t));
-                }
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "bcm2835_v3d: fragment QPU 0x%08x result=%u pc=%u instruction=0x%016" PRIx64 " varying=%u/%u color-mask=0x%04x expected=0x%04x\n",
-                              code_address, result, qpu.pc, instruction,
-                              qpu.varying_index, varying.count,
-                              qpu.tlb_color_write_mask, expected_mask);
-                g_free(code);
-                return false;
-            }
 #ifdef CONFIG_V3D_WGPU
             if (s->wgpu_context && s->wgpu_verify &&
-                wgpu_uniforms_readable &&
-                bcm2835_v3d_wgpu_run(s->wgpu_context, code, code_size,
-                                     wgpu_uniforms, batch,
-                                     wgpu_input_colors, qpu.io[46],
-                                     wgpu_colors)) {
-                memcpy(qpu.io[46], wgpu_colors,
-                       batch * sizeof(wgpu_colors[0]));
+                wgpu_uniforms_readable) {
+                wgpu_software_colors[first + lane] = qpu.io[46][lane];
+                if (wgpu_shader_needs_tmu0) {
+                    wgpu_tmu0_colors[first + lane] =
+                        qpu.tmu[0].result[lane];
+                }
             }
 #endif
-        }
-        for (unsigned lane = 0; lane < batch; lane++) {
-            s->tile_color[pixels[first + lane]] =
-#ifdef CONFIG_V3D_WGPU
-                wgpu_rendered ? wgpu_colors[lane] :
-#endif
-                qpu.io[46][lane];
+            s->tile_color[pixels[first + lane]] = qpu.io[46][lane];
         }
     }
+#ifdef CONFIG_V3D_WGPU
+    if (s->wgpu_context && s->wgpu_verify && wgpu_uniforms_readable &&
+        count <= BCM2835_V3D_WGPU_MAX_TILE_PIXELS &&
+        bcm2835_v3d_wgpu_run(s->wgpu_context, code, code_size,
+                             wgpu_uniforms, count, wgpu_input_colors,
+                             wgpu_shader_needs_tmu0 ?
+                             wgpu_tmu0_colors : NULL,
+                             wgpu_software_colors, wgpu_colors)) {
+        for (unsigned i = 0; i < count; i++) {
+            s->tile_color[pixels[i]] = wgpu_colors[i];
+        }
+    }
+#endif
     g_free(code);
     return true;
 }
@@ -1326,9 +2055,10 @@ static bool bcm2835_v3d_append_tile_triangle(BCM2835V3DState *s,
         return false;
     }
 
-    if (command_size - 1 > list_capacity - used) {
+    uint8_t branch[5] = { V3D_PACKET_BRANCH };
+
+    if (command_size - 1 + sizeof(branch) - 1 > list_capacity - used) {
         uint32_t next_block;
-        uint8_t branch[5] = { V3D_PACKET_BRANCH };
         uint8_t empty_list = V3D_PACKET_RETURN;
 
         if (used - 1 + sizeof(branch) > list_capacity ||
@@ -1426,7 +2156,7 @@ static bool bcm2835_v3d_project_clipped_vertex(BCM2835V3DState *s,
 
     if (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(scale_x) ||
         !isfinite(scale_y) || w == 0.0f || scale_x <= 0.0f ||
-        scale_y <= 0.0f) {
+        scale_y == 0.0f) {
         return false;
     }
     screen_x = x / w * scale_x;
@@ -1512,7 +2242,7 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
     float z_max = bcm2835_v3d_bits_float(s->clipper_z_max);
 
     if (!s->clipper_xy_scale_valid || !isfinite(scale_x) ||
-        !isfinite(scale_y) || scale_x <= 0.0f || scale_y <= 0.0f ||
+        !isfinite(scale_y) || scale_x <= 0.0f || scale_y == 0.0f ||
         (s->clipper_z_clip_valid &&
          (!isfinite(z_min) || !isfinite(z_max) || z_min > z_max))) {
         return false;
@@ -1599,9 +2329,11 @@ static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
                                              uint32_t *append_index)
 {
     int32_t center_x = s->viewport_offset_valid ? s->viewport_center_x :
-                                                 s->render_width / 2;
+                         s->bin_tiles_x * V3D_TILE_SIZE * 8;
     int32_t center_y = s->viewport_offset_valid ? s->viewport_center_y :
-                                                 s->render_height / 2;
+                         s->bin_tiles_y * V3D_TILE_SIZE * 8;
+    int32_t bin_width = s->bin_tiles_x * V3D_TILE_SIZE;
+    int32_t bin_height = s->bin_tiles_y * V3D_TILE_SIZE;
     int32_t x[3];
     int32_t y[3];
     int32_t min_x, min_y, max_x, max_y;
@@ -1611,9 +2343,12 @@ static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
 
     for (unsigned i = 0; i < 3; i++) {
         screen_xy[i] = triangle[i].word[4];
-        x[i] = center_x * 16 + (int16_t)screen_xy[i];
-        y[i] = center_y * 16 -
-               (int16_t)(screen_xy[i] >> 16);
+        x[i] = center_x + (int16_t)screen_xy[i];
+        /*
+         * VC4 screen Y is viewport centre + scaled Y; Mesa negates the scale
+         * for Y-flipped targets.
+         */
+        y[i] = center_y + (int16_t)(screen_xy[i] >> 16);
     }
     area = bcm2835_v3d_edge(x[0], y[0], x[1], y[1], x[2], y[2]);
     if (!area) {
@@ -1625,10 +2360,8 @@ static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
     max_y = MAX(y[0], MAX(y[1], y[2]));
     pixel_min_x = MAX(0, bcm2835_v3d_floor_12_4(min_x));
     pixel_min_y = MAX(0, bcm2835_v3d_floor_12_4(min_y));
-    pixel_max_x = MIN((int32_t)s->render_width - 1,
-                      bcm2835_v3d_floor_12_4(max_x));
-    pixel_max_y = MIN((int32_t)s->render_height - 1,
-                      bcm2835_v3d_floor_12_4(max_y));
+    pixel_max_x = MIN(bin_width - 1, bcm2835_v3d_floor_12_4(max_x));
+    pixel_max_y = MIN(bin_height - 1, bcm2835_v3d_floor_12_4(max_y));
     if (pixel_min_x > pixel_max_x || pixel_min_y > pixel_max_y) {
         return true;
     }
@@ -1659,8 +2392,6 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
                                       const BCM2835V3DVertex *vertices,
                                       unsigned count)
 {
-    unsigned format = (s->render_config >> 2) & 3;
-    unsigned memory_format = (s->render_config >> 6) & 3;
     uint64_t binned_tiles = 0;
     uint32_t append_index = 0;
 
@@ -1668,15 +2399,11 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
         s->bin_draw_append_count = 0;
     }
 
-    if (!s->render_config_valid || !s->bin_config_valid ||
-        !s->binning_started || !s->render_width || !s->render_height ||
-        (format != 1 && format != 2) || memory_format > 2 ||
-        DIV_ROUND_UP(s->render_width, V3D_TILE_SIZE) > s->bin_tiles_x ||
-        DIV_ROUND_UP(s->render_height, V3D_TILE_SIZE) > s->bin_tiles_y) {
+    if (!s->bin_config_valid || !s->binning_started ||
+        !s->bin_tiles_x || !s->bin_tiles_y) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "bcm2835_v3d: invalid bin setup render=%u/%u/%u bin=%u/%u/%u/%u\n",
-                      s->render_config_valid, s->render_width,
-                      s->render_height, s->bin_config_valid,
+                      "bcm2835_v3d: invalid bin setup bin=%u/%u/%u/%u\n",
+                      s->bin_config_valid,
                       s->binning_started, s->bin_tiles_x, s->bin_tiles_y);
         return false;
     }
@@ -1689,8 +2416,23 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
             if (!bcm2835_v3d_clip_triangle(s, vertices + vertex, polygon,
                                            &polygon_count)) {
                 qemu_log_mask(LOG_GUEST_ERROR,
-                              "bcm2835_v3d: triangle clipping failed at vertex %u\n",
-                              vertex);
+                              "bcm2835_v3d: triangle clipping failed at %u: xy-scale=%08x/%08x clip-z=%u/%08x/%08x v0=%08x,%08x,%08x,%08x v1=%08x,%08x,%08x,%08x v2=%08x,%08x,%08x,%08x\n",
+                              vertex, s->clipper_xy_scale[0],
+                              s->clipper_xy_scale[1],
+                              s->clipper_z_clip_valid, s->clipper_z_min,
+                              s->clipper_z_max,
+                              vertices[vertex].word[0],
+                              vertices[vertex].word[1],
+                              vertices[vertex].word[2],
+                              vertices[vertex].word[3],
+                              vertices[vertex + 1].word[0],
+                              vertices[vertex + 1].word[1],
+                              vertices[vertex + 1].word[2],
+                              vertices[vertex + 1].word[3],
+                              vertices[vertex + 2].word[0],
+                              vertices[vertex + 2].word[1],
+                              vertices[vertex + 2].word[2],
+                              vertices[vertex + 2].word[3]);
                 return false;
             }
             for (unsigned i = 1; i + 1 < polygon_count; i++) {
@@ -1725,12 +2467,13 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
                                                  const uint32_t *screen_xy,
                                                  const uint32_t *varying,
                                                  const uint32_t *reciprocal_w,
-                                                 uint64_t *work)
+                                                 uint64_t *work,
+                                                 BCM2835V3DWGPUFragmentBatch *batch)
 {
     int32_t center_x = s->viewport_offset_valid ? s->viewport_center_x :
-                                                 s->render_width / 2;
+                                                 s->render_width * 8;
     int32_t center_y = s->viewport_offset_valid ? s->viewport_center_y :
-                                                 s->render_height / 2;
+                                                 s->render_height * 8;
     int32_t x[3];
     int32_t y[3];
     int32_t x0 = (int32_t)s->tile_x * V3D_TILE_SIZE;
@@ -1739,6 +2482,9 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
     int32_t y1 = MIN(y0 + V3D_TILE_SIZE, s->render_height);
     int32_t min_x, min_y, max_x, max_y;
     int64_t area;
+    int64_t edge_row[3], edge_x_step[3], edge_y_step[3];
+    int64_t normalized_area, edge_sign;
+    bool edge_top_left[3];
     uint32_t color = s->clear_color_valid ? s->clear_color[0] : UINT32_MAX;
     uint16_t covered[64 * 64];
     uint32_t *covered_partial = NULL;
@@ -1746,6 +2492,7 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
     float vertex_varying[V3D_MAX_FRAGMENT_VARYINGS][3] = { 0 };
     float vertex_reciprocal_w[3] = { 1.0f, 1.0f, 1.0f };
     unsigned covered_count = 0;
+    int64_t raster_start_us;
 
     if (s->shader_record[3]) {
         if (!varying || !reciprocal_w) {
@@ -1783,8 +2530,12 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
     for (unsigned i = 0; i < 3; i++) {
         uint32_t packed = screen_xy[i];
 
-        x[i] = center_x * 16 + (int16_t)packed;
-        y[i] = center_y * 16 - (int16_t)(packed >> 16);
+        x[i] = center_x + (int16_t)packed;
+        /*
+         * VC4 screen Y is viewport centre + scaled Y; Mesa negates the scale
+         * for Y-flipped targets.
+         */
+        y[i] = center_y + (int16_t)(packed >> 16);
     }
     area = bcm2835_v3d_edge(x[0], y[0], x[1], y[1], x[2], y[2]);
     if (!area) {
@@ -1809,19 +2560,57 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
         return false;
     }
 
-    for (int32_t py = min_y; py <= max_y; py++) {
-        for (int32_t px = min_x; px <= max_x; px++) {
-            int32_t px_fixed = px * 16 + 8;
-            int32_t py_fixed = py * 16 + 8;
-            int64_t e0 = bcm2835_v3d_edge(
-                x[0], y[0], x[1], y[1], px_fixed, py_fixed);
-            int64_t e1 = bcm2835_v3d_edge(
-                x[1], y[1], x[2], y[2], px_fixed, py_fixed);
-            int64_t e2 = bcm2835_v3d_edge(
-                x[2], y[2], x[0], y[0], px_fixed, py_fixed);
+    edge_sign = area < 0 ? -1 : 1;
+    normalized_area = area * edge_sign;
+    int32_t first_px_fixed = min_x * 16 + 8;
+    int32_t first_py_fixed = min_y * 16 + 8;
+    for (unsigned i = 0; i < 3; i++) {
+        unsigned next = (i + 1) % 3;
+        int32_t dx = x[next] - x[i];
+        int32_t dy = y[next] - y[i];
+        int32_t oriented_dx = dx * edge_sign;
+        int32_t oriented_dy = dy * edge_sign;
 
-            if ((area > 0 && e0 >= 0 && e1 >= 0 && e2 >= 0) ||
-                (area < 0 && e0 <= 0 && e1 <= 0 && e2 <= 0)) {
+        edge_row[i] = bcm2835_v3d_edge(x[i], y[i], x[next], y[next],
+                                       first_px_fixed, first_py_fixed) *
+                      edge_sign;
+        edge_x_step[i] = 16LL * oriented_dy;
+        edge_y_step[i] = -16LL * oriented_dx;
+        edge_top_left[i] = oriented_dy > 0 ||
+                           (oriented_dy == 0 && oriented_dx < 0);
+    }
+
+    raster_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    for (int32_t py = min_y; py <= max_y; py++) {
+        int64_t span_start = 0;
+        int64_t span_end = max_x - min_x;
+        bool row_covered = true;
+
+        for (unsigned i = 0; i < 3; i++) {
+            int64_t threshold = edge_top_left[i] ? 0 : 1;
+
+            if (edge_x_step[i] > 0) {
+                span_start = MAX(span_start,
+                    bcm2835_v3d_ceil_div(threshold - edge_row[i],
+                                        edge_x_step[i]));
+            } else if (edge_x_step[i] < 0) {
+                span_end = MIN(span_end,
+                    bcm2835_v3d_floor_div(edge_row[i] - threshold,
+                                          -edge_x_step[i]));
+            } else if (edge_row[i] < threshold) {
+                row_covered = false;
+                break;
+            }
+        }
+
+        if (row_covered && span_start <= span_end) {
+            int32_t first_px = min_x + (int32_t)span_start;
+            int32_t last_px = min_x + (int32_t)span_end;
+            int64_t e0 = edge_row[0] + span_start * edge_x_step[0];
+            int64_t e1 = edge_row[1] + span_start * edge_x_step[1];
+            int64_t e2 = edge_row[2] + span_start * edge_x_step[2];
+
+            for (int32_t px = first_px; px <= last_px; px++) {
                 unsigned tile_pixel = (py - y0) * V3D_TILE_SIZE + px - x0;
                 float fragment_w = 1.0f;
 
@@ -1830,9 +2619,9 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
                     return false;
                 }
                 if (s->shader_record[3]) {
-                    double b0 = (double)e0 / area;
-                    double b1 = (double)e1 / area;
-                    double b2 = (double)e2 / area;
+                    double b0 = (double)e1 / normalized_area;
+                    double b1 = (double)e2 / normalized_area;
+                    double b2 = (double)e0 / normalized_area;
                     double inv_w = b0 * vertex_reciprocal_w[0] +
                                    b1 * vertex_reciprocal_w[1] +
                                    b2 * vertex_reciprocal_w[2];
@@ -1867,15 +2656,31 @@ static bool bcm2835_v3d_rasterize_tile_triangle(BCM2835V3DState *s,
                 covered[covered_count] = tile_pixel;
                 covered_w[covered_count] = bcm2835_v3d_float_bits(fragment_w);
                 covered_count++;
+                e0 += edge_x_step[0];
+                e1 += edge_x_step[1];
+                e2 += edge_x_step[2];
             }
         }
+        edge_row[0] += edge_y_step[0];
+        edge_row[1] += edge_y_step[1];
+        edge_row[2] += edge_y_step[2];
     }
+    trace_bcm2835_v3d_rasterize_triangle(
+        (max_x - min_x + 1) * (max_y - min_y + 1), covered_count,
+        qemu_clock_get_us(QEMU_CLOCK_REALTIME) - raster_start_us);
     if (covered_count && ldl_le_p(s->shader_record + 4)) {
         bool success = bcm2835_v3d_run_fragment_shader(
-            s, covered, covered_partial, covered_w, covered_count);
+            s, covered, covered_partial, covered_w, covered_count, batch);
         g_free(covered_partial);
         return success;
     }
+#ifdef CONFIG_V3D_WGPU
+    if (batch->pixels && batch->pixels->len &&
+        !bcm2835_v3d_wgpu_batch_flush(s, batch)) {
+        g_free(covered_partial);
+        return false;
+    }
+#endif
     for (unsigned i = 0; i < covered_count; i++) {
         s->tile_color[covered[i]] = color;
     }
@@ -1904,8 +2709,9 @@ static bool bcm2835_v3d_add_xy_delta(uint32_t xy, int32_t dx, int32_t dy,
     return true;
 }
 
-static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
-                                               uint32_t *ca)
+static bool bcm2835_v3d_execute_compressed_xy_body(
+    BCM2835V3DState *s, uint32_t *ca,
+    BCM2835V3DWGPUFragmentBatch *batch)
 {
     uint32_t triangles = 0;
     uint64_t work = 0;
@@ -2050,7 +2856,7 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
         }
         if (!bcm2835_v3d_rasterize_tile_triangle(
                 s, coords, varying_size ? varying : NULL,
-                varying_size ? reciprocal_w : NULL, &work)) {
+                varying_size ? reciprocal_w : NULL, &work, batch)) {
             return false;
         }
         memcpy(previous, coords, sizeof(previous));
@@ -2059,6 +2865,30 @@ static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
         triangles++;
     }
     return false;
+}
+
+static bool bcm2835_v3d_execute_compressed_xy(BCM2835V3DState *s,
+                                               uint32_t *ca)
+{
+    BCM2835V3DWGPUFragmentBatch local_batch = { 0 };
+    BCM2835V3DWGPUFragmentBatch *batch = &local_batch;
+    bool persistent_batch = false;
+    bool success;
+
+#ifdef CONFIG_V3D_WGPU
+    if (s->wgpu_context) {
+        if (!s->wgpu_batch) {
+            s->wgpu_batch = g_new0(BCM2835V3DWGPUFragmentBatch, 1);
+        }
+        batch = s->wgpu_batch;
+        persistent_batch = true;
+    }
+#endif
+    success = bcm2835_v3d_execute_compressed_xy_body(s, ca, batch);
+    if (!persistent_batch) {
+        bcm2835_v3d_wgpu_batch_clear(batch);
+    }
+    return success;
 }
 
 static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
@@ -2179,10 +3009,14 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
     return success;
 }
 
-static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
+static void bcm2835_v3d_run_thread_body(BCM2835V3DState *s, unsigned thread,
+                                        bool yield_after_tile)
 {
     uint32_t *ca = &s->ct_ca[thread];
     uint32_t ea = s->ct_ea[thread];
+#ifdef CONFIG_V3D_WGPU
+    unsigned deferred_stores_this_slice = 0;
+#endif
 
     for (uint32_t commands = 0; *ca != ea; commands++) {
         uint8_t packet[16];
@@ -2223,6 +3057,10 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 
         switch (opcode) {
         case V3D_PACKET_HALT:
+            if (!bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
             s->ct_cs[thread] &= ~V3D_CS_CTRUN;
             s->ct_cs[thread] |= V3D_CS_CTSUBS;
             s->ct_waiting[thread] = false;
@@ -2258,12 +3096,16 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             if (s->ct_waiting[target]) {
                 s->ct_waiting[target] = false;
                 s->ct_cs[target] &= ~V3D_CS_CTSUBS;
-                bcm2835_v3d_run_thread(s, target);
+                bcm2835_v3d_start_thread(s, target);
             }
             break;
         }
         case V3D_PACKET_WAIT_SEMA:
             if (!s->ct_semaphore[thread]) {
+                if (!bcm2835_v3d_wgpu_batch_flush_before(
+                        s, thread, packet_address)) {
+                    return;
+                }
                 s->ct_cs[thread] |= V3D_CS_CTSUBS;
                 s->ct_waiting[thread] = true;
                 return;
@@ -2399,6 +3241,10 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             }
             break;
         case V3D_PACKET_RENDER_CONFIG:
+            if (!bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
             s->render_base = ldl_le_p(packet + 1);
             s->render_width = lduw_le_p(packet + 5);
             s->render_height = lduw_le_p(packet + 7);
@@ -2407,11 +3253,29 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             s->tile_color_valid = false;
             break;
         case V3D_PACKET_CLEAR_COLORS:
+            if (!bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
             s->clear_color[0] = ldl_le_p(packet + 1);
             s->clear_color[1] = ldl_le_p(packet + 5);
             s->clear_color_valid = true;
             break;
         case V3D_PACKET_TILE_COORDS:
+#ifdef CONFIG_V3D_WGPU
+            if ((thread != 1 ||
+                 !bcm2835_v3d_wgpu_batch_defer_across_tile(
+                     s, packet[1], packet[2])) &&
+                !bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
+#else
+            if (!bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
+#endif
             s->tile_x = packet[1];
             s->tile_y = packet[2];
             s->tile_color_valid = false;
@@ -2420,6 +3284,15 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                         s, s->pending_tile_load_base,
                         s->pending_tile_load_memory_format,
                         s->pending_tile_load_color_format, false)) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "bcm2835_v3d: CT%u tile load base=0x%08x "
+                                  "format=%u color=%u tile=(%u,%u) "
+                                  "render=%ux%u\n",
+                                  thread, s->pending_tile_load_base,
+                                  s->pending_tile_load_memory_format,
+                                  s->pending_tile_load_color_format,
+                                  s->tile_x, s->tile_y,
+                                  s->render_width, s->render_height);
                     bcm2835_v3d_thread_error(s, thread, *ca,
                                              "tile buffer load DMA failed");
                     return;
@@ -2430,10 +3303,52 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             s->tile_primitive_format_valid = false;
             break;
         case V3D_PACKET_STORE_TILE:
-        case V3D_PACKET_LOAD_TILE:
+#ifdef CONFIG_V3D_WGPU
+            if (thread == 1 &&
+                bcm2835_v3d_wgpu_batch_defer_store(s, packet)) {
+                BCM2835V3DWGPUFragmentBatch *batch = s->wgpu_batch;
+
+                deferred_stores_this_slice++;
+                if (yield_after_tile &&
+                    batch->deferred_stores >=
+                    BCM2835_V3D_WGPU_MAX_BATCH_TILES) {
+                    if (!bcm2835_v3d_wgpu_batch_flush_before(
+                            s, thread, packet_address)) {
+                        return;
+                    }
+                    return;
+                }
+                if (yield_after_tile &&
+                    deferred_stores_this_slice >=
+                    BCM2835_V3D_WGPU_TILES_PER_SLICE) {
+                    /* Keep collecting across BH slices; submit every 64 tiles. */
+                    return;
+                }
+                break;
+            }
+#endif
+            if (!bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
             if (thread != 1 ||
                 !bcm2835_v3d_tile_buffer_packet(
-                    s, packet, opcode == V3D_PACKET_STORE_TILE)) {
+                    s, packet, true)) {
+                bcm2835_v3d_thread_error(s, thread, *ca,
+                                         "unsupported tile buffer operation or DMA failure");
+                return;
+            }
+            if (yield_after_tile && opcode == V3D_PACKET_STORE_TILE) {
+                return;
+            }
+            break;
+        case V3D_PACKET_LOAD_TILE:
+            if (!bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
+            if (thread != 1 ||
+                !bcm2835_v3d_tile_buffer_packet(s, packet, false)) {
                 bcm2835_v3d_thread_error(s, thread, *ca,
                                          "unsupported tile buffer operation or DMA failure");
                 return;
@@ -2441,6 +3356,10 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
             break;
         case V3D_PACKET_STORE_MS:
         case V3D_PACKET_STORE_MS_EOF:
+            if (!bcm2835_v3d_wgpu_batch_flush_before(
+                    s, thread, packet_address)) {
+                return;
+            }
             if (!bcm2835_v3d_clear_tile(s)) {
                 bcm2835_v3d_thread_error(s, thread, *ca,
                                          "unsupported render target or DMA write failed");
@@ -2480,8 +3399,65 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
         }
     }
 
+    if (!bcm2835_v3d_wgpu_batch_flush_before(s, thread, *ca)) {
+        return;
+    }
     s->ct_cs[thread] &= ~(V3D_CS_CTRUN | V3D_CS_CTSUBS);
     s->ct_waiting[thread] = false;
+}
+
+static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
+{
+    int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+
+    trace_bcm2835_v3d_thread_start(thread, s->ct_ca[thread],
+                                   s->ct_ea[thread]);
+    bcm2835_v3d_run_thread_body(s, thread, false);
+    trace_bcm2835_v3d_thread_end(thread, s->ct_ca[thread], s->ct_cs[thread],
+                                 qemu_clock_get_us(QEMU_CLOCK_REALTIME) -
+                                 start_us);
+}
+
+static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread)
+{
+    if (thread != 1) {
+        bcm2835_v3d_run_thread(s, thread);
+        return;
+    }
+
+    if (!s->ct1_start_us) {
+        s->ct1_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        trace_bcm2835_v3d_thread_start(thread, s->ct_ca[thread],
+                                      s->ct_ea[thread]);
+    }
+    qemu_bh_schedule(s->ct1_bh);
+}
+
+static void bcm2835_v3d_ct1_bh(void *opaque)
+{
+    BCM2835V3DState *s = opaque;
+    int64_t slice_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int64_t now_us;
+
+    bcm2835_v3d_run_thread_body(s, 1, true);
+    now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    trace_bcm2835_v3d_thread_slice(1, now_us - slice_start_us);
+
+    if (s->ct_waiting[1] || (s->ct_cs[1] & V3D_CS_CTRUN)) {
+        if (s->ct_waiting[1]) {
+            trace_bcm2835_v3d_thread_end(1, s->ct_ca[1], s->ct_cs[1],
+                                         now_us - s->ct1_start_us);
+            s->ct1_start_us = 0;
+        } else {
+            /* shortcut: ordinary tile stores yield promptly; split dense tiles if needed. */
+            qemu_bh_schedule(s->ct1_bh);
+        }
+        return;
+    }
+
+    trace_bcm2835_v3d_thread_end(1, s->ct_ca[1], s->ct_cs[1],
+                                 now_us - s->ct1_start_us);
+    s->ct1_start_us = 0;
 }
 
 static void bcm2835_v3d_resume_binner_if_ready(BCM2835V3DState *s)
@@ -2577,6 +3553,10 @@ static void bcm2835_v3d_write_thread_cs(BCM2835V3DState *s,
     bool resume = false;
 
     if (value & V3D_CS_CTRSTA) {
+        if (thread == 1) {
+            qemu_bh_cancel(s->ct1_bh);
+            s->ct1_start_us = 0;
+        }
         s->ct_cs[thread] = 0;
         s->ct_return_depth[thread] = 0;
         s->ct_waiting[thread] = false;
@@ -2604,7 +3584,7 @@ static void bcm2835_v3d_write_thread_cs(BCM2835V3DState *s,
                        (value & V3D_CS_CTMODE);
     bcm2835_v3d_update_semaphore(s, thread);
     if (resume) {
-        bcm2835_v3d_run_thread(s, thread);
+        bcm2835_v3d_start_thread(s, thread);
     }
 }
 
@@ -2616,7 +3596,7 @@ static void bcm2835_v3d_write_thread_ea(BCM2835V3DState *s,
         s->ct_ca[thread] != s->ct_ea[thread]) {
         s->ct_cs[thread] &= ~V3D_CS_CTERR;
         s->ct_cs[thread] |= V3D_CS_CTRUN;
-        bcm2835_v3d_run_thread(s, thread);
+        bcm2835_v3d_start_thread(s, thread);
     }
 }
 
@@ -2729,6 +3709,11 @@ static void bcm2835_v3d_reset(DeviceState *dev)
 {
     BCM2835V3DState *s = BCM2835_V3D(dev);
 
+    if (s->ct1_bh) {
+        qemu_bh_cancel(s->ct1_bh);
+    }
+    bcm2835_v3d_wgpu_batch_free(s);
+    s->ct1_start_us = 0;
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->ct_cs, 0, sizeof(s->ct_cs));
     memset(s->ct_ca, 0, sizeof(s->ct_ca));
@@ -2814,6 +3799,7 @@ static void bcm2835_v3d_realize(DeviceState *dev, Error **errp)
         s->wgpu_verify = verify && *verify;
     }
 #endif
+    s->ct1_bh = qemu_bh_new(bcm2835_v3d_ct1_bh, s);
     bcm2835_v3d_reset(dev);
 }
 
@@ -2821,6 +3807,12 @@ static void bcm2835_v3d_unrealize(DeviceState *dev)
 {
     BCM2835V3DState *s = BCM2835_V3D(dev);
 
+    if (s->ct1_bh) {
+        qemu_bh_cancel(s->ct1_bh);
+        qemu_bh_delete(s->ct1_bh);
+        s->ct1_bh = NULL;
+    }
+    bcm2835_v3d_wgpu_batch_free(s);
 #ifdef CONFIG_V3D_WGPU
     bcm2835_v3d_wgpu_free(s->wgpu_context);
     s->wgpu_context = NULL;
@@ -2883,6 +3875,9 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
         s->bin_spilluse = false;
     }
     bcm2835_v3d_update_irq(s);
+    if ((s->ct_cs[1] & V3D_CS_CTRUN) && !s->ct_waiting[1]) {
+        bcm2835_v3d_start_thread(s, 1);
+    }
     return 0;
 }
 

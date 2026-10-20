@@ -1001,11 +1001,17 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 
 - (void) mouseMoved:(NSEvent *)event
 {
+    if (isAbsoluteEnabled && !isMouseGrabbed) {
+        [self grabMouse];
+    }
     [self handleMouseEvent:event];
 }
 
 - (void) mouseDown:(NSEvent *)event
 {
+    if (isAbsoluteEnabled && !isMouseGrabbed) {
+        [self grabMouse];
+    }
     [self handleMouseEvent:event button:INPUT_BUTTON_LEFT down:true];
 }
 

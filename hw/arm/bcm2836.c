@@ -16,7 +16,14 @@
 #include "hw/arm/raspi_platform.h"
 #include "hw/core/sysbus.h"
 #include "target/arm/cpu-qom.h"
+#include "target/arm/hvf_arm.h"
 #include "target/arm/gtimer.h"
+
+static bool bcm283x_use_hvf_host_cpu(BCM283XBaseClass *bc)
+{
+    return hvf_enabled() &&
+           !strcmp(bc->cpu_type, ARM_CPU_TYPE_NAME("cortex-a53"));
+}
 
 static const Property bcm2836_enabled_cores_property =
     DEFINE_PROP_UINT32("enabled-cpus", BCM283XBaseState, enabled_cpus, 0);
@@ -59,10 +66,13 @@ bool bcm283x_common_realize(DeviceState *dev, BCMSocPeripheralBaseState *ps,
     BCM283XBaseState *s = BCM283X_BASE(dev);
     BCM283XBaseClass *bc = BCM283X_BASE_GET_CLASS(dev);
     Object *obj;
+    /* This SoC creates its CPUs directly, so -cpu host cannot select them. */
+    const char *cpu_type = bcm283x_use_hvf_host_cpu(bc) ?
+                           ARM_CPU_TYPE_NAME("host") : bc->cpu_type;
 
     for (int n = 0; n < bc->core_count; n++) {
         object_initialize_child(OBJECT(dev), "cpu[*]", &s->cpu[n].core,
-                                bc->cpu_type);
+                                cpu_type);
     }
 
     /* common peripherals from bcm2835 */
@@ -111,6 +121,8 @@ static void bcm2836_realize(DeviceState *dev, Error **errp)
     BCM283XBaseClass *bc = BCM283X_BASE_GET_CLASS(dev);
     BCMSocPeripheralBaseState *ps_base
         = BCM_SOC_PERIPHERALS_BASE(&s->peripherals);
+    bool hvf_host_cpu = bcm283x_use_hvf_host_cpu(bc);
+    bool hvf_has_el2 = hvf_host_cpu && hvf_arm_el2_supported();
 
     if (!bcm283x_common_realize(dev, ps_base, errp)) {
         return;
@@ -133,13 +145,21 @@ static void bcm2836_realize(DeviceState *dev, Error **errp)
                                 (bc->clusterid << 8) | n, &error_abort);
 
         /* set periphbase/CBAR value for CPU-local registers */
-        object_property_set_int(OBJECT(&s_base->cpu[n].core), "reset-cbar",
-                                bc->peri_base, &error_abort);
+        if (object_property_find(OBJECT(&s_base->cpu[n].core), "reset-cbar")) {
+            object_property_set_int(OBJECT(&s_base->cpu[n].core), "reset-cbar",
+                                    bc->peri_base, &error_abort);
+        }
 
         /* start powered off if not enabled */
         object_property_set_bool(OBJECT(&s_base->cpu[n].core),
                                  "start-powered-off",
                                  n >= s_base->enabled_cpus, &error_abort);
+
+        if (hvf_host_cpu) {
+            /* Apple hosts have no EL3; expose EL2 only when HVF can run it. */
+            s_base->cpu[n].core.has_el3 = false;
+            s_base->cpu[n].core.has_el2 = hvf_has_el2;
+        }
 
         if (!qdev_realize(DEVICE(&s_base->cpu[n].core), NULL, errp)) {
             return;

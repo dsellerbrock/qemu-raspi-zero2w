@@ -16,6 +16,8 @@
 #include "hw/char/pl011.h"
 #include "hw/char/bcm2835_aux.h"
 #include "hw/display/bcm2835_fb.h"
+#include "hw/display/bcm2835_hvs.h"
+#include "hw/display/bcm2835_pixelvalve.h"
 #include "hw/dma/bcm2835_dma.h"
 #include "hw/core/or-irq.h"
 #include "hw/intc/bcm2835_ic.h"
@@ -78,8 +80,9 @@ struct BCMSocPeripheralBaseState {
     BCM2835OTPState otp;
     UnimplementedDeviceState dbus;
     UnimplementedDeviceState ave0;
-    UnimplementedDeviceState hvs;
-    UnimplementedDeviceState pixv[3];
+    BCM2835HVSState hvs;
+    UnimplementedDeviceState pixv[2];
+    BCM2835PixelValveState pixv2;
     UnimplementedDeviceState hdmi0;
     UnimplementedDeviceState hdmi0_hd;
     BCM2835V3DState v3d;

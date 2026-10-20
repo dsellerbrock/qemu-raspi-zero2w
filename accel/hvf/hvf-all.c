@@ -77,9 +77,23 @@ static void do_hv_vm_protect(hwaddr start, size_t size,
     assert_hvf_ok(ret);
 }
 
-void hvf_protect_clean_range(hwaddr addr, size_t size)
+static void hvf_protect_section(MemoryRegionSection *section,
+                                hv_memory_flags_t flags)
 {
-    do_hv_vm_protect(addr, size, HV_MEMORY_READ | HV_MEMORY_EXEC);
+    uint64_t page_size = qemu_real_host_page_size();
+    hwaddr start = section->offset_within_address_space;
+    hwaddr end = start + int128_get64(section->size);
+    hwaddr slot_start = start - section->offset_within_region;
+    hwaddr slot_end = slot_start + memory_region_size(section->mr);
+
+    /* Dirty logging can cover a partial framebuffer page; HVF protects host pages. */
+    start = MAX(QEMU_ALIGN_DOWN(start, page_size),
+                QEMU_ALIGN_UP(slot_start, page_size));
+    end = MIN(QEMU_ALIGN_UP(end, page_size),
+              QEMU_ALIGN_DOWN(slot_end, page_size));
+    if (start < end) {
+        do_hv_vm_protect(start, end - start, flags);
+    }
 }
 
 void hvf_unprotect_dirty_range(hwaddr addr, size_t size)
@@ -140,8 +154,7 @@ static void hvf_log_start(MemoryListener *listener,
 {
     assert(new != 0);
     if (old == 0) {
-        hvf_protect_clean_range(section->offset_within_address_space,
-                                int128_get64(section->size));
+        hvf_protect_section(section, HV_MEMORY_READ | HV_MEMORY_EXEC);
     }
 }
 
@@ -150,8 +163,8 @@ static void hvf_log_stop(MemoryListener *listener,
 {
     assert(old != 0);
     if (new == 0) {
-        hvf_unprotect_dirty_range(section->offset_within_address_space,
-                                  int128_get64(section->size));
+        hvf_protect_section(section, HV_MEMORY_READ | HV_MEMORY_WRITE |
+                                    HV_MEMORY_EXEC);
     }
 }
 
@@ -163,8 +176,7 @@ static void hvf_log_clear(MemoryListener *listener,
      * Some number of those pages may have been dirtied and
      * the write permission enabled.  Reset the range read-only.
      */
-    hvf_protect_clean_range(section->offset_within_address_space,
-                            int128_get64(section->size));
+    hvf_protect_section(section, HV_MEMORY_READ | HV_MEMORY_EXEC);
 }
 
 static void hvf_region_add(MemoryListener *listener,

@@ -125,6 +125,11 @@ static void raspi_peripherals_base_init(Object *obj)
     object_property_add_const_link(OBJECT(&s->fb), "dma-mr",
                                    OBJECT(&s->gpu_bus_mr));
 
+    object_initialize_child(obj, "hvs", &s->hvs, TYPE_BCM2835_HVS);
+    s->hvs.fb = &s->fb;
+    object_initialize_child(obj, "pixelvalve2", &s->pixv2,
+                            TYPE_BCM2835_PIXELVALVE);
+
     /* OTP */
     object_initialize_child(obj, "bcm2835-otp", &s->otp,
                             TYPE_BCM2835_OTP);
@@ -469,6 +474,10 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    qdev_connect_gpio_out_named(DEVICE(&s->sdhost), "dreq", 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->dma),
+                                                       "dreq", 0));
+
     memory_region_add_subregion(&s->peri_mr, DMA_OFFSET,
                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->dma), 0));
     memory_region_add_subregion(&s->peri_mr, DMA15_OFFSET,
@@ -554,16 +563,26 @@ void bcm_soc_peripherals_common_realize(DeviceState *dev, Error **errp)
     create_unimp(s, &s->bscsl, "bcm2835-spis", BSC_SL_OFFSET, 0x100);
     create_unimp(s, &s->dbus, "bcm2835-dbus", DBUS_OFFSET, 0x8000);
     create_unimp(s, &s->ave0, "bcm2835-ave0", AVE0_OFFSET, 0x8000);
-    /* Keep unsupported VC4 display blocks mapped so Linux fails cleanly
-     * instead of taking an external abort while probing the DRM master.
-    */
-    create_unimp(s, &s->hvs, "bcm2835-hvs", HVS_OFFSET, 0x6000);
+    /* HVS and PixelValve 2 are modeled; keep the remaining VC4 blocks mapped
+     * so Linux fails cleanly instead of taking an external abort.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->hvs), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_mr, HVS_OFFSET,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->hvs), 0));
     create_unimp(s, &s->pixv[0], "bcm2835-pixelvalve0",
                  PIXV0_OFFSET, 0x100);
     create_unimp(s, &s->pixv[1], "bcm2835-pixelvalve1",
                  PIXV1_OFFSET, 0x100);
-    create_unimp(s, &s->pixv[2], "bcm2835-pixelvalve2",
-                 PIXV2_OFFSET, 0x100);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pixv2), errp)) {
+        return;
+    }
+    memory_region_add_subregion(&s->peri_mr, PIXV2_OFFSET,
+                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pixv2), 0));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->pixv2), 0,
+        qdev_get_gpio_in_named(DEVICE(&s->ic), BCM2835_IC_GPU_IRQ,
+                               INTERRUPT_PIXELVALVE2));
     /* HDMI0's core window overlaps the broad DBUS stub. */
     create_unimp_with_priority(s, &s->hdmi0, "bcm2835-hdmi0",
                                HDMI0_OFFSET, 0x600, 0);

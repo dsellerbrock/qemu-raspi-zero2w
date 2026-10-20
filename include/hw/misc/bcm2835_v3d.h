@@ -8,6 +8,7 @@
 #define HW_MISC_BCM2835_V3D_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/main-loop.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_V3D "bcm2835_v3d"
@@ -22,7 +23,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835V3DState, BCM2835_V3D)
 struct BCM2835V3DState {
     SysBusDevice parent_obj;
 
+    QEMUBH *ct1_bh;
+    int64_t ct1_start_us;
     void *wgpu_context;
+    void *wgpu_batch;
     bool wgpu_verify;
     MemoryRegion iomem;
     MemoryRegion *dma_mr;

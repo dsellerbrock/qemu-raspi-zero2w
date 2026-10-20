@@ -6,6 +6,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
+#include "hw/arm/raspi_platform.h"
 
 #define GPIO_BASE       0x3f200000
 #define GPIO_LEV0       (GPIO_BASE + 0x34)
@@ -26,6 +27,22 @@
 #define BSC_S_ERR       (1U << 8)
 #define BSC_S_TA        (1U << 0)
 #define BSC_S_DONE      (1U << 1)
+
+#define HVS_BASE         0x3f400000
+#define HVS_DLIST_START  0x2000
+#define HVS_GLOBAL_EN    (1U << 31)
+#define HVS_CHANNEL_EN   (1U << 31)
+
+#define PIXELVALVE2_BASE  0x3f807000
+#define PV_CONTROL        (PIXELVALVE2_BASE + 0x00)
+#define PV_V_CONTROL      (PIXELVALVE2_BASE + 0x04)
+#define PV_INTEN          (PIXELVALVE2_BASE + 0x24)
+#define PV_INTSTAT        (PIXELVALVE2_BASE + 0x28)
+#define PV_INT_VFP_START  (1U << 7)
+#define IRQ_BASE          0x3f00b200
+#define IRQ_PENDING_2     (IRQ_BASE + 0x08)
+#define IRQ_ENABLE_2      (IRQ_BASE + 0x14)
+#define PV2_IRQ_BIT       (1U << (INTERRUPT_PIXELVALVE2 - 32))
 
 static void test_hdmi_hpd_and_edid(void)
 {
@@ -62,12 +79,74 @@ static void test_hdmi_hpd_and_edid(void)
     g_assert_cmphex(checksum & 0xff, ==, 0);
 }
 
+static void test_hvs_display_list_ram(void)
+{
+    const uint32_t word = 0x12345678;
+
+    writel(HVS_BASE + HVS_DLIST_START, word);
+    g_assert_cmphex(readl(HVS_BASE + HVS_DLIST_START), ==, word);
+}
+
+static void test_hvs_primary_plane(void)
+{
+    uint32_t pixels[4] = { 0xff0000ff, 0xff00ff00, 0xffff0000, 0xffffffff };
+    uint32_t dlist[8] = {
+        (1U << 30) | (7U << 24) | (1U << 4) | 7,
+        0,
+        (2U << 16) | 2,
+        0xc0c0c0c0,
+        0xc0100000,
+        0xc0c0c0c0,
+        8,
+        1U << 31,
+    };
+    unsigned i;
+
+    qtest_memwrite(global_qtest, 0x00100000, pixels, sizeof(pixels));
+    for (i = 0; i < ARRAY_SIZE(dlist); i++) {
+        writel(HVS_BASE + HVS_DLIST_START + (32 + i) * sizeof(uint32_t),
+               dlist[i]);
+    }
+    writel(HVS_BASE, HVS_GLOBAL_EN);
+    writel(HVS_BASE + 0x28, 32);
+    writel(HVS_BASE + 0x60, HVS_CHANNEL_EN | (2U << 12) | 2);
+
+    g_assert_cmphex(readl(HVS_BASE + 0x38), ==, 32);
+    g_assert_cmphex(readl(HVS_BASE + 0x68) >> 30, ==, 2);
+}
+
+static void test_pixelvalve_vblank_irq(void)
+{
+    writel(IRQ_ENABLE_2, PV2_IRQ_BIT);
+    writel(PV_INTEN, PV_INT_VFP_START);
+    writel(PV_CONTROL, 1);
+    writel(PV_V_CONTROL, 1);
+
+    clock_step(20 * 1000 * 1000);
+    g_assert_cmphex(readl(PV_INTSTAT) & PV_INT_VFP_START, !=, 0);
+    g_assert_cmphex(readl(IRQ_PENDING_2) & PV2_IRQ_BIT, !=, 0);
+
+    writel(PV_INTSTAT, PV_INT_VFP_START);
+    g_assert_cmphex(readl(PV_INTSTAT) & PV_INT_VFP_START, ==, 0);
+    g_assert_cmphex(readl(IRQ_PENDING_2) & PV2_IRQ_BIT, ==, 0);
+
+    clock_step(20 * 1000 * 1000);
+    g_assert_cmphex(readl(PV_INTSTAT) & PV_INT_VFP_START, !=, 0);
+    g_assert_cmphex(readl(IRQ_PENDING_2) & PV2_IRQ_BIT, !=, 0);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
 
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/bcm2835/display/hpd_and_edid", test_hdmi_hpd_and_edid);
+    qtest_add_func("/bcm2835/display/hvs_display_list_ram",
+                   test_hvs_display_list_ram);
+    qtest_add_func("/bcm2835/display/hvs_primary_plane",
+                   test_hvs_primary_plane);
+    qtest_add_func("/bcm2835/display/pixelvalve_vblank_irq",
+                   test_pixelvalve_vblank_irq);
     qtest_start("-machine raspi3ap -smp 4");
     ret = g_test_run();
     qtest_end();

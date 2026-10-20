@@ -1307,7 +1307,7 @@ void hvf_arch_vcpu_destroy(CPUState *cpu)
     }
 }
 
-static bool hvf_arm_el2_supported(void)
+bool hvf_arm_el2_supported(void)
 {
     bool is_nested_virt_supported;
     if (__builtin_available(macOS 15.0, *)) {
@@ -2218,6 +2218,7 @@ static void hvf_wfi_timer_cb(void *opaque)
      * The interrupt delivery chain (GIC -> cpu_interrupt ->
      * qemu_cpu_kick) wakes the vCPU thread from halt_cond.
      */
+    trace_hvf_vtimer_irq(cpu->cpu_index, arm_cpu->env.pc);
     qemu_set_irq(arm_cpu->gt_timer_outputs[GTIMER_VIRT], 1);
     cpu->accel->vtimer_masked = true;
 }
@@ -2487,6 +2488,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         }
         break;
     case EC_AA64_HVC:
+        trace_hvf_hvc(env->pc, env->xregs[0]);
         cpu_synchronize_state(cpu);
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_HVC) {
             /* Do NOT advance $pc for HVC */
@@ -2501,6 +2503,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
         }
         break;
     case EC_AA64_SMC:
+        trace_hvf_smc(env->pc, env->xregs[0]);
         cpu_synchronize_state(cpu);
         if (arm_cpu->psci_conduit == QEMU_PSCI_CONDUIT_SMC) {
             /* Secure Monitor Call exception, we need to advance $pc */
@@ -2569,6 +2572,7 @@ static int hvf_handle_vmexit(CPUState *cpu, hv_vcpu_exit_t *exit)
         break;
     case HV_EXIT_REASON_VTIMER_ACTIVATED:
         assert(!hvf_irqchip_in_kernel());
+        trace_hvf_vtimer_irq(cpu->cpu_index, arm_cpu->env.pc);
         qemu_set_irq(arm_cpu->gt_timer_outputs[GTIMER_VIRT], 1);
         cpu->accel->vtimer_masked = true;
         break;

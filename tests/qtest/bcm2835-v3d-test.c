@@ -70,17 +70,20 @@ typedef struct QPUTestTexture {
     unsigned memory_reads;
 } QPUTestTexture;
 
-typedef struct QPUTestTextureFilter {
-    unsigned calls;
-    uint16_t lanes;
-    BCM2835V3DQPUTMUSample first;
-} QPUTestTextureFilter;
-
 typedef struct QPUTestVarying {
     uint32_t partial[BCM2835_V3D_QPU_LANES];
     uint32_t c[BCM2835_V3D_QPU_LANES];
     unsigned reads;
 } QPUTestVarying;
+
+typedef struct QPUTestCapturedShader {
+    uint32_t uniforms[8];
+    uint32_t varying[2][BCM2835_V3D_QPU_LANES];
+    uint32_t texels[4];
+    uint32_t texture_base;
+    unsigned uniform_reads;
+    unsigned texture_reads;
+} QPUTestCapturedShader;
 
 static bool qpu_test_read_uniform(void *opaque, uint32_t address,
                                   uint32_t *value)
@@ -140,33 +143,16 @@ static bool qpu_test_read_texture(void *opaque, uint32_t base,
     QPUTestTexture *texture = opaque;
 
     if (base != texture->memory_base || width != height ||
-        (width != 2 && width != 32) || x >= width || y >= height ||
+        (width != 2 && width != 24 && width != 32) ||
+        x >= width || y >= height ||
         memory_format > 2 ||
-        (memory_format && memory_format != (width < 32 ? 2 : 1))) {
+        (memory_format && memory_format != (width <= 16 ? 2 : 1))) {
         return false;
     }
     texture->memory_format = memory_format;
     *value = texture->texels[(y >= height / 2 ? 2 : 0) +
                              (x >= width / 2 ? 1 : 0)];
     texture->memory_reads++;
-    return true;
-}
-
-static bool qpu_test_filter_texture(
-    void *opaque, const BCM2835V3DQPUTMUSample samples[BCM2835_V3D_QPU_LANES],
-    uint16_t lanes, const uint32_t software_result[BCM2835_V3D_QPU_LANES],
-    uint32_t result[BCM2835_V3D_QPU_LANES])
-{
-    QPUTestTextureFilter *filter = opaque;
-
-    if (!software_result) {
-        return false;
-    }
-    filter->calls++;
-    filter->lanes = lanes;
-    filter->first = samples[0];
-    memcpy(result, software_result,
-           BCM2835_V3D_QPU_LANES * sizeof(result[0]));
     return true;
 }
 
@@ -190,6 +176,361 @@ static bool qpu_test_read_varying(void *opaque, unsigned index,
     memcpy(partial, varying->partial, sizeof(varying->partial));
     memcpy(c, varying->c, sizeof(varying->c));
     varying->reads++;
+    return true;
+}
+
+static bool qpu_test_read_captured_uniform(void *opaque, uint32_t address,
+                                           uint32_t *value)
+{
+    QPUTestCapturedShader *shader = opaque;
+    uint32_t offset;
+
+    if (address < 0x1000) {
+        return false;
+    }
+    offset = address - 0x1000;
+    if (offset >= sizeof(shader->uniforms) || offset % sizeof(uint32_t)) {
+        return false;
+    }
+    *value = shader->uniforms[offset / sizeof(uint32_t)];
+    shader->uniform_reads++;
+    return true;
+}
+
+static bool qpu_test_read_captured_texture(void *opaque, uint32_t base,
+                                           unsigned memory_format,
+                                           unsigned width, unsigned height,
+                                           unsigned x, unsigned y,
+                                           uint32_t *value)
+{
+    QPUTestCapturedShader *shader = opaque;
+
+    if (base != shader->texture_base || memory_format != 2 ||
+        width != 2 || height != 2 || x >= width || y >= height) {
+        return false;
+    }
+    *value = shader->texels[y * width + x];
+    shader->texture_reads++;
+    return true;
+}
+
+static bool qpu_test_read_captured_varying(
+    void *opaque, unsigned index,
+    uint32_t partial[BCM2835_V3D_QPU_LANES],
+    uint32_t c[BCM2835_V3D_QPU_LANES])
+{
+    QPUTestCapturedShader *shader = opaque;
+
+    if (index >= G_N_ELEMENTS(shader->varying)) {
+        return false;
+    }
+    memcpy(partial, shader->varying[index], sizeof(shader->varying[index]));
+    memset(c, 0, BCM2835_V3D_QPU_LANES * sizeof(*c));
+    return true;
+}
+
+static const char captured_labwc_tmu0_opaque[] =
+    "3e303e20e04900107e313e21e148021040739e01a708026080749e15671e0210c0769e15271e021000709e00e70900a000799e04e70802191b799e842248421b00799e846248521d09709e80e24960113f009e80e24970d180749e15a70b021000709e00e7090030";
+
+static void append_tile_buffer_packet(uint8_t *buffer, size_t *offset,
+                                      uint8_t opcode, uint32_t address,
+                                      unsigned memory_format,
+                                      unsigned color_format);
+
+static void append_ct1_tmu0_blend_triangle(uint8_t *cl, size_t *cl_size)
+{
+    cl[(*cl_size)++] = 129;
+    append_u32(cl, cl_size, 0xfe00fe00);
+    append_u32(cl, cl_size, 0xfe000200);
+    append_u32(cl, cl_size, 0x0200fe00);
+    for (unsigned i = 0; i < 6; i++) {
+        append_u32(cl, cl_size, qpu_test_float_bits(0.25f));
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        append_u32(cl, cl_size, qpu_test_float_bits(1.0f));
+    }
+}
+
+static void test_v3d_ct1_wgpu_batches_tmu0_blend_shader(void)
+{
+    enum {
+        TILES_X = 20,
+        TILES_Y = 13,
+        WIDTH = TILES_X * 64,
+        HEIGHT = TILES_Y * 64,
+        RENDER_BASE = 0x01000000,
+    };
+    static const uint64_t program[] = {
+        UINT64_C(0x100049e0203e303e), UINT64_C(0x100248e1213e317e),
+        UINT64_C(0x600208a7019e7340), UINT64_C(0x10021e67159e7480),
+        UINT64_C(0x10021e27159e76c0), UINT64_C(0xa00009e7009e7000),
+        UINT64_C(0x1d020867049e7900), UINT64_C(0x1b6258002482790e),
+        UINT64_C(0x195258c024827906), UINT64_C(0x114059c02082701e),
+        UINT64_C(0x1f0049e220827026), UINT64_C(0x113049e3809e7012),
+        UINT64_C(0xd17059c0809e003f), UINT64_C(0x10020827179e76c0),
+        UINT64_C(0x800009e7009e7000), UINT64_C(0x100049e1609e7020),
+        UINT64_C(0x100059eec0027031), UINT64_C(0x300009e7009e7000),
+    };
+    uint8_t *cl = g_new(uint8_t, 128 + TILES_X * TILES_Y * 128);
+    uint8_t record[44] = { 0 };
+    uint8_t code[sizeof(program)];
+    uint32_t uniforms[] = {
+        0x4000, (2U << 20) | (2U << 8) | (1U << 7) |
+                (1U << 4) | (1U << 2) | 1U,
+        0x3f800000, 0x3f800000, 0x00000000, 0x3f800000,
+    };
+    uint32_t texels[] = {
+        0x10203040, 0x50607080, 0x90a0b0c0, 0xd0e0f000,
+    };
+    size_t cl_size = 0;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(program); i++) {
+        stq_le_p(code + i * sizeof(uint64_t), program[i]);
+    }
+    record[3] = 2;
+    stl_le_p(record + 4, 0x5000);
+    stl_le_p(record + 8, 0x6000);
+    memwrite(0x34000, record, sizeof(record));
+    memwrite(0x5000, code, sizeof(code));
+    memwrite(0x6000, uniforms, sizeof(uniforms));
+    memwrite(0x4000, texels, sizeof(texels));
+
+    cl[cl_size++] = 113;
+    append_u32(cl, &cl_size, RENDER_BASE);
+    append_u16(cl, &cl_size, WIDTH);
+    append_u16(cl, &cl_size, HEIGHT);
+    append_u16(cl, &cl_size, V3D_FORMAT_RGBA8888 << 2);
+    cl[cl_size++] = 114;
+    append_u32(cl, &cl_size, 0xff000000);
+    append_u32(cl, &cl_size, 0);
+    append_u32(cl, &cl_size, 0);
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 64;
+    append_u32(cl, &cl_size, 0x34001);
+    for (unsigned tile = 0; tile < TILES_X * TILES_Y; tile++) {
+        cl[cl_size++] = 115;
+        cl[cl_size++] = tile % TILES_X;
+        cl[cl_size++] = tile / TILES_X;
+        cl[cl_size++] = 103;
+        append_u16(cl, &cl_size, (tile % TILES_X * 64 + 32) * 16);
+        append_u16(cl, &cl_size, (tile / TILES_X * 64 + 32) * 16);
+        cl[cl_size++] = 56;
+        cl[cl_size++] = 0x32;
+        cl[cl_size++] = 48;
+        append_ct1_tmu0_blend_triangle(cl, &cl_size);
+        if (tile == 0) {
+            /* Force an ordered overlap to exercise the batch flush boundary. */
+            append_ct1_tmu0_blend_triangle(cl, &cl_size);
+        }
+        cl[cl_size++] = 128;
+        append_tile_buffer_packet(cl, &cl_size, 28, RENDER_BASE, 0, 0);
+        if (tile == 2) {
+            append_tile_buffer_packet(cl, &cl_size, 29, RENDER_BASE, 0, 0);
+            cl[cl_size++] = 115;
+            cl[cl_size++] = 0;
+            cl[cl_size++] = 0;
+            cl[cl_size++] = 103;
+            append_u16(cl, &cl_size, 32 * 16);
+            append_u16(cl, &cl_size, 32 * 16);
+            cl[cl_size++] = 56;
+            cl[cl_size++] = 0x32;
+            cl[cl_size++] = 48;
+            append_ct1_tmu0_blend_triangle(cl, &cl_size);
+            cl[cl_size++] = 128;
+            append_tile_buffer_packet(cl, &cl_size, 28, RENDER_BASE, 0, 0);
+        }
+    }
+    cl[cl_size++] = 0;
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+    for (unsigned retries = 0;
+         retries < 5000 &&
+         (readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTRUN);
+         retries++) {
+        g_usleep(1000);
+    }
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) &
+                    (V3D_CTRUN | V3D_CTERR), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CA), ==,
+                    CL_ADDR + cl_size);
+
+    size_t frame_size = (size_t)WIDTH * HEIGHT * sizeof(uint32_t);
+    g_autofree uint8_t *frame = g_malloc(frame_size);
+    g_autofree gchar *digest = NULL;
+
+    memread(RENDER_BASE, frame, frame_size);
+    digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, frame, frame_size);
+    g_test_message("TMU0 blend frame SHA-256: %s", digest);
+    g_assert_cmpstr(digest, ==,
+                    "89283327c0894aca74c2fd7403f8b5dfc7fc91ee3f8369f8f13c7c4dc94efdf5");
+    g_free(cl);
+}
+
+static void test_v3d_qpu_captured_labwc_shaders(void)
+{
+    static const char *programs[] = {
+        captured_labwc_tmu0_opaque,
+        "3e303e20e04900107e313e21e148021040739e01a708026080749e15671e0210c0769e15271e021000709e00e70900a000799e046708021d0e7982242148621b06798224e14852191e708220e14940113f009e80e14970d140729e15a70b021000709e00e7090030",
+        "3e303e20e04900107e313e21e148021040739e01a708026080749e15671e0210c0769e15271e021000709e00e70900a000799e046708021d0e7982240058621b06798224c05852191e708220c059401126708220e249001f12709e80e34930113f009e80c05970d1c0769e172708021000709e00e709008020709e60e1490010317002c0ee59001000709e00e7090030",
+    };
+    static const unsigned expected_uniform_reads[] = { 2, 5, 6 };
+    static const uint32_t expected_colors[] = {
+        0xff203040, 0xff203000, 0xff5b8977,
+    };
+    QPUTestCapturedShader shader = {
+        .uniforms = {
+            0x4000, (2U << 20) | (2U << 8) | (1U << 7) |
+                    (1U << 4) | (1U << 2) | 1U,
+            0x3f800000, 0x3f800000, 0x00000000, 0x3f800000,
+        },
+        .texels = { 0x10203040, 0x50607080, 0x90a0b0c0, 0xd0e0f000 },
+        .texture_base = 0x4000,
+    };
+
+    for (unsigned program = 0; program < G_N_ELEMENTS(programs); program++) {
+        uint8_t code[18 * sizeof(uint64_t)];
+        BCM2835V3DQPUState qpu;
+        uint32_t executed;
+        BCM2835V3DQPUResult result;
+        size_t code_size = strlen(programs[program]) / 2;
+
+        g_assert_cmpuint(code_size, <=, sizeof(code));
+        for (unsigned i = 0; i < code_size; i++) {
+            unsigned byte;
+
+            g_assert_cmpint(sscanf(programs[program] + i * 2, "%2x",
+                                   &byte), ==, 1);
+            code[i] = byte;
+        }
+        shader.uniform_reads = 0;
+        shader.texture_reads = 0;
+        bcm2835_v3d_qpu_init(&qpu);
+        qpu.fragment_shader = true;
+        qpu.uniform_address = 0x1000;
+        qpu.read_uniform = qpu_test_read_captured_uniform;
+        qpu.uniform_opaque = &shader;
+        qpu.read_texture = qpu_test_read_captured_texture;
+        qpu.texture_opaque = &shader;
+        qpu.read_varying = qpu_test_read_captured_varying;
+        qpu.varying_opaque = &shader;
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            float s = (lane & 1) ? 0.75f : 0.25f;
+            float t = (lane & 2) ? 0.75f : 0.25f;
+
+            qpu.fragment_w[lane] = qpu_test_float_bits(1.0f);
+            shader.varying[0][lane] = qpu_test_float_bits(s);
+            shader.varying[1][lane] = qpu_test_float_bits(t);
+            qpu.io[45][lane] = 0x20406080;
+        }
+        result = bcm2835_v3d_qpu_run_until_tmu0(code, code_size, 16,
+                                                &qpu, &executed);
+        g_assert_cmpint(result, ==, BCM2835_V3D_QPU_TMU0_LOADED);
+        g_assert_cmpuint(qpu.pc, ==, 6);
+        g_assert_cmpuint(shader.uniform_reads, ==, 2);
+        g_assert_cmpuint(shader.texture_reads, ==,
+                         BCM2835_V3D_QPU_LANES);
+        g_assert_cmphex(qpu.acc[4][0], ==, shader.texels[0]);
+
+        if (program < 2) {
+            BCM2835V3DQPUState sampler;
+            uint32_t samples[BCM2835_V3D_QPU_LANES];
+            uint32_t varying_partial[2 * BCM2835_V3D_QPU_LANES];
+
+            sampler.read_texture = qpu_test_read_captured_texture;
+            sampler.texture_opaque = &shader;
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                varying_partial[lane * 2] = shader.varying[0][lane];
+                varying_partial[lane * 2 + 1] = shader.varying[1][lane];
+            }
+            shader.texture_reads = 0;
+            g_assert_true(bcm2835_v3d_qpu_sample_tmu0_batch(
+                &sampler, shader.uniforms[0], shader.uniforms[1],
+                varying_partial, qpu.fragment_w, 2,
+                BCM2835_V3D_QPU_LANES, samples));
+            g_assert_cmpuint(shader.texture_reads, ==,
+                             BCM2835_V3D_QPU_LANES);
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                g_assert_cmphex(samples[lane], ==, qpu.acc[4][lane]);
+            }
+
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                varying_partial[lane * 2] =
+                    qpu_test_float_bits(0.25f);
+                varying_partial[lane * 2 + 1] =
+                    qpu_test_float_bits(0.25f);
+            }
+            shader.texture_reads = 0;
+            g_assert_true(bcm2835_v3d_qpu_sample_tmu0_batch(
+                &sampler, shader.uniforms[0], shader.uniforms[1],
+                varying_partial, qpu.fragment_w, 2,
+                BCM2835_V3D_QPU_LANES, samples));
+            g_assert_cmpuint(shader.texture_reads, ==, 1);
+            for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+                g_assert_cmphex(samples[lane], ==, qpu.acc[4][0]);
+            }
+        }
+
+        shader.uniform_reads = 0;
+        shader.texture_reads = 0;
+        bcm2835_v3d_qpu_init(&qpu);
+        qpu.fragment_shader = true;
+        qpu.uniform_address = 0x1000;
+        qpu.read_uniform = qpu_test_read_captured_uniform;
+        qpu.uniform_opaque = &shader;
+        qpu.read_texture = qpu_test_read_captured_texture;
+        qpu.texture_opaque = &shader;
+        qpu.read_varying = qpu_test_read_captured_varying;
+        qpu.varying_opaque = &shader;
+        for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+            float s = (lane & 1) ? 0.75f : 0.25f;
+            float t = (lane & 2) ? 0.75f : 0.25f;
+
+            qpu.fragment_w[lane] = qpu_test_float_bits(1.0f);
+            shader.varying[0][lane] = qpu_test_float_bits(s);
+            shader.varying[1][lane] = qpu_test_float_bits(t);
+            qpu.io[45][lane] = 0x20406080;
+        }
+        result = bcm2835_v3d_qpu_run(code, code_size, 64, &qpu, &executed);
+        g_assert_cmpint(result, ==, BCM2835_V3D_QPU_END);
+        g_assert_cmpuint(executed, ==, code_size / sizeof(uint64_t));
+        g_assert_cmpuint(shader.uniform_reads, ==,
+                         expected_uniform_reads[program]);
+        g_assert_cmpuint(shader.texture_reads, ==,
+                         BCM2835_V3D_QPU_LANES);
+        g_assert_cmphex(qpu.io[46][0], ==,
+                        expected_colors[program]);
+    }
+}
+
+typedef struct QPUTestMemory {
+    uint32_t base;
+    uint8_t data[256];
+} QPUTestMemory;
+
+static bool qpu_test_read_vpm_dma(void *opaque, uint32_t address,
+                                  uint32_t *value)
+{
+    QPUTestMemory *memory = opaque;
+
+    if (address < memory->base || address - memory->base >
+        sizeof(memory->data) - sizeof(*value)) {
+        return false;
+    }
+    *value = ldl_le_p(memory->data + address - memory->base);
+    return true;
+}
+
+static bool qpu_test_write_vpm_dma(void *opaque, uint32_t address,
+                                   uint32_t value)
+{
+    QPUTestMemory *memory = opaque;
+
+    if (address < memory->base || address - memory->base >
+        sizeof(memory->data) - sizeof(value)) {
+        return false;
+    }
+    stl_le_p(memory->data + address - memory->base, value);
     return true;
 }
 
@@ -338,9 +679,9 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
 {
     uint8_t code[4 * sizeof(uint64_t)];
     BCM2835V3DQPUState qpu;
-    static const unsigned texture_types[] = { 16, 0, 0, 1, 0 };
-    static const unsigned dimensions[] = { 2, 2, 32, 2, 2 };
-    static const unsigned min_filters[] = { 1, 1, 1, 1, 2 };
+    static const unsigned texture_types[] = { 16, 0, 0, 0, 1, 0 };
+    static const unsigned dimensions[] = { 2, 2, 24, 32, 2, 2 };
+    static const unsigned min_filters[] = { 1, 1, 1, 1, 1, 2 };
     QPUTestTexture texture = {
         .uniform_address = 0x1000,
         .memory_base = 0x4000,
@@ -348,7 +689,6 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
             0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00,
         },
     };
-    QPUTestTextureFilter filter = { 0 };
     uint32_t executed;
 
     stq_le_p(code, qpu_test_write_tmu(57, false));
@@ -358,7 +698,7 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
     for (unsigned test = 0; test < G_N_ELEMENTS(texture_types); test++) {
         unsigned type = texture_types[test];
         unsigned size = dimensions[test];
-        unsigned memory_format = type == 16 ? 0 : size < 32 ? 2 : 1;
+        unsigned memory_format = type == 16 ? 0 : size <= 16 ? 2 : 1;
 
         texture.config[0] = texture.memory_base | ((type & 0xf) << 4);
         texture.config[1] = (type == 16 ? 1U << 31 : 0) |
@@ -415,9 +755,6 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
     qpu.memory_opaque = &texture;
     qpu.read_texture = qpu_test_read_texture;
     qpu.texture_opaque = &texture;
-    qpu.filter_texture = qpu_test_filter_texture;
-    qpu.filter_texture_opaque = &filter;
-    qpu.filter_texture_verify = true;
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.rf[0][0][lane] = qpu_test_float_bits(0.5f);
         qpu.rf[1][0][lane] = qpu_test_float_bits(0.5f);
@@ -428,16 +765,6 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
                     ==, BCM2835_V3D_QPU_END);
     g_assert_cmpuint(texture.memory_reads, ==,
                      4 * BCM2835_V3D_QPU_LANES);
-    g_assert_cmpuint(filter.calls, ==, 1);
-    g_assert_cmphex(filter.lanes, ==, UINT16_MAX);
-    g_assert_cmphex(filter.first.texel[0], ==, texture.texels[0]);
-    g_assert_cmphex(filter.first.texel[1], ==, texture.texels[1]);
-    g_assert_cmphex(filter.first.texel[2], ==, texture.texels[2]);
-    g_assert_cmphex(filter.first.texel[3], ==, texture.texels[3]);
-    g_assert_cmphex(filter.first.fraction_s, ==,
-                    qpu_test_float_bits(0.5f));
-    g_assert_cmphex(filter.first.fraction_t, ==,
-                    qpu_test_float_bits(0.5f));
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.acc[4][lane], ==, 0x77889966);
     }
@@ -1273,6 +1600,7 @@ static void test_v3d_qpu_vpm_vector_io(void)
     qpu.vpm_read_address = 2;
     qpu.vpm_read_stride = 1;
     qpu.vpm_read_remaining = 1;
+    qpu.vpm_read_size = 2;
     qpu.vpm_read_horizontal = true;
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.vpm[2][lane] = lane + 0x100;
@@ -1291,6 +1619,7 @@ static void test_v3d_qpu_vpm_vector_io(void)
     qpu.vpm_write_setup = true;
     qpu.vpm_write_address = 3;
     qpu.vpm_write_stride = 1;
+    qpu.vpm_write_size = 2;
     qpu.vpm_write_horizontal = true;
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         qpu.rf[0][0][lane] = lane * 17;
@@ -1343,6 +1672,572 @@ static void test_v3d_qpu_vpm_vertical_32bit(void)
                     ==, BCM2835_V3D_QPU_END);
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.vpm[32 + lane][3], ==, lane * 17);
+    }
+}
+
+static void test_v3d_qpu_vpm_subword_io(void)
+{
+    uint8_t code[3 * sizeof(uint64_t)];
+
+    for (unsigned size = 0; size < 2; size++) {
+        unsigned sub_bits = 2 - size;
+        unsigned sub_count = 1U << sub_bits;
+        unsigned vector_words = BCM2835_V3D_QPU_LANES / sub_count;
+        unsigned value_bits = 8U << size;
+        uint32_t value_mask = (1U << value_bits) - 1;
+
+        for (unsigned horizontal = 0; horizontal < 2; horizontal++) {
+            for (unsigned laned = 0; laned < 2; laned++) {
+                BCM2835V3DQPUState qpu;
+                unsigned sub_index = sub_count - 1;
+                unsigned base = horizontal ? 23 : (2U << 4) | 5U;
+                uint32_t address = (base << sub_bits) | sub_index;
+                uint32_t setup = (1U << 20) | (1U << 12) |
+                                 (horizontal << 11) | (laned << 10) |
+                                 (size << 8) | address;
+                uint32_t expected_vpm[BCM2835_V3D_QPU_VPM_ROWS]
+                                     [BCM2835_V3D_QPU_LANES];
+                uint32_t executed;
+
+                stq_le_p(code, qpu_test_load_imm(49, setup));
+                stq_le_p(code + 8, qpu_test_add_imm(48, 0, 0));
+                stq_le_p(code + 16, 3ULL << 60);
+                bcm2835_v3d_qpu_init(&qpu);
+                for (unsigned row = 0; row < BCM2835_V3D_QPU_VPM_ROWS;
+                     row++) {
+                    for (unsigned column = 0;
+                         column < BCM2835_V3D_QPU_LANES; column++) {
+                        qpu.vpm[row][column] =
+                            0x10203040 + (row * 16 + column) * 0x01010101;
+                    }
+                }
+
+                g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8,
+                                                     &qpu, &executed),
+                                ==, BCM2835_V3D_QPU_END);
+                g_assert_cmpuint(qpu.vpm_read_address, ==,
+                                 (address + 1) & (0xffU >> size));
+                for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES;
+                     lane++) {
+                    unsigned word = laned ? lane :
+                                    sub_index * vector_words + lane / sub_count;
+                    unsigned row = horizontal ? base :
+                                   ((base >> 4) * 16 + word);
+                    unsigned column = horizontal ? word : base & 0xf;
+                    unsigned shift = (laned ? sub_index : lane % sub_count) *
+                                     value_bits;
+                    uint32_t expected = (qpu.vpm[row][column] >> shift) &
+                                        value_mask;
+
+                    g_assert_cmphex(qpu.rf[0][0][lane], ==, expected);
+                }
+
+                stq_le_p(code, qpu_test_load_imm(49, setup) | (1ULL << 44));
+                stq_le_p(code + 8, qpu_test_add_imm(0, 48, 0) |
+                         (1ULL << 44));
+                stq_le_p(code + 16, 3ULL << 60);
+                bcm2835_v3d_qpu_init(&qpu);
+                for (unsigned row = 0; row < BCM2835_V3D_QPU_VPM_ROWS;
+                     row++) {
+                    for (unsigned column = 0;
+                         column < BCM2835_V3D_QPU_LANES; column++) {
+                        qpu.vpm[row][column] = 0xa1b2c3d4 ^ row ^ column;
+                        expected_vpm[row][column] = qpu.vpm[row][column];
+                    }
+                }
+                for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES;
+                     lane++) {
+                    unsigned word = laned ? lane :
+                                    sub_index * vector_words + lane / sub_count;
+                    unsigned row = horizontal ? base :
+                                   ((base >> 4) * 16 + word);
+                    unsigned column = horizontal ? word : base & 0xf;
+                    unsigned shift = (laned ? sub_index : lane % sub_count) *
+                                     value_bits;
+                    uint32_t field_mask = value_mask << shift;
+                    uint32_t value = value_mask - lane;
+
+                    qpu.rf[0][0][lane] = value;
+                    expected_vpm[row][column] =
+                        (expected_vpm[row][column] & ~field_mask) |
+                        (value << shift);
+                }
+
+                g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8,
+                                                     &qpu, &executed),
+                                ==, BCM2835_V3D_QPU_END);
+                g_assert_cmpuint(qpu.vpm_write_address, ==,
+                                 (address + 1) & (0xffU >> size));
+                for (unsigned row = 0; row < BCM2835_V3D_QPU_VPM_ROWS;
+                     row++) {
+                    for (unsigned column = 0;
+                         column < BCM2835_V3D_QPU_LANES; column++) {
+                        g_assert_cmphex(qpu.vpm[row][column], ==,
+                                        expected_vpm[row][column]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_single_row(void)
+{
+    uint8_t code[5 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t load_setup = (1U << 31) | (4U << 20) | (1U << 16) |
+                          (1U << 12) | (5U << 4) | 3U;
+    uint32_t store_setup = (2U << 30) | (1U << 23) | (4U << 16) |
+                           (1U << 14) | (((5U << 4) | 3U) << 3);
+
+    for (unsigned i = 0; i < 4; i++) {
+        stl_le_p(memory.data + i * sizeof(uint32_t), 0x10203040 + i);
+    }
+    stq_le_p(code, qpu_test_load_imm(49, load_setup));
+    stq_le_p(code + sizeof(uint64_t), qpu_test_load_imm(50, memory.base));
+    stq_le_p(code + 2 * sizeof(uint64_t),
+             qpu_test_load_imm(49, store_setup) | (1ULL << 44));
+    stq_le_p(code + 3 * sizeof(uint64_t),
+             qpu_test_load_imm(50, memory.base + 0x40) | (1ULL << 44));
+    stq_le_p(code + 4 * sizeof(uint64_t), 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 4; i++) {
+        g_assert_cmphex(qpu.vpm[5][3 + i], ==, 0x10203040 + i);
+        g_assert_cmphex(ldl_le_p(memory.data + 0x40 + i * sizeof(uint32_t)),
+                        ==, 0x10203040 + i);
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_2d(void)
+{
+    uint8_t code[6 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t load_setup = (1U << 31) | (1U << 24) | (3U << 20) |
+                          (2U << 16) | (1U << 12) | (5U << 4) | 3U;
+    uint32_t store_setup = (2U << 30) | (2U << 23) | (3U << 16) |
+                           (1U << 14) | (((5U << 4) | 3U) << 3);
+    uint32_t store_stride = (3U << 30) | 4U;
+
+    for (unsigned i = 0; i < 3; i++) {
+        stl_le_p(memory.data + i * sizeof(uint32_t), 0x10203040 + i);
+        stl_le_p(memory.data + 16 + i * sizeof(uint32_t), 0x50607080 + i);
+    }
+    stq_le_p(code, qpu_test_load_imm(49, load_setup));
+    stq_le_p(code + 8, qpu_test_load_imm(50, memory.base));
+    stq_le_p(code + 16, qpu_test_load_imm(49, store_setup) | (1ULL << 44));
+    stq_le_p(code + 24, qpu_test_load_imm(49, store_stride) | (1ULL << 44));
+    stq_le_p(code + 32,
+             qpu_test_load_imm(50, memory.base + 0x80) | (1ULL << 44));
+    stq_le_p(code + 40, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 3; i++) {
+        g_assert_cmphex(qpu.vpm[5][3 + i], ==, 0x10203040 + i);
+        g_assert_cmphex(qpu.vpm[6][3 + i], ==, 0x50607080 + i);
+        g_assert_cmphex(ldl_le_p(memory.data + 0x80 + i * 4), ==,
+                        0x10203040 + i);
+        g_assert_cmphex(ldl_le_p(memory.data + 0x90 + i * 4), ==,
+                        0x50607080 + i);
+    }
+
+    uint8_t extended_code[4 * sizeof(uint64_t)];
+    uint32_t extended_pitch_setup = (9U << 28) | 16U;
+    uint32_t extended_load_setup = (1U << 31) | (3U << 20) | (2U << 16) |
+                                   (1U << 12) | (5U << 4) | 3U;
+
+    stq_le_p(extended_code, qpu_test_load_imm(49, extended_pitch_setup));
+    stq_le_p(extended_code + 8,
+             qpu_test_load_imm(49, extended_load_setup));
+    stq_le_p(extended_code + 16, qpu_test_load_imm(50, memory.base));
+    stq_le_p(extended_code + 24, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(extended_code, sizeof(extended_code),
+                                        8, &qpu, &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 3; i++) {
+        g_assert_cmphex(qpu.vpm[5][3 + i], ==, 0x10203040 + i);
+        g_assert_cmphex(qpu.vpm[6][3 + i], ==, 0x50607080 + i);
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_store_blockmode(void)
+{
+    uint8_t code[4 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t store_stride = (3U << 30) | (1U << 16) | 4U;
+    uint32_t store_setup = (2U << 30) | (2U << 23) | (3U << 16) |
+                           (1U << 14) | (((5U << 4) | 14U) << 3);
+
+    stq_le_p(code, qpu_test_load_imm(49, store_stride) | (1ULL << 44));
+    stq_le_p(code + 8, qpu_test_load_imm(49, store_setup) | (1ULL << 44));
+    stq_le_p(code + 16,
+             qpu_test_load_imm(50, memory.base + 0x40) | (1ULL << 44));
+    stq_le_p(code + 24, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.memory_opaque = &memory;
+    for (unsigned i = 0; i < 6; i++) {
+        unsigned index = 5 * BCM2835_V3D_QPU_LANES + 14 + i;
+
+        qpu.vpm[index / BCM2835_V3D_QPU_LANES]
+               [index % BCM2835_V3D_QPU_LANES] = 0x10203040 + i;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 3; i++) {
+        g_assert_cmphex(ldl_le_p(memory.data + 0x40 + i * 4), ==,
+                        0x10203040 + i);
+        g_assert_cmphex(ldl_le_p(memory.data + 0x50 + i * 4), ==,
+                        0x10203040 + 3 + i);
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_vertical_32bit(void)
+{
+    uint8_t code[4 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t load_setup = (1U << 31) | (3U << 24) | (2U << 16) |
+                          (1U << 11) | 15U;
+
+    for (unsigned i = 0; i < 32; i++) {
+        stl_le_p(memory.data + i * sizeof(uint32_t), 0x10203040 + i);
+    }
+    stq_le_p(code, qpu_test_load_imm(49, load_setup));
+    stq_le_p(code + 8, qpu_test_load_imm(50, memory.base));
+    stq_le_p(code + 16, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 16; i++) {
+        g_assert_cmphex(qpu.vpm[i][15], ==, 0x10203040 + i);
+        g_assert_cmphex(qpu.vpm[16 + i][15], ==, 0x10203040 + 16 + i);
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_vertical_store_32bit(void)
+{
+    uint8_t code[4 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t store_stride = (3U << 30) | 4U;
+    uint32_t store_setup = (2U << 30) | (2U << 23) | (3U << 16) |
+                           (5U << 7) | (3U << 3);
+
+    stq_le_p(code, qpu_test_load_imm(49, store_stride) | (1ULL << 44));
+    stq_le_p(code + 8, qpu_test_load_imm(49, store_setup) | (1ULL << 44));
+    stq_le_p(code + 16,
+             qpu_test_load_imm(50, memory.base + 0x40) | (1ULL << 44));
+    stq_le_p(code + 24, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.memory_opaque = &memory;
+    for (unsigned y = 0; y < 2; y++) {
+        for (unsigned x = 0; x < 3; x++) {
+            qpu.vpm[5 + x][3 + y] = 0x10203040 + y * 3 + x;
+        }
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned y = 0; y < 2; y++) {
+        for (unsigned x = 0; x < 3; x++) {
+            g_assert_cmphex(ldl_le_p(memory.data + 0x40 + y * 0x10 + x * 4),
+                            ==, 0x10203040 + y * 3 + x);
+        }
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_vertical_store_blockmode(void)
+{
+    uint8_t code[4 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t store_stride = (3U << 30) | (1U << 16) | 4U;
+    uint32_t store_setup = (2U << 30) | (2U << 23) | (3U << 16) |
+                           (62U << 7) | (3U << 3);
+
+    stq_le_p(code, qpu_test_load_imm(49, store_stride) | (1ULL << 44));
+    stq_le_p(code + 8, qpu_test_load_imm(49, store_setup) | (1ULL << 44));
+    stq_le_p(code + 16,
+             qpu_test_load_imm(50, memory.base + 0x40) | (1ULL << 44));
+    stq_le_p(code + 24, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.memory_opaque = &memory;
+    for (unsigned i = 0; i < 6; i++) {
+        unsigned index = 3 * BCM2835_V3D_QPU_VPM_ROWS + 62 + i;
+
+        qpu.vpm[index % BCM2835_V3D_QPU_VPM_ROWS]
+               [index / BCM2835_V3D_QPU_VPM_ROWS] = 0x10203040 + i;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 3; i++) {
+        g_assert_cmphex(ldl_le_p(memory.data + 0x40 + i * 4), ==,
+                        0x10203040 + i);
+        g_assert_cmphex(ldl_le_p(memory.data + 0x50 + i * 4), ==,
+                        0x10203040 + 3 + i);
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_packed_load(void)
+{
+    uint8_t code[3 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t load_setup = (1U << 31) | (6U << 28) | (1U << 24) |
+                          (2U << 16) | (1U << 12) | (5U << 4);
+
+    for (unsigned i = 0; i < 32; i++) {
+        memory.data[i] = i < 16 ? i + 1 : i + 0x21;
+    }
+    stq_le_p(code, qpu_test_load_imm(49, load_setup));
+    stq_le_p(code + 8, qpu_test_load_imm(50, memory.base));
+    stq_le_p(code + 16, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 4; i++) {
+        uint32_t first = memory.data[i * 4];
+        uint32_t second = memory.data[16 + i * 4];
+        uint32_t expected_first = first | memory.data[i * 4 + 1] << 8 |
+                                  memory.data[i * 4 + 2] << 16 |
+                                  memory.data[i * 4 + 3] << 24;
+        uint32_t expected_second = second |
+                                   memory.data[17 + i * 4] << 8 |
+                                   memory.data[18 + i * 4] << 16 |
+                                   memory.data[19 + i * 4] << 24;
+
+        g_assert_cmphex(qpu.vpm[5][8 + i], ==, expected_first);
+        g_assert_cmphex(qpu.vpm[6][8 + i], ==, expected_second);
+    }
+
+    uint32_t horizontal16_setup = (1U << 31) | (3U << 28) | (2U << 24) |
+                                  (1U << 16) | (1U << 12) | (7U << 4);
+
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned value = 0x100 + i;
+
+        memory.data[i * 2] = value;
+        memory.data[i * 2 + 1] = value >> 8;
+    }
+    stq_le_p(code, qpu_test_load_imm(49, horizontal16_setup));
+    stq_le_p(code + 8, qpu_test_load_imm(50, memory.base));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 8; i++) {
+        g_assert_cmphex(qpu.vpm[7][8 + i], ==,
+                        (0x100 + i * 2) | ((0x101 + i * 2) << 16));
+    }
+
+    uint32_t vertical_setup = (1U << 31) | (3U << 28) | (2U << 24) |
+                              (2U << 16) | (1U << 11) | (16U << 4) | 3U;
+
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned first = 0x100 + i;
+        unsigned second = 0x200 + i;
+
+        memory.data[i * 2] = first;
+        memory.data[i * 2 + 1] = first >> 8;
+        memory.data[32 + i * 2] = second;
+        memory.data[33 + i * 2] = second >> 8;
+    }
+    stq_le_p(code, qpu_test_load_imm(49, vertical_setup));
+    stq_le_p(code + 8, qpu_test_load_imm(50, memory.base));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 8; i++) {
+        g_assert_cmphex(qpu.vpm[24 + i][3], ==,
+                        (0x100 + i * 2) | ((0x101 + i * 2) << 16));
+        g_assert_cmphex(qpu.vpm[40 + i][3], ==,
+                        (0x200 + i * 2) | ((0x201 + i * 2) << 16));
+    }
+
+    uint32_t vertical8_setup = (1U << 31) | (7U << 28) | (1U << 24) |
+                               (1U << 16) | (1U << 11) | (32U << 4) | 4U;
+
+    for (unsigned i = 0; i < 16; i++) {
+        memory.data[i] = i + 0x31;
+    }
+    stq_le_p(code, qpu_test_load_imm(49, vertical8_setup));
+    stq_le_p(code + 8, qpu_test_load_imm(50, memory.base));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 4; i++) {
+        g_assert_cmphex(qpu.vpm[44 + i][4], ==,
+                        0x34333231 + i * 0x04040404);
+    }
+}
+
+static void test_v3d_qpu_vpm_dma_packed_store(void)
+{
+    uint8_t code[4 * sizeof(uint64_t)];
+    QPUTestMemory memory = { .base = 0x1000 };
+    BCM2835V3DQPUState qpu;
+    uint32_t executed;
+    uint32_t store_stride = 3U << 30;
+    uint32_t store_setup = (2U << 30) | (1U << 23) | (7U << 16) |
+                           (1U << 14) | (5U << 7) | 6U;
+
+    memset(memory.data, 0xcc, sizeof(memory.data));
+    stq_le_p(code, qpu_test_load_imm(49, store_stride) | (1ULL << 44));
+    stq_le_p(code + 8, qpu_test_load_imm(49, store_setup) | (1ULL << 44));
+    stq_le_p(code + 16,
+             qpu_test_load_imm(50, memory.base + 0x80) | (1ULL << 44));
+    stq_le_p(code + 24, 3ULL << 60);
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+    for (unsigned i = 0; i < 4; i++) {
+        qpu.vpm[5][8 + i] = 0x04030201 + i * 0x04040404;
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmphex(memory.data[0x7f], ==, 0xcc);
+    g_assert_cmphex(memory.data[0x87], ==, 0xcc);
+    for (unsigned i = 0; i < 7; i++) {
+        g_assert_cmphex(memory.data[0x80 + i], ==, i + 1);
+    }
+
+    uint32_t horizontal16_setup = (2U << 30) | (1U << 23) | (16U << 16) |
+                                  (1U << 14) | (7U << 7) | 3U;
+
+    memset(memory.data, 0xcc, sizeof(memory.data));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+    for (unsigned i = 0; i < 8; i++) {
+        qpu.vpm[7][8 + i] = (0x0102 + i * 2) | ((0x0304 + i * 2) << 16);
+    }
+    stq_le_p(code + 8,
+             qpu_test_load_imm(49, horizontal16_setup) | (1ULL << 44));
+    stq_le_p(code + 16,
+             qpu_test_load_imm(50, memory.base + 0x80) | (1ULL << 44));
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned value = i & 1 ? 0x0304 + i - 1 : 0x0102 + i;
+
+        g_assert_cmphex(memory.data[0x80 + i * 2], ==, value & 0xff);
+        g_assert_cmphex(memory.data[0x81 + i * 2], ==, value >> 8);
+    }
+
+    uint32_t vertical_stride = 3U << 30;
+    uint32_t vertical_setup = (2U << 30) | (2U << 23) | (16U << 16) |
+                              (16U << 7) | (3U << 3) | 3U;
+
+    memset(memory.data, 0xcc, sizeof(memory.data));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+    for (unsigned y = 0; y < 2; y++) {
+        for (unsigned i = 0; i < 8; i++) {
+            unsigned first = 1 + y * 0x20 + i * 4;
+
+            qpu.vpm[24 + i][3 + y] = first | (first + 1) << 8 |
+                                     (first + 2) << 16 |
+                                     (first + 3) << 24;
+        }
+    }
+    stq_le_p(code, qpu_test_load_imm(49, vertical_stride) | (1ULL << 44));
+    stq_le_p(code + 8,
+             qpu_test_load_imm(49, vertical_setup) | (1ULL << 44));
+    stq_le_p(code + 16,
+             qpu_test_load_imm(50, memory.base + 0x80) | (1ULL << 44));
+    stq_le_p(code + 24, 3ULL << 60);
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmphex(memory.data[0x7f], ==, 0xcc);
+    g_assert_cmphex(memory.data[0xc0], ==, 0xcc);
+    for (unsigned y = 0; y < 2; y++) {
+        for (unsigned i = 0; i < 16; i++) {
+            g_assert_cmphex(memory.data[0x80 + y * 32 + i], ==,
+                            1 + y * 0x20 + i);
+        }
+    }
+
+    uint32_t vertical8_setup = (2U << 30) | (1U << 23) | (16U << 16) |
+                               (32U << 7) | (4U << 3) | 7U;
+
+    memset(memory.data, 0xcc, sizeof(memory.data));
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.write_memory = qpu_test_write_vpm_dma;
+    qpu.read_memory = qpu_test_read_vpm_dma;
+    qpu.memory_opaque = &memory;
+    for (unsigned i = 0; i < 4; i++) {
+        qpu.vpm[44 + i][4] = 0x34333231 + i * 0x04040404;
+    }
+    stq_le_p(code + 8,
+             qpu_test_load_imm(49, vertical8_setup) | (1ULL << 44));
+    stq_le_p(code + 16,
+             qpu_test_load_imm(50, memory.base + 0x80) | (1ULL << 44));
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                        &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    for (unsigned i = 0; i < 16; i++) {
+        g_assert_cmphex(memory.data[0x80 + i], ==, 0x31 + i);
     }
 }
 
@@ -1653,31 +2548,32 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     enum { test_fb_width = 64, test_fb_height = 65 };
     static const uint32_t vertices[9][8] = {
         { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0xff00ff00, 0x3f800000, 0x40000000, 0x3f800000 },
+          0x0100ff00, 0x3f800000, 0x40000000, 0x3f800000 },
         { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0xff000400, 0x3f800000, 0x40000000, 0x3f800000 },
+          0x01000400, 0x3f800000, 0x40000000, 0x3f800000 },
         { 0x00000000, 0x3f800000, 0x00000000, 0x40000000,
-          0x01000000, 0x3fc00000, 0x40400000, 0x3f000000 },
+          0xff000000, 0x3fc00000, 0x40400000, 0x3f000000 },
         { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0xff00ff00, 0x3f800000, 0x3f800000, 0x3f800000 },
+          0x0100ff00, 0x3f800000, 0x3f800000, 0x3f800000 },
         { 0x40000000, 0x00000000, 0x00000000, 0x3f800000,
-          0xff000400, 0x3f800000, 0x3f800000, 0x3f800000 },
+          0x01000400, 0x3f800000, 0x3f800000, 0x3f800000 },
         { 0x40000000, 0x3f000000, 0x00000000, 0x3f800000,
-          0x01000000, 0x3f800000, 0x3f800000, 0x3f800000 },
+          0xff000000, 0x3f800000, 0x3f800000, 0x3f800000 },
         { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0xff00ff00, 0x3f800000, 0x40000000, 0x3f800000 },
+          0x0100ff00, 0x3f800000, 0x40000000, 0x3f800000 },
         { 0x3f000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0xff000400, 0x3f800000, 0x40000000, 0x3f800000 },
+          0x01000400, 0x3f800000, 0x40000000, 0x3f800000 },
         { 0x00000000, 0x3f000000, 0x00000000, 0x40000000,
-          0x01000000, 0x3fc00000, 0x40400000, 0x3f000000 },
+          0xff000000, 0x3fc00000, 0x40400000, 0x3f000000 },
     };
     uint8_t render_cl[32];
-    uint8_t bin_cl[64];
+    uint8_t bin_cl[128];
     uint8_t draw_cl[32];
     uint8_t tile_head[64];
     uint8_t tile_list[64];
     uint8_t tile_overflow[64];
     uint8_t record[44] = { 0 };
+    uint8_t record_no_varying[44];
     uint8_t vertex_code[19 * sizeof(uint64_t)] = { 0 };
     uint8_t code[19 * sizeof(uint64_t)] = { 0 };
     uint8_t fragment_code[4 * sizeof(uint64_t)];
@@ -1790,7 +2686,8 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     append_u16(bin_cl, &bin_size, 32 * 16);
     bin_cl[bin_size++] = 105;
     append_u32(bin_cl, &bin_size, 0x44000000);
-    append_u32(bin_cl, &bin_size, 0x44000000);
+    /* Negative Y scale mirrors Mesa's Y-flipped target; screen rows stay fixed. */
+    append_u32(bin_cl, &bin_size, 0xc4000000);
     bin_cl[bin_size++] = 33;
     bin_cl[bin_size++] = 4;
     append_u32(bin_cl, &bin_size, G_N_ELEMENTS(vertices));
@@ -1854,8 +2751,8 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     g_assert_cmphex(tile_head[1], ==, 0x32);
     g_assert_cmphex(tile_head[7], ==, 48);
     g_assert_cmphex(tile_head[8], ==, 129);
-    g_assert_cmphex(read_u32(tile_head + 9), ==, 0xff00ff00);
-    g_assert_cmphex(read_u32(tile_head + 13), ==, 0xff000200);
+    g_assert_cmphex(read_u32(tile_head + 9), ==, 0x0100ff00);
+    g_assert_cmphex(read_u32(tile_head + 13), ==, 0x01000200);
     g_assert_cmphex(read_u32(tile_head + 17), ==, 0x00000200);
     g_assert_cmphex(read_u32(tile_head + 33), ==, 0x40000000);
     g_assert_cmphex(read_u32(tile_head + 21), ==, 0x3f800000);
@@ -1866,9 +2763,9 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     g_assert_cmphex(tile_list[1], ==, 0x32);
     g_assert_cmphex(tile_list[7], ==, 48);
     g_assert_cmphex(tile_list[8], ==, 129);
-    g_assert_cmphex(read_u32(tile_list + 9), ==, 0xff00ff00);
+    g_assert_cmphex(read_u32(tile_list + 9), ==, 0x0100ff00);
     g_assert_cmphex(read_u32(tile_list + 13), ==, 0x00000200);
-    g_assert_cmphex(read_u32(tile_list + 17), ==, 0x01000000);
+    g_assert_cmphex(read_u32(tile_list + 17), ==, 0xff000000);
     g_assert_cmphex(read_u32(tile_list + 21), ==, 0x3f800000);
     g_assert_cmphex(tile_list[57], ==, 128);
     g_assert_cmphex(tile_list[58], ==, 16);
@@ -1902,8 +2799,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         float value;
 
         memcpy(&value, &bits, sizeof(value));
-        g_assert_cmpfloat(value, >, 2.16f);
-        g_assert_cmpfloat(value, <, 2.18f);
+        g_assert_cmpfloat_with_epsilon(value, 2.132743f, 0.001f);
     }
     g_assert_cmphex(read_u32(fb + (1 * test_fb_width + 1) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
@@ -1951,6 +2847,56 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA), ==,
                     CL_ADDR + bin_size);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BFC), ==, bin_count + 1);
+
+    /* Leave room for a 5-byte BRANCH when a tile list block fills. */
+    memcpy(record_no_varying, record, sizeof(record_no_varying));
+    record_no_varying[3] = 0;
+    memwrite(0x34000, record, sizeof(record));
+    memwrite(0x34100, record_no_varying, sizeof(record_no_varying));
+    bin_size = 0;
+    bin_cl[bin_size++] = 112;
+    append_u32(bin_cl, &bin_size, 0x3a000);
+    append_u32(bin_cl, &bin_size, 0x2000);
+    append_u32(bin_cl, &bin_size, 0x3c000);
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 0x54; /* 128-byte initial and spill blocks. */
+    bin_cl[bin_size++] = 6;
+    bin_cl[bin_size++] = 103;
+    append_u16(bin_cl, &bin_size, 40 * 16);
+    append_u16(bin_cl, &bin_size, 32 * 16);
+    bin_cl[bin_size++] = 105;
+    append_u32(bin_cl, &bin_size, 0x44000000);
+    append_u32(bin_cl, &bin_size, 0xc4000000);
+    for (unsigned primitive = 0; primitive < 5; primitive++) {
+        bin_cl[bin_size++] = 64;
+        append_u32(bin_cl, &bin_size,
+                   primitive ? 0x34101 : 0x34001);
+        bin_cl[bin_size++] = 33;
+        bin_cl[bin_size++] = 4;
+        append_u32(bin_cl, &bin_size, 3);
+        append_u32(bin_cl, &bin_size, 0);
+    }
+    bin_cl[bin_size++] = 4;
+    memwrite(CL_ADDR, bin_cl, bin_size);
+    writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA), ==,
+                    CL_ADDR + bin_size);
+    {
+        uint8_t spill_head[128];
+        uint8_t spill_block[64];
+
+        memread(0x3a000, spill_head, sizeof(spill_head));
+        memread(0x3a100, spill_block, sizeof(spill_block));
+        g_assert_cmphex(spill_head[102], ==, 16);
+        g_assert_cmphex(read_u32(spill_head + 103), ==, 0x3a100);
+        g_assert_cmphex(spill_block[0], ==, 56);
+        g_assert_cmphex(spill_block[1], ==, 0x32);
+    }
 }
 
 static void append_tile_buffer_packet(uint8_t *buffer, size_t *offset,
@@ -2030,6 +2976,197 @@ static void test_v3d_ct1_clear_single_sample_64x64_tile(void)
     }
 }
 
+static void test_v3d_ct1_resumes_after_compressed_tile(void)
+{
+    uint8_t cl[128];
+    uint8_t record[44] = { 0 };
+    uint8_t initial[128 * 64 * sizeof(uint32_t)];
+    uint8_t fb[sizeof(initial)];
+    uint32_t color = 0xff123456;
+    size_t cl_size = 0;
+
+    memset(initial, 0x5a, sizeof(initial));
+    memwrite(FB_ADDR, initial, sizeof(initial));
+    memwrite(0x34000, record, sizeof(record));
+
+    cl[cl_size++] = 113;
+    append_u32(cl, &cl_size, FB_ADDR);
+    append_u16(cl, &cl_size, 128);
+    append_u16(cl, &cl_size, 64);
+    append_u16(cl, &cl_size, V3D_FORMAT_RGBA8888 << 2);
+    cl[cl_size++] = 114;
+    append_u32(cl, &cl_size, color);
+    append_u32(cl, &cl_size, 0);
+    append_u32(cl, &cl_size, 0);
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 64;
+    append_u32(cl, &cl_size, 0x34001);
+
+    for (unsigned tile_x = 0; tile_x < 2; tile_x++) {
+        cl[cl_size++] = 115;
+        cl[cl_size++] = tile_x;
+        cl[cl_size++] = 0;
+        cl[cl_size++] = 56;
+        cl[cl_size++] = 0x32;
+        cl[cl_size++] = 48;
+        cl[cl_size++] = 129;
+        append_u32(cl, &cl_size, 0);
+        append_u32(cl, &cl_size, 0);
+        append_u32(cl, &cl_size, 0);
+        cl[cl_size++] = 128;
+        append_tile_buffer_packet(cl, &cl_size, 28, FB_ADDR, 0, 0);
+    }
+    cl[cl_size++] = 0;
+
+    memwrite(CL_ADDR, cl, cl_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + cl_size);
+    for (unsigned retries = 0;
+         retries < 100 && (readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTRUN);
+         retries++) {
+        g_usleep(1000);
+    }
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) &
+                    (V3D_CTRUN | V3D_CTERR), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CA), ==,
+                    CL_ADDR + cl_size);
+
+    memread(FB_ADDR, fb, sizeof(fb));
+    g_assert_cmphex(read_u32(fb), ==, color);
+    g_assert_cmphex(read_u32(fb + 64 * sizeof(uint32_t)), ==, color);
+}
+
+static void test_v3d_ct1_wgpu_batches_opaque_shader(void)
+{
+    enum {
+        TILES_X = 20,
+        TILES_Y = 13,
+        WIDTH = TILES_X * 64,
+        HEIGHT = TILES_Y * 64,
+        RENDER_BASE = 0x01000000,
+    };
+    uint8_t *cl = g_new(uint8_t, 128 + TILES_X * TILES_Y * 80);
+    uint8_t record[44] = { 0 };
+    uint8_t code[(sizeof(captured_labwc_tmu0_opaque) - 1) / 2];
+    uint32_t uniforms[] = {
+        0x4000, (2U << 20) | (2U << 8) | (1U << 7) |
+                (1U << 4) | (1U << 2) | 1U,
+        0x3f800000, 0x3f800000, 0x00000000, 0x3f800000,
+    };
+    uint32_t texels[] = {
+        0x10203040, 0x50607080, 0x90a0b0c0, 0xd0e0f000,
+    };
+    size_t tile_ends[TILES_X * TILES_Y + 1];
+    size_t cl_size = 0;
+
+    for (unsigned i = 0; i < sizeof(code); i++) {
+        unsigned byte;
+
+        g_assert_cmpint(sscanf(captured_labwc_tmu0_opaque + i * 2, "%2x",
+                               &byte), ==, 1);
+        code[i] = byte;
+    }
+    record[3] = 2;
+    stl_le_p(record + 4, 0x5000);
+    stl_le_p(record + 8, 0x6000);
+    memwrite(0x34000, record, sizeof(record));
+    memwrite(0x5000, code, sizeof(code));
+    memwrite(0x6000, uniforms, sizeof(uniforms));
+    memwrite(0x4000, texels, sizeof(texels));
+
+    cl[cl_size++] = 113;
+    append_u32(cl, &cl_size, RENDER_BASE);
+    append_u16(cl, &cl_size, WIDTH);
+    append_u16(cl, &cl_size, HEIGHT);
+    append_u16(cl, &cl_size, V3D_FORMAT_RGBA8888 << 2);
+    cl[cl_size++] = 114;
+    append_u32(cl, &cl_size, 0xff000000);
+    append_u32(cl, &cl_size, 0);
+    append_u32(cl, &cl_size, 0);
+    cl[cl_size++] = 0;
+    cl[cl_size++] = 64;
+    append_u32(cl, &cl_size, 0x34001);
+    tile_ends[0] = cl_size;
+
+    for (unsigned tile = 0; tile < TILES_X * TILES_Y; tile++) {
+        cl[cl_size++] = 115;
+        cl[cl_size++] = tile % TILES_X;
+        cl[cl_size++] = tile / TILES_X;
+        cl[cl_size++] = 103;
+        append_u16(cl, &cl_size, (tile % TILES_X * 64 + 32) * 16);
+        append_u16(cl, &cl_size, (tile / TILES_X * 64 + 32) * 16);
+        cl[cl_size++] = 56;
+        cl[cl_size++] = 0x32;
+        cl[cl_size++] = 48;
+        cl[cl_size++] = 129;
+        append_u32(cl, &cl_size, 0xfe00fe00);
+        append_u32(cl, &cl_size, 0xfe000200);
+        append_u32(cl, &cl_size, 0x0200fe00);
+        for (unsigned i = 0; i < 6; i++) {
+            append_u32(cl, &cl_size, qpu_test_float_bits(0.25f));
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            append_u32(cl, &cl_size, qpu_test_float_bits(1.0f));
+        }
+        cl[cl_size++] = 128;
+        append_tile_buffer_packet(cl, &cl_size, 28, RENDER_BASE, 0, 0);
+        tile_ends[tile + 1] = cl_size;
+    }
+    cl[cl_size++] = 0;
+    g_autofree uint8_t *cl_template = g_memdup2(cl, cl_size);
+    static const unsigned tile_counts[] = { 1, 2, 3, 4, 16, 64, 260, 1 };
+    static const unsigned samples[] = { 0, 64, 254, 255, 259 };
+
+    for (unsigned pass = 0; pass < G_N_ELEMENTS(tile_counts); pass++) {
+        unsigned tile_count = tile_counts[pass];
+        size_t active_cl_size = tile_ends[tile_count] + 1;
+
+        memcpy(cl, cl_template, tile_ends[tile_count]);
+        cl[active_cl_size - 1] = 0;
+        writel(RASPI3_V3D_BASE + V3D_CT1CS, 1U << 15);
+        memwrite(CL_ADDR, cl, active_cl_size);
+        writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+        writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + active_cl_size);
+        for (unsigned retries = 0;
+             retries < 5000 &&
+             (readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTRUN);
+             retries++) {
+            g_usleep(1000);
+        }
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) &
+                        (V3D_CTRUN | V3D_CTERR), ==, 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CA), ==,
+                        CL_ADDR + active_cl_size);
+
+        for (unsigned i = 0; i < G_N_ELEMENTS(samples); i++) {
+            unsigned tile = samples[i];
+            size_t pixel;
+            uint8_t color[sizeof(uint32_t)];
+
+            if (tile >= tile_count) {
+                continue;
+            }
+            pixel = (size_t)(tile / TILES_X * 64 + 16) * WIDTH +
+                    tile % TILES_X * 64 + 16;
+            memread(RENDER_BASE + pixel * sizeof(uint32_t), color,
+                    sizeof(color));
+            g_assert_cmphex(read_u32(color), ==, 0xff203040);
+        }
+        if (tile_count == TILES_X * TILES_Y) {
+            size_t frame_size = (size_t)WIDTH * HEIGHT * sizeof(uint32_t);
+            g_autofree uint8_t *frame = g_malloc(frame_size);
+            g_autofree gchar *digest = NULL;
+
+            memread(RENDER_BASE, frame, frame_size);
+            digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256, frame,
+                                                 frame_size);
+            g_assert_cmpstr(digest, ==,
+                            "468cac829f9203d5cd0a16ae9aa1d103430de322f16aeb5d5f8df48a440a8b2f");
+        }
+    }
+    g_free(cl);
+}
+
 static void test_v3d_ct1_compressed_xy_triangle_encodings(void)
 {
     uint8_t cl[96];
@@ -2038,9 +3175,10 @@ static void test_v3d_ct1_compressed_xy_triangle_encodings(void)
     uint8_t fb[FB_SIZE];
     uint32_t color = 0xff123456;
     size_t cl_size = 0;
-    uint64_t relative_triangle = 15 | (48ULL << 4) | (80ULL << 11) |
-                                 (48ULL << 25) |
-                                 (0xffe8ULL << 32) | (0xffe8ULL << 48);
+    /* Y mirrored for VC4 screen Y = centre + Y; rows match the old layout. */
+    uint64_t relative_triangle = 15 | (48ULL << 4) | (48ULL << 11) |
+                                 (80ULL << 25) |
+                                 (0xffe8ULL << 32) | (0x0018ULL << 48);
 
     memset(initial, 0x5a, sizeof(initial));
     memwrite(FB_ADDR, initial, sizeof(initial));
@@ -2070,14 +3208,14 @@ static void test_v3d_ct1_compressed_xy_triangle_encodings(void)
     cl[cl_size++] = 48;
     stq_le_p(cl + cl_size, relative_triangle); /* Coding 2: absolute + deltas. */
     cl_size += sizeof(relative_triangle);
-    append_u16(cl, &cl_size, 0xa004); /* Coding 0: shared edge + delta. */
+    append_u16(cl, &cl_size, 0x6004); /* Coding 0: shared edge + delta. */
     cl[cl_size++] = 11; /* Coding 1: shared edge + wide delta, orientation 2. */
     cl[cl_size++] = 0;
     cl[cl_size++] = 0;
     cl[cl_size++] = 129; /* Coding 3: absolute triangle. */
-    append_u32(cl, &cl_size, 0xffe8ffe8);
-    append_u32(cl, &cl_size, 0xffe80018);
     append_u32(cl, &cl_size, 0x0018ffe8);
+    append_u32(cl, &cl_size, 0x00180018);
+    append_u32(cl, &cl_size, 0xffe8ffe8);
     cl[cl_size++] = 128; /* Compressed-list escape. */
     cl[cl_size++] = 25;  /* Store tile and end frame. */
 
@@ -2095,7 +3233,8 @@ static void test_v3d_ct1_compressed_xy_triangle_encodings(void)
         drawn_pixels += read_u32(fb + i * sizeof(uint32_t)) == color;
     }
     g_assert_cmpuint(drawn_pixels, >, 0);
-    g_assert_cmphex(read_u32(fb + (32 * 64 + 32) * sizeof(uint32_t)),
+    /* Sample inside the triangle; (32, 32) lies on its exclusive diagonal. */
+    g_assert_cmphex(read_u32(fb + (32 * 64 + 31) * sizeof(uint32_t)),
                     ==, color);
     g_assert_cmphex(read_u32(fb + (10 * 64 + 50) * sizeof(uint32_t)),
                     ==, 0x5a5a5a5a);
@@ -2331,8 +3470,9 @@ static void test_v3d_ct1_load_store_color_tile(void)
     uint8_t destination[FB_SIZE];
     uint8_t result[FB_SIZE];
 
-    for (unsigned color_format_i = 0; color_format_i < 2; color_format_i++) {
-        unsigned color_format = color_format_i == 0 ? 0 : 2;
+    for (unsigned color_format_i = 0; color_format_i < 3; color_format_i++) {
+        unsigned color_format = color_format_i;
+        unsigned store_color_format = color_format == 1 ? 2 : color_format;
         unsigned bytes_per_pixel = color_format == 0 ? 4 : 2;
         size_t surface_size = 64 * 64 * bytes_per_pixel;
 
@@ -2371,7 +3511,7 @@ static void test_v3d_ct1_load_store_color_tile(void)
             cl[offset++] = 0;
             cl[offset++] = 0;
             append_tile_buffer_packet(cl, &offset, 28, dst,
-                                      memory_format, color_format);
+                                      memory_format, store_color_format);
 
             memwrite(CL_ADDR, cl, offset);
             writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
@@ -2402,6 +3542,46 @@ static void test_v3d_ct1_load_store_color_tile(void)
             g_assert_cmpmem(result, surface_size, source, surface_size);
         }
     }
+}
+
+static void test_v3d_ct1_tile_load_high_dma_address(void)
+{
+    const uint32_t src = 0xc0029000;
+    const uint32_t dst = 0xc0030000;
+    const uint32_t src_phys = src - 0xc0000000;
+    const uint32_t dst_phys = dst - 0xc0000000;
+    uint8_t cl[64];
+    uint8_t source[64 * 64 * sizeof(uint32_t)];
+    uint8_t destination[sizeof(source)];
+    uint8_t result[sizeof(source)];
+    size_t offset = 0;
+
+    for (unsigned i = 0; i < 64 * 64; i++) {
+        stl_le_p(source + i * sizeof(uint32_t), 0xff000000 | i);
+    }
+    memset(destination, 0xa5, sizeof(destination));
+    memwrite(src_phys, source, sizeof(source));
+    memwrite(dst_phys, destination, sizeof(destination));
+
+    cl[offset++] = 113;
+    append_u32(cl, &offset, dst);
+    append_u16(cl, &offset, 64);
+    append_u16(cl, &offset, 64);
+    append_u16(cl, &offset, 0);
+    append_tile_buffer_packet(cl, &offset, 29, src, 0, 0);
+    cl[offset++] = 115;
+    cl[offset++] = 0;
+    cl[offset++] = 0;
+    append_tile_buffer_packet(cl, &offset, 28, dst, 0, 0);
+
+    writel(RASPI3_V3D_BASE + V3D_CT1CS, 1U << 15);
+    memwrite(CL_ADDR, cl, offset);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + offset);
+
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTERR, ==, 0);
+    memread(dst_phys, result, sizeof(result));
+    g_assert_cmpmem(result, sizeof(result), source, sizeof(source));
 }
 
 static void test_v3d_ct1_load_store_layout_conversion(void)
@@ -2473,6 +3653,8 @@ int main(int argc, char **argv)
                    test_v3d_qpu_uniform_read);
     qtest_add_func("/bcm2835/v3d/qpu_tmu0_rgba_texture_sampling",
                    test_v3d_qpu_tmu0_rgba_texture_sampling);
+    qtest_add_func("/bcm2835/v3d/qpu_captured_labwc_shaders",
+                   test_v3d_qpu_captured_labwc_shaders);
     qtest_add_func("/bcm2835/v3d/qpu_tmu1_rgba_texture_sampling",
                    test_v3d_qpu_tmu1_rgba_texture_sampling);
     qtest_add_func("/bcm2835/v3d/qpu_fragment_w_register",
@@ -2509,6 +3691,24 @@ int main(int argc, char **argv)
                    test_v3d_qpu_vpm_vector_io);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vertical_32bit",
                    test_v3d_qpu_vpm_vertical_32bit);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_subword_io",
+                   test_v3d_qpu_vpm_subword_io);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_single_row",
+                   test_v3d_qpu_vpm_dma_single_row);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_2d",
+                   test_v3d_qpu_vpm_dma_2d);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_store_blockmode",
+                   test_v3d_qpu_vpm_dma_store_blockmode);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_vertical_32bit",
+                   test_v3d_qpu_vpm_dma_vertical_32bit);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_vertical_store_32bit",
+                   test_v3d_qpu_vpm_dma_vertical_store_32bit);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_vertical_store_blockmode",
+                   test_v3d_qpu_vpm_dma_vertical_store_blockmode);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_packed_load",
+                   test_v3d_qpu_vpm_dma_packed_load);
+    qtest_add_func("/bcm2835/v3d/qpu_vpm_dma_packed_store",
+                   test_v3d_qpu_vpm_dma_packed_store);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_setup_and_write",
                    test_v3d_qpu_vpm_setup_and_write);
     qtest_add_func("/bcm2835/v3d/qpu_branch_delay_slots",
@@ -2542,10 +3742,18 @@ int main(int argc, char **argv)
                    test_v3d_ct1_clear_lt_tiled_bgr565);
     qtest_add_func("/bcm2835/v3d/ct1_load_store_color_tile",
                    test_v3d_ct1_load_store_color_tile);
+    qtest_add_func("/bcm2835/v3d/ct1_tile_load_high_dma_address",
+                   test_v3d_ct1_tile_load_high_dma_address);
     qtest_add_func("/bcm2835/v3d/ct1_load_store_layout_conversion",
                    test_v3d_ct1_load_store_layout_conversion);
     qtest_add_func("/bcm2835/v3d/ct1_clear_single_sample_64x64_tile",
                    test_v3d_ct1_clear_single_sample_64x64_tile);
+    qtest_add_func("/bcm2835/v3d/ct1_resumes_after_compressed_tile",
+                   test_v3d_ct1_resumes_after_compressed_tile);
+    qtest_add_func("/bcm2835/v3d/ct1_wgpu_batches_opaque_shader",
+                   test_v3d_ct1_wgpu_batches_opaque_shader);
+    qtest_add_func("/bcm2835/v3d/ct1_wgpu_batches_tmu0_blend_shader",
+                   test_v3d_ct1_wgpu_batches_tmu0_blend_shader);
     qtest_add_func("/bcm2835/v3d/ct1_compressed_xy_triangle_encodings",
                    test_v3d_ct1_compressed_xy_triangle_encodings);
     qtest_add_func("/bcm2835/v3d/ct1_frame_done_requires_eof",

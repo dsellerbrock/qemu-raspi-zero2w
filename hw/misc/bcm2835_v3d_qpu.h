@@ -26,15 +26,6 @@ typedef bool (*BCM2835V3DQPUReadTexture)(void *opaque, uint32_t base,
                                          unsigned width, unsigned height,
                                          unsigned x, unsigned y,
                                          uint32_t *value);
-typedef struct BCM2835V3DQPUTMUSample {
-    uint32_t texel[4];
-    uint32_t fraction_s;
-    uint32_t fraction_t;
-} BCM2835V3DQPUTMUSample;
-typedef bool (*BCM2835V3DQPUFilterTexture)(
-    void *opaque, const BCM2835V3DQPUTMUSample samples[BCM2835_V3D_QPU_LANES],
-    uint16_t lanes, const uint32_t software_result[BCM2835_V3D_QPU_LANES],
-    uint32_t result[BCM2835_V3D_QPU_LANES]);
 typedef bool (*BCM2835V3DQPUReadVarying)(
     void *opaque, unsigned index,
     uint32_t partial[BCM2835_V3D_QPU_LANES],
@@ -105,15 +96,13 @@ typedef struct BCM2835V3DQPUState {
     BCM2835V3DQPUWriteMemory write_memory;
     BCM2835V3DQPUReadTexture read_texture;
     void *texture_opaque;
-    BCM2835V3DQPUFilterTexture filter_texture;
-    void *filter_texture_opaque;
-    bool filter_texture_verify;
     BCM2835V3DQPUReadVarying read_varying;
     void *varying_opaque;
 } BCM2835V3DQPUState;
 
 typedef enum BCM2835V3DQPUResult {
     BCM2835_V3D_QPU_END,
+    BCM2835_V3D_QPU_TMU0_LOADED,
     BCM2835_V3D_QPU_UNSUPPORTED,
     BCM2835_V3D_QPU_BUDGET,
     BCM2835_V3D_QPU_CODE_FAULT,
@@ -125,5 +114,12 @@ BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t instruction_budget,
                                          BCM2835V3DQPUState *qpu,
                                          uint32_t *executed);
+BCM2835V3DQPUResult bcm2835_v3d_qpu_run_until_tmu0(
+    const uint8_t *code, uint32_t code_size, uint32_t instruction_budget,
+    BCM2835V3DQPUState *qpu, uint32_t *executed);
+bool bcm2835_v3d_qpu_sample_tmu0_batch(
+    BCM2835V3DQPUState *qpu, uint32_t config0, uint32_t config1,
+    const uint32_t *varying_partial, const uint32_t *fragment_w,
+    unsigned varying_count, unsigned count, uint32_t *samples);
 
 #endif /* HW_MISC_BCM2835_V3D_QPU_H */

@@ -174,7 +174,9 @@ uint64_t board_ram_size(uint32_t board_rev);
 #define INTERRUPT_CAM1                 39
 #define INTERRUPT_HDMI0                40
 #define INTERRUPT_HDMI1                41
+/* The firmware DT routes PixelValve 2 to GPU interrupt 42. */
 #define INTERRUPT_PIXELVALVE1          42
+#define INTERRUPT_PIXELVALVE2          42
 #define INTERRUPT_I2CSPISLV            43
 #define INTERRUPT_DSI1                 44
 #define INTERRUPT_PWA0                 45

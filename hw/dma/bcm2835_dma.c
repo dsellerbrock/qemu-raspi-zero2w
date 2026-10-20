@@ -12,6 +12,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "trace.h"
 
 /* DMA CS Control and Status bits */
 #define BCM2708_DMA_ACTIVE      (1 << 0)
@@ -34,7 +35,11 @@
 #define BCM2708_DMA_S_INC       (1 << 8)
 #define BCM2708_DMA_S_WIDTH     (1 << 9)
 #define BCM2708_DMA_S_DREQ      (1 << 10)
+#define BCM2708_DMA_D_DREQ      (1 << 6)
 #define BCM2708_DMA_S_IGNORE    (1 << 11)
+#define BCM2708_DMA_PERMAP_SHIFT 16
+#define BCM2708_DMA_PERMAP_MASK  0x1f
+#define BCM2708_DMA_PERMAP_SDHOST 13
 
 /* Register offsets */
 #define BCM2708_DMA_CS          0x00 /* Control and Status */
@@ -56,56 +61,74 @@
 static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
 {
     BCM2835DMAChan *ch = &s->chan[c];
-    uint32_t data, xlen, xlen_td, ylen;
-    int16_t dst_stride, src_stride;
+    uint32_t data;
 
-    if (!(s->enable & (1 << c))) {
+    if (!(s->enable & (1 << c)) || ch->updating) {
         return;
     }
 
+    ch->updating = true;
+    ch->cs &= ~(BCM2708_DMA_ISHELD | BCM2708_DMA_ISPAUSED);
     while ((s->enable & (1 << c)) && (ch->conblk_ad != 0)) {
-        /* CB fetch */
-        ch->ti = ldl_le_phys(&s->dma_as, ch->conblk_ad);
-        ch->source_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 4);
-        ch->dest_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 8);
-        ch->txfr_len = ldl_le_phys(&s->dma_as, ch->conblk_ad + 12);
-        ch->stride = ldl_le_phys(&s->dma_as, ch->conblk_ad + 16);
-        ch->nextconbk = ldl_le_phys(&s->dma_as, ch->conblk_ad + 20);
+        if (!ch->cb_loaded) {
+            /* CB fetch */
+            ch->ti = ldl_le_phys(&s->dma_as, ch->conblk_ad);
+            ch->source_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 4);
+            ch->dest_ad = ldl_le_phys(&s->dma_as, ch->conblk_ad + 8);
+            ch->txfr_len = ldl_le_phys(&s->dma_as, ch->conblk_ad + 12);
+            ch->stride = ldl_le_phys(&s->dma_as, ch->conblk_ad + 16);
+            ch->nextconbk = ldl_le_phys(&s->dma_as, ch->conblk_ad + 20);
 
-        ylen = 1;
-        if (ch->ti & BCM2708_DMA_TDMODE) {
-            /* 2D transfer mode */
-            ylen += (ch->txfr_len >> 16) & 0x3fff;
-            xlen = ch->txfr_len & 0xffff;
-            dst_stride = ch->stride >> 16;
-            src_stride = ch->stride & 0xffff;
-        } else {
-            xlen = ch->txfr_len;
-            dst_stride = 0;
-            src_stride = 0;
+            ch->ylen = 1;
+            if (ch->ti & BCM2708_DMA_TDMODE) {
+                /* 2D transfer mode */
+                ch->ylen += (ch->txfr_len >> 16) & 0x3fff;
+                ch->xlen = ch->txfr_len & 0xffff;
+                ch->dst_stride = ch->stride >> 16;
+                ch->src_stride = ch->stride & 0xffff;
+            } else {
+                ch->xlen = ch->txfr_len;
+                ch->dst_stride = 0;
+                ch->src_stride = 0;
+            }
+            ch->xlen_td = ch->xlen;
+
+            if (ch->ti & BCM2708_DMA_D_WIDTH) {
+                qemu_log_mask(LOG_UNIMP,
+                              "%s: 128bit transfers not yet supported", __func__);
+                ch->cs |= BCM2708_DMA_ERR;
+                goto done;
+            }
+
+            /* Datasheet implies 32-bit or 128-bit transfers only. */
+            if (ch->xlen & 0x3) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "%s: bad transfer size\n", __func__);
+                ch->cs |= BCM2708_DMA_ERR;
+                goto done;
+            }
+            ch->cb_loaded = true;
+            trace_bcm2835_dma_state(c, "load", ch->cs, ch->conblk_ad,
+                                    ch->ti, ch->xlen, s->sdhost_dreq);
         }
-        xlen_td = xlen;
 
-        if (ch->ti & BCM2708_DMA_D_WIDTH) {
-            qemu_log_mask(LOG_UNIMP, "%s: 128bit transfers not yet supported", __func__);
-            ch->cs |= BCM2708_DMA_ERR;
-            break;
-        }
+        while (ch->ylen != 0) {
+            while (ch->xlen != 0) {
+                /* shortcut: only SDHOST PERMAP 13 is wired; add DREQ sources
+                 * when their peripheral models expose them.
+                 */
+                if ((ch->ti & (BCM2708_DMA_S_DREQ | BCM2708_DMA_D_DREQ)) &&
+                    ((ch->ti >> BCM2708_DMA_PERMAP_SHIFT) &
+                     BCM2708_DMA_PERMAP_MASK) == BCM2708_DMA_PERMAP_SDHOST &&
+                    !s->sdhost_dreq) {
+                    ch->cs |= BCM2708_DMA_ISHELD;
+                    trace_bcm2835_dma_state(c, "held", ch->cs,
+                                            ch->conblk_ad, ch->ti, ch->xlen,
+                                            s->sdhost_dreq);
+                    ch->updating = false;
+                    return;
+                }
 
-        /*
-         * Datasheet implies 32bit or 128bit transfers only
-         *
-         * TODO: test on real HW and report back.
-         */
-        if (xlen & 0x3) {
-            qemu_log_mask(LOG_GUEST_ERROR, "%s: bad transfer size\n", __func__);
-            ch->cs |= BCM2708_DMA_ERR;
-            break;
-        }
-
-        while (ylen != 0) {
-            /* Normal transfer mode */
-            while (xlen != 0) {
                 if (ch->ti & BCM2708_DMA_S_IGNORE) {
                     /* Ignore reads */
                     data = 0;
@@ -126,39 +149,89 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
                 }
 
                 /* update remaining transfer length */
-                xlen -= 4;
+                ch->xlen -= 4;
                 if (ch->ti & BCM2708_DMA_TDMODE) {
-                    ch->txfr_len = (ylen << 16) | xlen;
+                    ch->txfr_len = (ch->ylen << 16) | ch->xlen;
                 } else {
-                    ch->txfr_len = xlen;
+                    ch->txfr_len = ch->xlen;
                 }
             }
 
-            if (--ylen != 0) {
-                ch->source_ad += src_stride;
-                ch->dest_ad += dst_stride;
-                xlen = xlen_td;
+            if (--ch->ylen != 0) {
+                ch->source_ad += ch->src_stride;
+                ch->dest_ad += ch->dst_stride;
+                ch->xlen = ch->xlen_td;
             }
         }
+        ch->cb_loaded = false;
         ch->cs |= BCM2708_DMA_END;
         if (ch->ti & BCM2708_DMA_INT_EN) {
             ch->cs |= BCM2708_DMA_INT;
             s->int_status |= (1 << c);
             qemu_set_irq(ch->irq, 1);
+            trace_bcm2835_dma_irq(c, 1, ch->cs, s->int_status);
         }
+        trace_bcm2835_dma_state(c, "cb-done", ch->cs, ch->conblk_ad,
+                                ch->ti, ch->xlen, s->sdhost_dreq);
 
         /* Process next CB */
         ch->conblk_ad = ch->nextconbk;
     }
 
+done:
     ch->cs &= ~BCM2708_DMA_ACTIVE;
+    ch->cs &= ~BCM2708_DMA_ISHELD;
     ch->cs |= BCM2708_DMA_ISPAUSED;
+    ch->updating = false;
 }
 
-static void bcm2835_dma_chan_reset(BCM2835DMAChan *ch)
+static void bcm2835_dma_dreq_bh(void *opaque)
 {
+    BCM2835DMAState *s = opaque;
+
+    if (!s->sdhost_dreq) {
+        return;
+    }
+
+    for (unsigned c = 0; c < BCM2835_DMA_NCHANS; c++) {
+        BCM2835DMAChan *ch = &s->chan[c];
+
+        if ((ch->cs & BCM2708_DMA_ACTIVE) &&
+            (ch->ti & (BCM2708_DMA_S_DREQ | BCM2708_DMA_D_DREQ)) &&
+            ((ch->ti >> BCM2708_DMA_PERMAP_SHIFT) &
+             BCM2708_DMA_PERMAP_MASK) == BCM2708_DMA_PERMAP_SDHOST) {
+            bcm2835_dma_update(s, c);
+        }
+    }
+}
+
+static void bcm2835_dma_dreq(void *opaque, int n, int level)
+{
+    BCM2835DMAState *s = opaque;
+    bool dreq = !!level;
+
+    (void)n;
+    if (s->sdhost_dreq == dreq) {
+        return;
+    }
+    s->sdhost_dreq = dreq;
+    trace_bcm2835_dma_state(0, "dreq", 0, 0, 0, 0, dreq);
+    if (s->sdhost_dreq) {
+        qemu_bh_schedule(s->dreq_bh);
+    }
+}
+
+static void bcm2835_dma_chan_reset(BCM2835DMAState *s, unsigned c)
+{
+	BCM2835DMAChan *ch = &s->chan[c];
+
     ch->cs = 0;
     ch->conblk_ad = 0;
+    ch->cb_loaded = false;
+    ch->updating = false;
+    s->int_status &= ~(1 << c);
+    qemu_set_irq(ch->irq, 0);
+    trace_bcm2835_dma_irq(c, 0, ch->cs, s->int_status);
 }
 
 static uint64_t bcm2835_dma_read(BCM2835DMAState *s, hwaddr offset,
@@ -223,10 +296,7 @@ static void bcm2835_dma_write(BCM2835DMAState *s, hwaddr offset,
     case BCM2708_DMA_CS:
         oldcs = ch->cs;
         if (value & BCM2708_DMA_RESET) {
-            bcm2835_dma_chan_reset(ch);
-        }
-        if (value & BCM2708_DMA_ABORT) {
-            /* abort is a no-op, since we always run to completion */
+            bcm2835_dma_chan_reset(s, c);
         }
         if (value & BCM2708_DMA_END) {
             ch->cs &= ~BCM2708_DMA_END;
@@ -235,15 +305,30 @@ static void bcm2835_dma_write(BCM2835DMAState *s, hwaddr offset,
             ch->cs &= ~BCM2708_DMA_INT;
             s->int_status &= ~(1 << c);
             qemu_set_irq(ch->irq, 0);
+            trace_bcm2835_dma_irq(c, 0, ch->cs, s->int_status);
         }
         ch->cs &= ~BCM2708_DMA_CS_RW_MASK;
         ch->cs |= (value & BCM2708_DMA_CS_RW_MASK);
-        if (!(oldcs & BCM2708_DMA_ACTIVE) && (ch->cs & BCM2708_DMA_ACTIVE)) {
+        if (value & BCM2708_DMA_ABORT) {
+            /* The guest clears NEXTCB before aborting a DREQ-held block. */
+            ch->conblk_ad = ch->nextconbk;
+            ch->cb_loaded = false;
+            if (ch->conblk_ad) {
+                bcm2835_dma_update(s, c);
+            } else {
+                ch->cs &= ~(BCM2708_DMA_ACTIVE | BCM2708_DMA_ISHELD);
+                ch->cs |= BCM2708_DMA_ISPAUSED;
+            }
+        } else if (!(oldcs & BCM2708_DMA_ACTIVE) &&
+                   (ch->cs & BCM2708_DMA_ACTIVE)) {
             bcm2835_dma_update(s, c);
         }
         break;
     case BCM2708_DMA_ADDR:
         ch->conblk_ad = value;
+        break;
+    case BCM2708_DMA_NEXTCB:
+        ch->nextconbk = value;
         break;
     case BCM2708_DMA_DEBUG:
         ch->debug = value;
@@ -326,7 +411,7 @@ static const MemoryRegionOps bcm2835_dma15_ops = {
 
 static const VMStateDescription vmstate_bcm2835_dma_chan = {
     .name = TYPE_BCM2835_DMA "-chan",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cs, BCM2835DMAChan),
@@ -338,19 +423,26 @@ static const VMStateDescription vmstate_bcm2835_dma_chan = {
         VMSTATE_UINT32(stride, BCM2835DMAChan),
         VMSTATE_UINT32(nextconbk, BCM2835DMAChan),
         VMSTATE_UINT32(debug, BCM2835DMAChan),
+        VMSTATE_UINT32_V(xlen, BCM2835DMAChan, 2),
+        VMSTATE_UINT32_V(xlen_td, BCM2835DMAChan, 2),
+        VMSTATE_UINT32_V(ylen, BCM2835DMAChan, 2),
+        VMSTATE_INT16_V(src_stride, BCM2835DMAChan, 2),
+        VMSTATE_INT16_V(dst_stride, BCM2835DMAChan, 2),
+        VMSTATE_BOOL_V(cb_loaded, BCM2835DMAChan, 2),
         VMSTATE_END_OF_LIST()
     }
 };
 
 static const VMStateDescription vmstate_bcm2835_dma = {
     .name = TYPE_BCM2835_DMA,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(chan, BCM2835DMAState, BCM2835_DMA_NCHANS, 1,
                              vmstate_bcm2835_dma_chan, BCM2835DMAChan),
         VMSTATE_UINT32(int_status, BCM2835DMAState),
         VMSTATE_UINT32(enable, BCM2835DMAState),
+        VMSTATE_UINT8_V(sdhost_dreq, BCM2835DMAState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -376,6 +468,7 @@ static void bcm2835_dma_init(Object *obj)
     for (n = 0; n < 16; n++) {
         sysbus_init_irq(SYS_BUS_DEVICE(s), &s->chan[n].irq);
     }
+    qdev_init_gpio_in_named(DEVICE(s), bcm2835_dma_dreq, "dreq", 1);
 }
 
 static void bcm2835_dma_reset(DeviceState *dev)
@@ -385,8 +478,9 @@ static void bcm2835_dma_reset(DeviceState *dev)
 
     s->enable = 0xffff;
     s->int_status = 0;
+    s->sdhost_dreq = 0;
     for (n = 0; n < BCM2835_DMA_NCHANS; n++) {
-        bcm2835_dma_chan_reset(&s->chan[n]);
+        bcm2835_dma_chan_reset(s, n);
     }
 }
 
@@ -398,6 +492,8 @@ static void bcm2835_dma_realize(DeviceState *dev, Error **errp)
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_DMA "-memory");
+    s->dreq_bh = qemu_bh_new_guarded(bcm2835_dma_dreq_bh, s,
+                                     &dev->mem_reentrancy_guard);
 
     bcm2835_dma_reset(dev);
 }

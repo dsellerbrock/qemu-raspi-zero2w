@@ -23,6 +23,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "trace.h"
 
 #define REG_GPU_ROUTE           0x0c
 #define REG_LOCALTIMERROUTING   0x24
@@ -188,6 +189,9 @@ static void bcm2836_control_set_gpu_fiq(void *opaque, int irq, int level)
 {
     BCM2836ControlState *s = opaque;
 
+    if (s->gpu_fiq != !!level) {
+        trace_bcm2836_control_gpu_fiq(!!level);
+    }
     s->gpu_fiq = level;
 
     bcm2836_control_update(s);

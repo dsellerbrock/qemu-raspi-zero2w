@@ -27,6 +27,7 @@ struct BCM2835SDHostState {
     SysBusDevice busdev;
     SDBus sdbus;
     MemoryRegion iomem;
+    qemu_irq dreq;
 
     uint32_t cmd;
     uint32_t cmdarg;

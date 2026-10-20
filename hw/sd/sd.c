@@ -1568,8 +1568,11 @@ static bool address_in_range(SDState *sd, const char *desc,
 
 static sd_rsp_type_t sd_invalid_state_for_cmd(SDState *sd, SDRequest req)
 {
-    qemu_log_mask(LOG_GUEST_ERROR, "%s: CMD%i in a wrong state: %s (spec %s)\n",
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "%s: CMD%i in a wrong state: %s "
+                  "(previous CMD%i data %u/%zu; spec %s)\n",
                   sd->proto->name, req.cmd, sd_state_name(sd->state),
+                  sd->current_cmd, sd->data_offset, sd->data_size,
                   sd_version_str(sd->spec_version));
 
     return sd_illegal;

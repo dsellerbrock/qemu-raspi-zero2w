@@ -9,6 +9,7 @@
 #define BCM2835_DMA_H
 
 #include "hw/core/sysbus.h"
+#include "qemu/main-loop.h"
 #include "qom/object.h"
 
 typedef struct {
@@ -21,6 +22,13 @@ typedef struct {
     uint32_t stride;
     uint32_t nextconbk;
     uint32_t debug;
+    uint32_t xlen;
+    uint32_t xlen_td;
+    uint32_t ylen;
+    int16_t src_stride;
+    int16_t dst_stride;
+    bool cb_loaded;
+    bool updating;
 
     qemu_irq irq;
 } BCM2835DMAChan;
@@ -42,6 +50,8 @@ struct BCM2835DMAState {
     BCM2835DMAChan chan[BCM2835_DMA_NCHANS];
     uint32_t int_status;
     uint32_t enable;
+    uint8_t sdhost_dreq;
+    QEMUBH *dreq_bh;
 };
 
 #endif

@@ -210,6 +210,15 @@ static bool fb_update_display(void *opaque)
         qemu_console_update(s->con, 0, first, s->config.xres, last - first + 1);
     }
 
+    if (s->invalidate) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_fb: base=%08x memory=%s rows=%d..%d\n",
+                      s->config.base,
+                      s->fbsection.mr ? memory_region_name(s->fbsection.mr) :
+                                        "unmapped",
+                      first, last);
+    }
+
     s->invalidate = false;
     return true;
 }

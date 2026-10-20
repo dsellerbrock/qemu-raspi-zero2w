@@ -157,8 +157,19 @@ static void bcm2835_sdhost_send_command(BCM2835SDHostState *s)
     return;
 
 error:
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "bcm2835_sdhost: CMD%u arg=0x%08x failed, response length=%zu\n",
+                  request.cmd, request.arg, rlen);
     s->cmd |= SDCMD_FAIL_FLAG;
+    s->datacnt = 0;
+    s->fifo_pos = 0;
+    s->fifo_len = 0;
+    s->edm &= ~SDEDM_FSM_MASK;
+    s->edm |= SDEDM_FSM_DATAMODE;
+    s->status &= ~(SDHSTS_BUSY_IRPT | SDHSTS_BLOCK_IRPT |
+                   SDHSTS_SDIO_IRPT | SDHSTS_DATA_FLAG);
     s->status |= SDHSTS_CMD_TIME_OUT;
+    qemu_set_irq(s->dreq, 0);
 }
 
 static void bcm2835_sdhost_fifo_push(BCM2835SDHostState *s, uint32_t value)
@@ -214,6 +225,7 @@ static void bcm2835_sdhost_fifo_run(BCM2835SDHostState *s)
 {
     uint32_t value = 0;
     uint32_t datacnt_before = s->datacnt;
+    bool dreq;
     int n;
     int is_read;
     int is_write;
@@ -280,10 +292,20 @@ static void bcm2835_sdhost_fifo_run(BCM2835SDHostState *s)
         }
     }
 
+    if (is_read && !s->datacnt && !s->fifo_len) {
+        s->status &= ~(SDHSTS_DATA_FLAG | SDHSTS_SDIO_IRPT);
+    }
+
     bcm2835_sdhost_update_irq(s);
 
     s->edm &= ~(0x1f << 4);
     s->edm |= ((s->fifo_len & 0x1f) << 4);
+    trace_bcm2835_sdhost_state("fifo", s->cmd, s->datacnt, s->fifo_len,
+                               s->config, s->status, s->edm);
+    dreq = is_read ? s->fifo_len != 0 :
+           is_write ? s->datacnt != 0 &&
+                      s->fifo_len < BCM2835_SDHOST_FIFO_LEN : false;
+    qemu_set_irq(s->dreq, dreq);
     trace_bcm2835_sdhost_edm_change("fifo run", s->edm);
 }
 
@@ -352,6 +374,16 @@ static void bcm2835_sdhost_write(void *opaque, hwaddr offset,
     case SDCMD:
         s->cmd = value;
         if (value & SDCMD_NEW_FLAG) {
+            if ((value & SDCMD_CMD_MASK) == 12) {
+                s->datacnt = 0;
+                s->fifo_pos = 0;
+                s->fifo_len = 0;
+                s->edm &= ~SDEDM_FSM_MASK;
+                s->edm |= SDEDM_FSM_DATAMODE;
+                s->status &= ~(SDHSTS_BUSY_IRPT | SDHSTS_BLOCK_IRPT |
+                               SDHSTS_SDIO_IRPT | SDHSTS_DATA_FLAG);
+                qemu_set_irq(s->dreq, 0);
+            }
             sdhost_fifo_err_logged = false;
             bcm2835_sdhost_send_command(s);
             bcm2835_sdhost_fifo_run(s);
@@ -364,7 +396,19 @@ static void bcm2835_sdhost_write(void *opaque, hwaddr offset,
         break;
     case SDHSTS:
         s->status &= ~value;
+        if ((value & SDHSTS_SDIO_IRPT) &&
+            (s->cmd & SDCMD_READ_CMD) &&
+            (s->fifo_len > ((s->edm >> SDEDM_READ_THRESHOLD_SHIFT) &
+                            SDEDM_THRESHOLD_MASK) ||
+             (!s->datacnt && s->fifo_len))) {
+            s->status |= SDHSTS_DATA_FLAG;
+            if (s->config & SDHCFG_DATA_IRPT_EN) {
+                s->status |= SDHSTS_SDIO_IRPT;
+            }
+        }
         bcm2835_sdhost_update_irq(s);
+        trace_bcm2835_sdhost_state("hsts", s->cmd, s->datacnt, s->fifo_len,
+                                   s->config, s->status, s->edm);
         break;
     case SDARG:
         s->cmdarg = value;
@@ -379,6 +423,10 @@ static void bcm2835_sdhost_write(void *opaque, hwaddr offset,
         break;
     case SDHCFG:
         s->config = value;
+        if ((value & SDHCFG_DATA_IRPT_EN) &&
+            (s->status & SDHSTS_DATA_FLAG) && s->fifo_len) {
+            s->status |= SDHSTS_SDIO_IRPT;
+        }
         bcm2835_sdhost_fifo_run(s);
         break;
     case SDVDD:
@@ -443,6 +491,7 @@ static void bcm2835_sdhost_init(Object *obj)
                           TYPE_BCM2835_SDHOST, 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
+    qdev_init_gpio_out_named(DEVICE(s), &s->dreq, "dreq", 1);
 }
 
 static void bcm2835_sdhost_reset(DeviceState *dev)
@@ -454,11 +503,14 @@ static void bcm2835_sdhost_reset(DeviceState *dev)
     s->edm = 0x0000c60f;
     trace_bcm2835_sdhost_edm_change("device reset", s->edm);
     s->config = 0;
+    s->status = 0;
     s->hbct = 0;
     s->hblc = 0;
     s->datacnt = 0;
     s->fifo_pos = 0;
     s->fifo_len = 0;
+    qemu_set_irq(s->irq, 0);
+    qemu_set_irq(s->dreq, 0);
 }
 
 static void bcm2835_sdhost_class_init(ObjectClass *klass, const void *data)

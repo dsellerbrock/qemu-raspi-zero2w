@@ -23,6 +23,15 @@ void hvf_arm_init_debug(void);
 
 void hvf_arm_set_cpu_features_from_host(ARMCPU *cpu);
 
+#ifdef CONFIG_HVF_IS_POSSIBLE
+bool hvf_arm_el2_supported(void);
+#else
+static inline bool hvf_arm_el2_supported(void)
+{
+    return false;
+}
+#endif
+
 /*
  * We need access to types from macOS SDK >=15.2, so expose stubs if the
  * headers are not available until we raise our minimum macOS version.
