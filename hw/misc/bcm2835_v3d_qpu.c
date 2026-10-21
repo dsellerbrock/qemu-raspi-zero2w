@@ -5,10 +5,19 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/thread.h"
 #include "qemu/bswap.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "bcm2835_v3d_qpu.h"
+
+static GPrivate bcm2835_v3d_qpu_worker_mode = G_PRIVATE_INIT(NULL);
+
+void bcm2835_v3d_qpu_set_worker_mode(bool worker_mode)
+{
+    g_private_set(&bcm2835_v3d_qpu_worker_mode,
+                  worker_mode ? GINT_TO_POINTER(1) : NULL);
+}
 #include <math.h>
 
 #define QPU_FIELD(v, shift, mask) (((v) >> (shift)) & (mask))
@@ -640,9 +649,11 @@ static BCM2835V3DQPUResult qpu_tmu_fetch(BCM2835V3DQPUState *qpu,
     uint32_t config1;
 
     if (tmu->pending) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "bcm2835_v3d: QPU TMU%u fetch while previous result pending at pc=%u\n",
-                      unit, qpu->pc);
+        if (!g_private_get(&bcm2835_v3d_qpu_worker_mode)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: QPU TMU%u fetch while previous result pending at pc=%u\n",
+                          unit, qpu->pc);
+        }
         return QPU_UNSUPPORTED(qpu);
     }
 
@@ -662,11 +673,13 @@ static BCM2835V3DQPUResult qpu_tmu_fetch(BCM2835V3DQPUState *qpu,
         }
         /* shortcut: one mip level only; add LOD selection for multiple levels. */
         if (!qpu_tmu_decode_config(tmu->config0, config1, &config)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "bcm2835_v3d: unsupported TMU%u type=%u size=%ux%u wrap=%u/%u filter=%u/%u cfg=%08x/%08x\n",
-                          unit, config.type, config.width, config.height,
-                          config.wrap_s, config.wrap_t, config.min_filter,
-                          config.mag_filter, tmu->config0, config1);
+            if (!g_private_get(&bcm2835_v3d_qpu_worker_mode)) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm2835_v3d: unsupported TMU%u type=%u size=%ux%u wrap=%u/%u filter=%u/%u cfg=%08x/%08x\n",
+                              unit, config.type, config.width, config.height,
+                              config.wrap_s, config.wrap_t, config.min_filter,
+                              config.mag_filter, tmu->config0, config1);
+            }
             return QPU_UNSUPPORTED(qpu);
         }
         if ((config.type == 16 && !qpu->read_memory) ||

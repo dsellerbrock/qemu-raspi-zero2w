@@ -2852,6 +2852,24 @@ static uint32_t read_u32(const uint8_t *buffer)
            ((uint32_t)buffer[2] << 16) | ((uint32_t)buffer[3] << 24);
 }
 
+static gchar *test_v3d_hash_frame_status(const uint8_t *frame, size_t size)
+{
+    g_autofree uint8_t *data = g_malloc(size + 4 * sizeof(uint32_t));
+
+    memcpy(data, frame, size);
+    stl_le_p(data + size, readl(RASPI3_V3D_BASE + V3D_CT0CS));
+    stl_le_p(data + size + 4, readl(RASPI3_V3D_BASE + V3D_CT1CS));
+    stl_le_p(data + size + 8, readl(RASPI3_V3D_BASE + V3D_RFC));
+    stl_le_p(data + size + 12, readl(RASPI3_V3D_BASE + V3D_BFC));
+    return g_compute_checksum_for_data(G_CHECKSUM_SHA256, data,
+                                       size + 4 * sizeof(uint32_t));
+}
+
+static gchar *test_v3d_hash_frame(const uint8_t *frame, size_t size)
+{
+    return g_compute_checksum_for_data(G_CHECKSUM_SHA256, frame, size);
+}
+
 typedef struct V3DTestFragmentShader {
     const uint64_t *code;
     size_t code_words;
@@ -2908,7 +2926,8 @@ static void test_v3d_wait_ct1(void)
 
 static void test_v3d_render_reference_geometry(
     const V3DTestFragmentShader *fragment,
-    const uint32_t varyings[9][5], unsigned varying_count)
+    const uint32_t varyings[9][5], unsigned varying_count,
+    bool full_tile)
 {
     enum { fb_width = 64, fb_height = 65, max_shader_words = 64 };
     uint8_t bin_cl[128], render_cl[32], draw_cl[32];
@@ -2946,6 +2965,11 @@ static void test_v3d_render_reference_geometry(
         qpu_test_add_imm(7, 48, 0) | (1ULL << 44),
         3ULL << 60,
     };
+    static const uint32_t full_tile_screen_xy[9] = {
+        0x0200fe00, 0x02000200, 0xfe00fe00,
+        0x02000200, 0xfe000200, 0xfe00fe00,
+        0x0200fe00, 0x02000200, 0xfe00fe00,
+    };
 
     g_assert_cmpuint(varying_count, <=, 5);
     g_assert_cmpuint(fragment->code_words, <=, max_shader_words);
@@ -2956,6 +2980,10 @@ static void test_v3d_render_reference_geometry(
              word++) {
             uint32_t value = reference_vertices[vertex][word];
             uint32_t coordinate_value = value;
+
+            if (full_tile && word == 4) {
+                value = coordinate_value = full_tile_screen_xy[vertex];
+            }
 
             if (word >= 3 && word < 3 + varying_count) {
                 value = varyings[vertex][word - 3];
@@ -2973,7 +3001,6 @@ static void test_v3d_render_reference_geometry(
     vertex_instructions[1] =
         qpu_test_load_imm(49, vertex_setup_read | (8U << 20));
     static const unsigned output_inputs[] = { 4, 2, 7, 3, 4, 5, 6, 7 };
-
     for (unsigned i = 0; i < 8; i++) {
         vertex_instructions[i + 2] = qpu_test_add_imm(48, i, 0);
         vertex_instructions[i + 10] =
@@ -3011,7 +3038,7 @@ static void test_v3d_render_reference_geometry(
     stl_le_p(record + 28, 0x6200);
     stl_le_p(record + 36, 0x7000);
     stl_le_p(record + 44, 0x7400);
-    record[0] = 1U << 2;
+    record[0] = full_tile ? 0 : 1U << 2;
     record[3] = varying_count;
     record[14] = 1;
     record[26] = 2;
@@ -3031,7 +3058,7 @@ static void test_v3d_render_reference_geometry(
     bin_cl[bin_size++] = 64;
     append_u32(bin_cl, &bin_size, 0x34002);
     bin_cl[bin_size++] = 103;
-    append_u16(bin_cl, &bin_size, 40 * 16);
+    append_u16(bin_cl, &bin_size, (full_tile ? 32 : 40) * 16);
     append_u16(bin_cl, &bin_size, 32 * 16);
     bin_cl[bin_size++] = 105;
     append_u32(bin_cl, &bin_size, 0x44000000);
@@ -3084,7 +3111,7 @@ static void test_v3d_render_reference_geometry(
     append_u32(render_cl, &render_size, 0);
     render_cl[render_size++] = 0;
     render_cl[render_size++] = 103;
-    append_u16(render_cl, &render_size, 40 * 16);
+    append_u16(render_cl, &render_size, (full_tile ? 32 : 40) * 16);
     append_u16(render_cl, &render_size, 32 * 16);
     render_cl[render_size++] = 0;
     memwrite(CL_ADDR, render_cl, render_size);
@@ -3143,7 +3170,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         varyings[vertex][0] = reference_vertices[vertex][5];
         varyings[vertex][1] = reference_vertices[vertex][6];
     }
-    test_v3d_render_reference_geometry(&fragment, varyings, 2);
+    test_v3d_render_reference_geometry(&fragment, varyings, 2, false);
     memread(FB_ADDR, fb, sizeof(fb));
     g_assert_cmphex(read_u32(fb + (30 * test_fb_width + 32) * 4),
                     ==, 0x5a5a5a5a);
@@ -3952,14 +3979,15 @@ static bool test_v3d_reference_varyings_at(unsigned pixel_x,
 static size_t lt_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
                                     unsigned bytes_per_pixel);
 
-static void test_v3d_textured_reference_triangles(bool stk_5var)
+static gchar *test_v3d_textured_reference_triangles(bool stk_5var,
+                                                     bool full_tile)
 {
     enum {
         fb_width = 64,
         fb_height = 65,
-        reference_covered_pixels = 880,
         clear_color = 0xff00ff00,
     };
+    unsigned reference_covered_pixels = full_tile ? 4096 : 880;
     /* The captured shader uses a 16x16 LT descriptor; 2var tests T-format. */
     unsigned texture_width = stk_5var ? 16 : 512;
     unsigned texture_height = stk_5var ? 16 : 256;
@@ -4060,7 +4088,8 @@ static void test_v3d_textured_reference_triangles(bool stk_5var)
             varyings[vertex][1] = qpu_test_float_bits(t);
         }
     }
-    test_v3d_render_reference_geometry(&fragment, varyings, varying_count);
+    test_v3d_render_reference_geometry(&fragment, varyings, varying_count,
+                                       full_tile);
     memread(FB_ADDR, fb, sizeof(fb));
 
     for (unsigned y = 0; y < fb_height; y++) {
@@ -4068,8 +4097,8 @@ static void test_v3d_textured_reference_triangles(bool stk_5var)
             uint32_t actual = read_u32(fb + (y * fb_width + x) * 4);
             bool actual_covered = actual != clear_color;
             double sample_s = 0.0, sample_t = 0.0;
-            bool expected_covered = test_v3d_reference_varyings_at(
-                x, y, &sample_s, &sample_t);
+            bool expected_covered = full_tile ? y < 64 :
+                test_v3d_reference_varyings_at(x, y, &sample_s, &sample_t);
             uint32_t expected = clear_color;
             uint32_t decoded = stk_5var ?
                 (actual & 0xff00ff00) | ((actual & 0xff) << 16) |
@@ -4151,25 +4180,46 @@ static void test_v3d_textured_reference_triangles(bool stk_5var)
             }
         }
     }
-    g_test_message("%s covered=%u reference=%u exact=%u within1-only=%u "
-                   "outside1=%u first8=%s",
-                   stk_5var ? "STK-5-varying" : "2-varying",
-                   covered_pixels, reference_pixels, exact_matches,
-                   within1_only, mismatch_count, first_mismatches->str);
+    if (full_tile && covered_pixels != 4096) {
+        for (unsigned y = 0; y < 64; y++) {
+            unsigned row_coverage = 0;
+            unsigned min_x = 64, max_x = 0;
+
+            for (unsigned x = 0; x < 64; x++) {
+                if (read_u32(fb + (y * fb_width + x) * 4) != clear_color) {
+                    row_coverage++;
+                    min_x = MIN(min_x, x);
+                    max_x = MAX(max_x, x);
+                }
+            }
+            if (row_coverage) {
+                g_test_message("full-tile row %u coverage=%u x=%u..%u",
+                               y, row_coverage, min_x, max_x);
+            }
+        }
+    }
+    if (!full_tile) {
+        g_test_message("%s covered=%u reference=%u exact=%u within1-only=%u "
+                       "outside1=%u first8=%s",
+                       stk_5var ? "STK-5-varying" : "2-varying",
+                       covered_pixels, reference_pixels, exact_matches,
+                       within1_only, mismatch_count, first_mismatches->str);
+    }
     g_string_free(first_mismatches, TRUE);
     g_assert_cmpuint(reference_pixels, ==, reference_covered_pixels);
     g_assert_cmpuint(covered_pixels, ==, reference_covered_pixels);
     g_assert_cmpuint(mismatch_count, ==, 0);
+    return test_v3d_hash_frame_status(fb, sizeof(fb));
 }
 
 static void test_v3d_textured_tformat_2var(void)
 {
-    test_v3d_textured_reference_triangles(false);
+    g_free(test_v3d_textured_reference_triangles(false, false));
 }
 
 static void test_v3d_textured_lt_stk5var(void)
 {
-    test_v3d_textured_reference_triangles(true);
+    g_free(test_v3d_textured_reference_triangles(true, false));
 }
 
 static size_t lt_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
@@ -4404,6 +4454,95 @@ static void test_v3d_ct1_load_store_layout_conversion(void)
     }
 }
 
+static void test_v3d_fragment_worker_equivalence(void)
+{
+    enum { frame_size = 64 * 65 * sizeof(uint32_t), stress_iterations = 20 };
+    uint8_t frame[frame_size];
+    g_autofree gchar *serial_varying = NULL;
+    g_autofree gchar *serial_texture = NULL;
+    g_autofree gchar *serial_stk = NULL;
+    g_autofree gchar *serial_texture_pixels = NULL;
+    g_autofree gchar *serial_stk_pixels = NULL;
+    g_autofree gchar *serial_full = NULL;
+    g_autofree gchar *serial_full_pixels = NULL;
+    g_autofree gchar *worker_varying = NULL;
+    g_autofree gchar *worker_texture = NULL;
+    g_autofree gchar *worker_stk = NULL;
+    g_autofree gchar *worker_texture_pixels = NULL;
+    g_autofree gchar *worker_stk_pixels = NULL;
+    g_autofree gchar *worker_full = NULL;
+    g_autofree gchar *worker_full_pixels = NULL;
+
+    qtest_end();
+    qtest_start("-machine raspi3ap -smp 4");
+    test_v3d_ct0_clips_and_rasterizes_varying_triangles();
+    memread(FB_ADDR, frame, sizeof(frame));
+    serial_varying = test_v3d_hash_frame_status(frame, sizeof(frame));
+    serial_texture = test_v3d_textured_reference_triangles(false, false);
+    memread(FB_ADDR, frame, sizeof(frame));
+    serial_texture_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    serial_stk = test_v3d_textured_reference_triangles(true, false);
+    memread(FB_ADDR, frame, sizeof(frame));
+    serial_stk_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    serial_full = test_v3d_textured_reference_triangles(true, true);
+    memread(FB_ADDR, frame, sizeof(frame));
+    serial_full_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    for (unsigned i = 0; i < stress_iterations; i++) {
+        g_free(test_v3d_textured_reference_triangles(false, false));
+        memread(FB_ADDR, frame, sizeof(frame));
+        g_autofree gchar *texture = test_v3d_hash_frame(frame, sizeof(frame));
+        g_free(test_v3d_textured_reference_triangles(true, false));
+        memread(FB_ADDR, frame, sizeof(frame));
+        g_autofree gchar *stk = test_v3d_hash_frame(frame, sizeof(frame));
+        g_free(test_v3d_textured_reference_triangles(true, true));
+        memread(FB_ADDR, frame, sizeof(frame));
+        g_autofree gchar *full = test_v3d_hash_frame(frame, sizeof(frame));
+
+        g_assert_cmpstr(texture, ==, serial_texture_pixels);
+        g_assert_cmpstr(stk, ==, serial_stk_pixels);
+        g_assert_cmpstr(full, ==, serial_full_pixels);
+    }
+
+    qtest_end();
+    qtest_start("-machine raspi3ap -smp 4 "
+                "-global bcm2835_v3d.fragment-workers=4");
+    test_v3d_ct0_clips_and_rasterizes_varying_triangles();
+    memread(FB_ADDR, frame, sizeof(frame));
+    worker_varying = test_v3d_hash_frame_status(frame, sizeof(frame));
+    worker_texture = test_v3d_textured_reference_triangles(false, false);
+    memread(FB_ADDR, frame, sizeof(frame));
+    worker_texture_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    worker_stk = test_v3d_textured_reference_triangles(true, false);
+    memread(FB_ADDR, frame, sizeof(frame));
+    worker_stk_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    worker_full = test_v3d_textured_reference_triangles(true, true);
+    memread(FB_ADDR, frame, sizeof(frame));
+    worker_full_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    g_assert_cmpstr(worker_varying, ==, serial_varying);
+    g_assert_cmpstr(worker_texture, ==, serial_texture);
+    g_assert_cmpstr(worker_stk, ==, serial_stk);
+    g_assert_cmpstr(worker_full, ==, serial_full);
+    for (unsigned i = 0; i < stress_iterations; i++) {
+        g_free(test_v3d_textured_reference_triangles(false, false));
+        memread(FB_ADDR, frame, sizeof(frame));
+        g_autofree gchar *texture = test_v3d_hash_frame(frame, sizeof(frame));
+        g_free(test_v3d_textured_reference_triangles(true, false));
+        memread(FB_ADDR, frame, sizeof(frame));
+        g_autofree gchar *stk = test_v3d_hash_frame(frame, sizeof(frame));
+        g_free(test_v3d_textured_reference_triangles(true, true));
+        memread(FB_ADDR, frame, sizeof(frame));
+        g_autofree gchar *full = test_v3d_hash_frame(frame, sizeof(frame));
+
+        g_assert_cmpstr(texture, ==, serial_texture_pixels);
+        g_assert_cmpstr(stk, ==, serial_stk_pixels);
+        g_assert_cmpstr(full, ==, serial_full_pixels);
+    }
+    g_test_message("fragment hashes: varying=%s texture=%s stk=%s full=%s; "
+                   "%u serial and %u worker stress iterations match",
+                   worker_varying, worker_texture, worker_stk, worker_full,
+                   stress_iterations, stress_iterations);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -4530,7 +4669,14 @@ int main(int argc, char **argv)
                    test_v3d_ct1_compressed_xy_triangle_encodings);
     qtest_add_func("/bcm2835/v3d/ct1_frame_done_requires_eof",
                    test_v3d_ct1_frame_done_requires_eof);
-    qtest_start("-machine raspi3ap -smp 4");
+    qtest_add_func("/bcm2835/v3d/fragment_worker_equivalence",
+                   test_v3d_fragment_worker_equivalence);
+    if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_WORKERS"), "4") == 0) {
+        qtest_start("-machine raspi3ap -smp 4 "
+                    "-global bcm2835_v3d.fragment-workers=4");
+    } else {
+        qtest_start("-machine raspi3ap -smp 4");
+    }
     ret = g_test_run();
     qtest_end();
     return ret;

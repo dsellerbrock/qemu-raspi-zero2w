@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qemu/main-loop.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_V3D "bcm2835_v3d"
@@ -36,6 +37,16 @@ struct BCM2835V3DState {
     uint32_t irq_status;
     uint32_t irq_enable;
     uint32_t fragment_dump_count;
+    uint32_t fragment_workers_requested;
+    uint32_t fragment_workers;
+    QemuThread *fragment_worker_threads;
+    QemuMutex fragment_worker_mutex;
+    QemuCond fragment_worker_cond;
+    QemuCond fragment_worker_done;
+    uint64_t fragment_worker_generation;
+    unsigned fragment_worker_completed;
+    void *fragment_worker_job;
+    bool fragment_worker_quit;
 
     uint32_t ct_cs[2];
     uint32_t ct_ca[2];

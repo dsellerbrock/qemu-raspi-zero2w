@@ -116,6 +116,7 @@ typedef enum BCM2835V3DQPUResult {
 } BCM2835V3DQPUResult;
 
 void bcm2835_v3d_qpu_init(BCM2835V3DQPUState *qpu);
+void bcm2835_v3d_qpu_set_worker_mode(bool worker_mode);
 BCM2835V3DQPUResult bcm2835_v3d_qpu_run(const uint8_t *code,
                                          uint32_t code_size,
                                          uint32_t instruction_budget,

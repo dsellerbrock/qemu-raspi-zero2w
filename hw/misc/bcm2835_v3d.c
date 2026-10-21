@@ -6,13 +6,16 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "hw/core/boards.h"
 #include "qapi/error.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/misc/bcm2835_v3d.h"
 #include "bcm2835_v3d_qpu.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/rcu.h"
 #include "qemu/timer.h"
 #include "system/dma.h"
 #include "trace.h"
@@ -20,6 +23,7 @@
 #include "bcm2835_v3d_wgpu.h"
 #endif
 #include <math.h>
+#include <unistd.h>
 
 #define V3D_IDENT0             0x000
 #define V3D_IDENT1             0x004
@@ -121,6 +125,41 @@ typedef struct BCM2835V3DFragmentVarying {
     unsigned count;
 } BCM2835V3DFragmentVarying;
 
+typedef struct BCM2835V3DFragmentWorkerSlot {
+    BCM2835V3DQPUResult result;
+    uint32_t varying_index;
+    uint16_t color_write_mask;
+    uint32_t colors[BCM2835_V3D_QPU_LANES];
+    bool fallback;
+} BCM2835V3DFragmentWorkerSlot;
+
+typedef struct BCM2835V3DFragmentWorkerJob {
+    BCM2835V3DState *s;
+    const uint8_t *code;
+    uint32_t code_size;
+    const uint16_t *pixels;
+    const uint32_t *varying_partial;
+    const uint32_t *fragment_w;
+    unsigned count;
+    unsigned batches;
+    unsigned varying_count;
+    uint32_t uniforms_address;
+    BCM2835V3DFragmentWorkerSlot *slots;
+    int next_batch;
+} BCM2835V3DFragmentWorkerJob;
+
+static GPrivate bcm2835_v3d_fragment_worker_slot = G_PRIVATE_INIT(NULL);
+
+static void bcm2835_v3d_fragment_worker_fallback(void)
+{
+    BCM2835V3DFragmentWorkerSlot *slot =
+        g_private_get(&bcm2835_v3d_fragment_worker_slot);
+
+    if (slot) {
+        slot->fallback = true;
+    }
+}
+
 /* VC4 packet 49 and compressed-list relative branches are not decoded yet. */
 static unsigned bcm2835_v3d_packet_size(uint8_t opcode)
 {
@@ -206,6 +245,25 @@ static void bcm2835_v3d_wgpu_batch_free(BCM2835V3DState *s);
 static bool bcm2835_v3d_dma_read(BCM2835V3DState *s, uint32_t addr,
                                  void *buf, size_t len)
 {
+    if (g_private_get(&bcm2835_v3d_fragment_worker_slot)) {
+        hwaddr xlat, plen = len;
+        MemoryRegion *mr;
+
+        if ((uint64_t)addr + len > UINT32_MAX + 1ULL) {
+            bcm2835_v3d_fragment_worker_fallback();
+            return false;
+        }
+        RCU_READ_LOCK_GUARD();
+        mr = address_space_translate(&s->dma_as, addr, &xlat, &plen, false,
+                                     MEMTXATTRS_UNSPECIFIED);
+        if (!mr || plen < len || !memory_region_is_ram(mr) ||
+            dma_memory_read(&s->dma_as, addr, buf, len,
+                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
+            bcm2835_v3d_fragment_worker_fallback();
+            return false;
+        }
+        return true;
+    }
     MemTxResult result = dma_memory_read(&s->dma_as, addr, buf, len,
                                           MEMTXATTRS_UNSPECIFIED);
 
@@ -721,6 +779,11 @@ static bool bcm2835_v3d_qpu_write_memory(void *opaque, uint32_t address,
     BCM2835V3DState *s = opaque;
     uint8_t bytes[sizeof(uint32_t)];
 
+    if (g_private_get(&bcm2835_v3d_fragment_worker_slot)) {
+        bcm2835_v3d_fragment_worker_fallback();
+        return false;
+    }
+
     if ((uint64_t)address + sizeof(bytes) > UINT32_MAX + 1ULL) {
         return false;
     }
@@ -1105,6 +1168,157 @@ static void bcm2835_v3d_init_fragment_qpu(
                 varying_partial[(first + lane) * varying->count + index];
         }
     }
+}
+
+static void bcm2835_v3d_fragment_worker_run_batches(
+    BCM2835V3DFragmentWorkerJob *job)
+{
+    int index;
+
+    while ((index = qatomic_fetch_inc(&job->next_batch)) < job->batches) {
+        BCM2835V3DFragmentWorkerSlot *slot = &job->slots[index];
+        BCM2835V3DState *s = job->s;
+        BCM2835V3DQPUState qpu;
+        BCM2835V3DFragmentVarying varying = { 0 };
+        uint32_t first = index * BCM2835_V3D_QPU_LANES;
+        uint32_t count = MIN(job->count - first,
+                             BCM2835_V3D_QPU_LANES);
+        uint32_t executed;
+
+        g_private_set(&bcm2835_v3d_fragment_worker_slot, slot);
+        bcm2835_v3d_qpu_set_worker_mode(true);
+        bcm2835_v3d_init_fragment_qpu(
+            s, &qpu, &varying, job->pixels, job->varying_partial,
+            job->fragment_w, job->uniforms_address, job->varying_count,
+            first, count);
+        slot->result = bcm2835_v3d_qpu_run(
+            job->code, job->code_size, V3D_QPU_INSTRUCTION_BUDGET,
+            &qpu, &executed);
+        slot->varying_index = qpu.varying_index;
+        slot->color_write_mask = qpu.tlb_color_write_mask;
+        memcpy(slot->colors, qpu.io[46], sizeof(slot->colors));
+        bcm2835_v3d_qpu_set_worker_mode(false);
+        g_private_set(&bcm2835_v3d_fragment_worker_slot, NULL);
+    }
+}
+
+static void *bcm2835_v3d_fragment_worker_thread(void *opaque)
+{
+    BCM2835V3DState *s = opaque;
+    uint64_t generation = 0;
+
+    rcu_register_thread();
+    qemu_mutex_lock(&s->fragment_worker_mutex);
+    while (!s->fragment_worker_quit) {
+        BCM2835V3DFragmentWorkerJob *job;
+
+        while (!s->fragment_worker_quit &&
+               generation == s->fragment_worker_generation) {
+            qemu_cond_wait(&s->fragment_worker_cond,
+                           &s->fragment_worker_mutex);
+        }
+        if (s->fragment_worker_quit) {
+            break;
+        }
+        generation = s->fragment_worker_generation;
+        job = s->fragment_worker_job;
+        qemu_mutex_unlock(&s->fragment_worker_mutex);
+        bcm2835_v3d_fragment_worker_run_batches(job);
+        qemu_mutex_lock(&s->fragment_worker_mutex);
+        s->fragment_worker_completed++;
+        if (s->fragment_worker_completed == s->fragment_workers) {
+            qemu_cond_broadcast(&s->fragment_worker_done);
+        }
+    }
+    qemu_mutex_unlock(&s->fragment_worker_mutex);
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static bool bcm2835_v3d_fragment_pixels_unique(const uint16_t *pixels,
+                                               unsigned count)
+{
+    uint64_t seen[64] = { 0 };
+
+    for (unsigned i = 0; i < count; i++) {
+        unsigned pixel = pixels[i];
+        uint64_t bit;
+
+        if (pixel >= 64 * 64) {
+            return false;
+        }
+        bit = UINT64_C(1) << (pixel % 64);
+        if (seen[pixel / 64] & bit) {
+            return false;
+        }
+        seen[pixel / 64] |= bit;
+    }
+    return true;
+}
+
+static bool bcm2835_v3d_fragment_try_workers(
+    BCM2835V3DState *s, const uint16_t *pixels,
+    const uint32_t *varying_partial, const uint32_t *fragment_w,
+    unsigned count, uint32_t uniforms_address, unsigned varying_count,
+    const uint8_t *code, uint32_t code_size)
+{
+    BCM2835V3DFragmentWorkerJob job = {
+        .s = s,
+        .code = code,
+        .code_size = code_size,
+        .pixels = pixels,
+        .varying_partial = varying_partial,
+        .fragment_w = fragment_w,
+        .count = count,
+        .batches = DIV_ROUND_UP(count, BCM2835_V3D_QPU_LANES),
+        .varying_count = varying_count,
+        .uniforms_address = uniforms_address,
+    };
+
+    if (!s->fragment_workers || job.batches < 2 || s->wgpu_context ||
+        !bcm2835_v3d_fragment_pixels_unique(pixels, count)) {
+        return false;
+    }
+    g_autofree BCM2835V3DFragmentWorkerSlot *slots =
+        g_new0(BCM2835V3DFragmentWorkerSlot, job.batches);
+
+    job.slots = slots;
+    qemu_mutex_lock(&s->fragment_worker_mutex);
+    s->fragment_worker_job = &job;
+    s->fragment_worker_completed = 0;
+    s->fragment_worker_generation++;
+    qemu_cond_broadcast(&s->fragment_worker_cond);
+    qemu_mutex_unlock(&s->fragment_worker_mutex);
+
+    bcm2835_v3d_fragment_worker_run_batches(&job);
+
+    qemu_mutex_lock(&s->fragment_worker_mutex);
+    while (s->fragment_worker_completed < s->fragment_workers) {
+        qemu_cond_wait(&s->fragment_worker_done, &s->fragment_worker_mutex);
+    }
+    s->fragment_worker_job = NULL;
+    qemu_mutex_unlock(&s->fragment_worker_mutex);
+
+    for (unsigned i = 0; i < job.batches; i++) {
+        BCM2835V3DFragmentWorkerSlot *slot = &job.slots[i];
+        unsigned first = i * BCM2835_V3D_QPU_LANES;
+        unsigned batch = MIN(count - first, BCM2835_V3D_QPU_LANES);
+        uint16_t expected_mask = batch == BCM2835_V3D_QPU_LANES ?
+                                 UINT16_MAX : (1U << batch) - 1;
+
+        if (slot->fallback || slot->result != BCM2835_V3D_QPU_END ||
+            slot->varying_index != varying_count ||
+            (slot->color_write_mask & expected_mask) != expected_mask) {
+            return false;
+        }
+    }
+    for (unsigned i = 0; i < count; i++) {
+        unsigned batch = i / BCM2835_V3D_QPU_LANES;
+        unsigned lane = i % BCM2835_V3D_QPU_LANES;
+
+        s->tile_color[pixels[i]] = job.slots[batch].colors[lane];
+    }
+    return true;
 }
 
 #define BCM2835_V3D_WGPU_TILES_PER_SLICE 4
@@ -1851,6 +2065,15 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
         return false;
     }
 #endif
+
+    if (s->fragment_workers) {
+        if (bcm2835_v3d_fragment_try_workers(
+                s, pixels, varying_partial, fragment_w, count,
+                uniforms_address, s->shader_record[3], code, code_size)) {
+            g_free(code);
+            return true;
+        }
+    }
 
     for (unsigned first = 0; first < count;
          first += BCM2835_V3D_QPU_LANES) {
@@ -3827,6 +4050,50 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     bcm2835_v3d_update_irq(s);
 }
 
+static void bcm2835_v3d_fragment_workers_init(BCM2835V3DState *s)
+{
+    long host_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    unsigned guest_cpus = current_machine ? current_machine->smp.cpus : 1;
+    unsigned available = host_cpus > guest_cpus ? host_cpus - guest_cpus : 0;
+
+    s->fragment_workers = MIN(MIN(s->fragment_workers_requested, 4),
+                              available);
+    qemu_log("bcm2835_v3d: fragment workers=%u\n", s->fragment_workers);
+    if (!s->fragment_workers) {
+        return;
+    }
+
+    qemu_mutex_init(&s->fragment_worker_mutex);
+    qemu_cond_init(&s->fragment_worker_cond);
+    qemu_cond_init(&s->fragment_worker_done);
+    s->fragment_worker_threads = g_new0(QemuThread, s->fragment_workers);
+    for (unsigned i = 0; i < s->fragment_workers; i++) {
+        qemu_thread_create(&s->fragment_worker_threads[i],
+                           "v3d-fragment", bcm2835_v3d_fragment_worker_thread,
+                           s, QEMU_THREAD_JOINABLE);
+    }
+}
+
+static void bcm2835_v3d_fragment_workers_destroy(BCM2835V3DState *s)
+{
+    if (!s->fragment_worker_threads) {
+        return;
+    }
+    qemu_mutex_lock(&s->fragment_worker_mutex);
+    s->fragment_worker_quit = true;
+    s->fragment_worker_generation++;
+    qemu_cond_broadcast(&s->fragment_worker_cond);
+    qemu_mutex_unlock(&s->fragment_worker_mutex);
+    for (unsigned i = 0; i < s->fragment_workers; i++) {
+        qemu_thread_join(&s->fragment_worker_threads[i]);
+    }
+    g_free(s->fragment_worker_threads);
+    s->fragment_worker_threads = NULL;
+    qemu_cond_destroy(&s->fragment_worker_done);
+    qemu_cond_destroy(&s->fragment_worker_cond);
+    qemu_mutex_destroy(&s->fragment_worker_mutex);
+}
+
 static void bcm2835_v3d_realize(DeviceState *dev, Error **errp)
 {
     BCM2835V3DState *s = BCM2835_V3D(dev);
@@ -3835,6 +4102,7 @@ static void bcm2835_v3d_realize(DeviceState *dev, Error **errp)
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_V3D "-memory");
+    bcm2835_v3d_fragment_workers_init(s);
 #ifdef CONFIG_V3D_WGPU
     const char *library = g_getenv("QEMU_V3D_WGPU_LIBRARY");
     const char *verify = g_getenv("QEMU_V3D_WGPU_VERIFY");
@@ -3857,6 +4125,7 @@ static void bcm2835_v3d_unrealize(DeviceState *dev)
         qemu_bh_delete(s->ct1_bh);
         s->ct1_bh = NULL;
     }
+    bcm2835_v3d_fragment_workers_destroy(s);
     bcm2835_v3d_wgpu_batch_free(s);
 #ifdef CONFIG_V3D_WGPU
     bcm2835_v3d_wgpu_free(s->wgpu_context);
@@ -4018,9 +4287,14 @@ static void bcm2835_v3d_init(Object *obj)
 static void bcm2835_v3d_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    static const Property properties[] = {
+        DEFINE_PROP_UINT32("fragment-workers", BCM2835V3DState,
+                           fragment_workers_requested, 0),
+    };
 
     dc->realize = bcm2835_v3d_realize;
     dc->unrealize = bcm2835_v3d_unrealize;
+    device_class_set_props(dc, properties);
     device_class_set_legacy_reset(dc, bcm2835_v3d_reset);
     dc->vmsd = &vmstate_bcm2835_v3d;
 }
