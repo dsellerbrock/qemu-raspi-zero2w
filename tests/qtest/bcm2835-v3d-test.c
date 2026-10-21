@@ -2879,6 +2879,17 @@ typedef struct V3DTestFragmentShader {
     uint32_t initial_color;
 } V3DTestFragmentShader;
 
+typedef struct V3DTestGeometryInput {
+    const uint32_t (*vertices)[8];
+    unsigned count;
+    uint32_t vertex_address;
+    uint32_t coordinate_address;
+    uint32_t first;
+    bool expect_ct0_error;
+    uint8_t tiles_x;
+    uint8_t tiles_y;
+} V3DTestGeometryInput;
+
 static const uint32_t reference_vertices[9][8] = {
     { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
       0x0100ff00, 0x3f800000, 0x40000000, 0x3f800000 },
@@ -2928,19 +2939,31 @@ static void test_v3d_wait_ct1(void)
 static void test_v3d_render_reference_geometry(
     const V3DTestFragmentShader *fragment,
     const uint32_t varyings[9][5], unsigned varying_count,
-    bool full_tile, const uint32_t (*clip_space)[4], bool frame_done)
+    bool full_tile, const uint32_t (*clip_space)[4], bool frame_done,
+    const V3DTestGeometryInput *geometry)
 {
     enum { fb_width = 64, fb_height = 65, max_shader_words = 64 };
     uint8_t bin_cl[128], render_cl[32], draw_cl[32];
     uint8_t record[52] = { 0 };
-    uint8_t vertex_data[sizeof(reference_vertices)];
-    uint8_t coordinate_data[sizeof(reference_vertices)];
     uint8_t vertex_code[19 * sizeof(uint64_t)] = { 0 };
     uint8_t coordinate_code[19 * sizeof(uint64_t)] = { 0 };
     uint8_t fragment_code[max_shader_words * sizeof(uint64_t)] = { 0 };
     uint8_t uniform_data[16 * sizeof(uint32_t)] = { 0 };
     uint8_t initial[fb_width * fb_height * sizeof(uint32_t)];
+    const V3DTestGeometryInput default_geometry = {
+        .vertices = reference_vertices,
+        .count = clip_space ? 3 : G_N_ELEMENTS(reference_vertices),
+        .vertex_address = 0x7000,
+        .coordinate_address = 0x7400,
+        .first = 0,
+        .expect_ct0_error = false,
+        .tiles_x = 1,
+        .tiles_y = 1,
+    };
+    g_autofree uint8_t *vertex_data = NULL;
+    g_autofree uint8_t *coordinate_data = NULL;
     size_t bin_size = 0, render_size = 0, draw_size = 0;
+    size_t vertex_data_size;
     uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8);
     uint32_t vertex_setup_read = (1U << 12) | (1U << 11) | (2U << 8);
     uint32_t coordinate_setup_read = vertex_setup_read | 7;
@@ -2973,14 +2996,23 @@ static void test_v3d_render_reference_geometry(
     };
     static const unsigned clip_space_input_word[] = { 0, 1, 2, 3 };
 
+    if (!geometry) {
+        geometry = &default_geometry;
+    }
+    g_assert(!varying_count ||
+             geometry->count <= G_N_ELEMENTS(reference_vertices));
+    g_assert(!full_tile ||
+             geometry->count <= G_N_ELEMENTS(full_tile_screen_xy));
+    vertex_data_size = geometry->count * sizeof(reference_vertices[0]);
+    vertex_data = g_malloc(vertex_data_size);
+    coordinate_data = g_malloc(vertex_data_size);
     g_assert_cmpuint(varying_count, <=, 5);
     g_assert_cmpuint(fragment->code_words, <=, max_shader_words);
     g_assert_cmpuint(fragment->uniform_words, <=, 16);
-    for (unsigned vertex = 0; vertex < G_N_ELEMENTS(reference_vertices);
-         vertex++) {
+    for (unsigned vertex = 0; vertex < geometry->count; vertex++) {
         for (unsigned word = 0; word < G_N_ELEMENTS(reference_vertices[0]);
              word++) {
-            uint32_t value = reference_vertices[vertex][word];
+            uint32_t value = geometry->vertices[vertex][word];
             uint32_t coordinate_value = value;
 
             if (full_tile && word == 4) {
@@ -3034,8 +3066,8 @@ static void test_v3d_render_reference_geometry(
         stl_le_p(initial + i, fragment->initial_color);
     }
     memwrite(FB_ADDR, initial, sizeof(initial));
-    memwrite(0x7000, vertex_data, sizeof(vertex_data));
-    memwrite(0x7400, coordinate_data, sizeof(coordinate_data));
+    memwrite(geometry->vertex_address, vertex_data, vertex_data_size);
+    memwrite(geometry->coordinate_address, coordinate_data, vertex_data_size);
     memwrite(0x6000, vertex_code, sizeof(vertex_code));
     memwrite(0x6200, coordinate_code, sizeof(coordinate_code));
     memwrite(0x6400, fragment_code,
@@ -3046,8 +3078,8 @@ static void test_v3d_render_reference_geometry(
     stl_le_p(record + 8, 0x6600);
     stl_le_p(record + 16, 0x6000);
     stl_le_p(record + 28, 0x6200);
-    stl_le_p(record + 36, 0x7000);
-    stl_le_p(record + 44, 0x7400);
+    stl_le_p(record + 36, geometry->vertex_address);
+    stl_le_p(record + 44, geometry->coordinate_address);
     record[0] = full_tile ? 0 : 1U << 2;
     record[3] = varying_count;
     record[14] = 1;
@@ -3061,8 +3093,8 @@ static void test_v3d_render_reference_geometry(
     append_u32(bin_cl, &bin_size, 0x30000);
     append_u32(bin_cl, &bin_size, clip_space ? 0x1000 : 0x140);
     append_u32(bin_cl, &bin_size, 0x32000);
-    bin_cl[bin_size++] = 1;
-    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = geometry->tiles_x;
+    bin_cl[bin_size++] = geometry->tiles_y;
     bin_cl[bin_size++] = varying_count > 2 ? 0x54 : 0x2c;
     bin_cl[bin_size++] = 6;
     bin_cl[bin_size++] = 64;
@@ -3077,9 +3109,8 @@ static void test_v3d_render_reference_geometry(
                clip_space ? 0xc5480000 : 0xc4000000);
     bin_cl[bin_size++] = 33;
     bin_cl[bin_size++] = 4;
-    append_u32(bin_cl, &bin_size,
-               clip_space ? 3 : G_N_ELEMENTS(reference_vertices));
-    append_u32(bin_cl, &bin_size, 0);
+    append_u32(bin_cl, &bin_size, geometry->count);
+    append_u32(bin_cl, &bin_size, geometry->first);
     bin_cl[bin_size++] = 4;
     memwrite(CL_ADDR, bin_cl, bin_size);
     writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
@@ -3090,6 +3121,10 @@ static void test_v3d_render_reference_geometry(
     uint32_t ct0cs = readl(RASPI3_V3D_BASE + V3D_CT0CS);
 
     if (clip_space) {
+        if (geometry->expect_ct0_error) {
+            g_assert_cmphex(ct0cs & V3D_CTERR, ==, V3D_CTERR);
+            return;
+        }
         g_assert_cmphex(ct0cs & (V3D_CTRUN | V3D_CTERR), ==, 0);
         g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA), ==,
                         readl(RASPI3_V3D_BASE + V3D_CT0EA));
@@ -3196,7 +3231,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         varyings[vertex][1] = reference_vertices[vertex][6];
     }
     test_v3d_render_reference_geometry(&fragment, varyings, 2, false, NULL,
-                                       true);
+                                       true, NULL);
     memread(FB_ADDR, fb, sizeof(fb));
     g_assert_cmphex(read_u32(fb + (30 * test_fb_width + 32) * 4),
                     ==, 0x5a5a5a5a);
@@ -4116,7 +4151,7 @@ static gchar *test_v3d_textured_reference_triangles(bool stk_5var,
         }
     }
     test_v3d_render_reference_geometry(&fragment, varyings, varying_count,
-                                       full_tile, NULL, frame_done);
+                                       full_tile, NULL, frame_done, NULL);
     memread(FB_ADDR, fb, sizeof(fb));
 
     for (unsigned y = 0; y < fb_height; y++) {
@@ -4776,7 +4811,7 @@ static void test_v3d_ct0_clip_case(const uint32_t clip_space[3][4],
     qtest_start(qemu_args);
 
     test_v3d_render_reference_geometry(&fragment, varyings, 0, false,
-                                       clip_space, true);
+                                       clip_space, true, NULL);
     uint8_t tile_list_head;
 
     memread(0x30000, &tile_list_head, sizeof(tile_list_head));
@@ -4805,6 +4840,136 @@ static void test_v3d_ct0_clip_stk_behind_eye_offscreen(void)
 
     test_v3d_ct0_clip_case(behind_eye, 18);
     test_v3d_ct0_clip_case(visible, 56);
+}
+
+static void test_v3d_ct0_array_prim_4680_vertices(void)
+{
+    enum { vertex_count = 4680, vertex_data_address = 0x100000,
+           coordinate_data_address = 0x130000 };
+    static const uint32_t degenerate[3][4] = {
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+    };
+    const uint64_t fragment_code[] = { 3ULL << 60 };
+    g_autofree uint32_t *vertex_words = g_new(uint32_t,
+                                               vertex_count * 8);
+    const uint32_t (*vertices)[8] = (const uint32_t (*)[8])vertex_words;
+    V3DTestGeometryInput geometry = {
+        .vertices = vertices,
+        .count = vertex_count,
+        .vertex_address = vertex_data_address,
+        .coordinate_address = coordinate_data_address,
+        .tiles_x = 4,
+        .tiles_y = 4,
+    };
+    V3DTestFragmentShader fragment = {
+        .code = fragment_code,
+        .code_words = G_N_ELEMENTS(fragment_code),
+        .initial_color = 0x5a5a5a5a,
+    };
+    uint8_t tile_lists[16 * 64];
+    g_autofree gchar *log_path = NULL;
+    g_autofree gchar *qemu_args = NULL;
+    int fd = g_file_open_tmp("bcm2835-v3d-guest-errors-XXXXXX",
+                             &log_path, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    for (unsigned vertex = 0; vertex < vertex_count; vertex++) {
+        unsigned source = vertex < vertex_count - 3 ? 0 :
+                          vertex - (vertex_count - 3);
+
+        memcpy(vertex_words + vertex * 8, reference_vertices[source],
+               sizeof(reference_vertices[0]));
+    }
+    qtest_end();
+    qemu_args = g_strdup_printf("-machine raspi3ap -smp 4 "
+                                "-d guest_errors -D %s", log_path);
+    qtest_start(qemu_args);
+
+    test_v3d_render_reference_geometry(&fragment, NULL, 0, false,
+                                       degenerate, true, &geometry);
+    memread(0x30000, tile_lists, sizeof(tile_lists));
+    for (unsigned tile = 0; tile < 12; tile++) {
+        g_assert_cmphex(tile_lists[tile * 64], ==, 56);
+    }
+    for (unsigned tile = 12; tile < 16; tile++) {
+        g_assert_cmphex(tile_lists[tile * 64], ==, 18);
+    }
+
+    qtest_end();
+    v3d_assert_no_guest_errors(log_path);
+}
+
+static void v3d_assert_guest_error_contains(const gchar *log_path,
+                                            const char *expected)
+{
+    g_autofree gchar *log = NULL;
+
+    g_assert_true(g_file_get_contents(log_path, &log, NULL, NULL));
+    g_assert_nonnull(strstr(log, expected));
+    g_assert_cmpint(g_remove(log_path), ==, 0);
+}
+
+static void test_v3d_ct0_array_prim_rejected(unsigned count, uint32_t first,
+                                             const char *expected_error)
+{
+    enum { vertex_data_address = 0x100000 };
+    static const uint32_t degenerate[3][4] = {
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+    };
+    const uint64_t fragment_code[] = { 3ULL << 60 };
+    g_autofree uint32_t *vertex_words = g_new(uint32_t, count * 8);
+    const uint32_t (*vertices)[8] = (const uint32_t (*)[8])vertex_words;
+    V3DTestGeometryInput geometry = {
+        .vertices = vertices,
+        .count = count,
+        .vertex_address = vertex_data_address,
+        .coordinate_address = vertex_data_address +
+                              count * sizeof(reference_vertices[0]) + 0x1000,
+        .first = first,
+        .expect_ct0_error = true,
+        .tiles_x = 2,
+        .tiles_y = 2,
+    };
+    V3DTestFragmentShader fragment = {
+        .code = fragment_code,
+        .code_words = G_N_ELEMENTS(fragment_code),
+        .initial_color = 0x5a5a5a5a,
+    };
+    g_autofree gchar *log_path = NULL;
+    g_autofree gchar *qemu_args = NULL;
+    int fd = g_file_open_tmp("bcm2835-v3d-guest-errors-XXXXXX",
+                             &log_path, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    for (unsigned vertex = 0; vertex < count; vertex++) {
+        unsigned source = vertex < count - 3 ? 0 : vertex - (count - 3);
+
+        memcpy(vertex_words + vertex * 8, reference_vertices[source],
+               sizeof(reference_vertices[0]));
+    }
+    qtest_end();
+    qemu_args = g_strdup_printf("-machine raspi3ap -smp 4 "
+                                "-d guest_errors -D %s", log_path);
+    qtest_start(qemu_args);
+
+    test_v3d_render_reference_geometry(&fragment, NULL, 0, false,
+                                       degenerate, true, &geometry);
+    qtest_end();
+    v3d_assert_guest_error_contains(log_path, expected_error);
+}
+
+static void test_v3d_ct0_array_prim_65537_vertices_rejected(void)
+{
+    test_v3d_ct0_array_prim_rejected(3, UINT32_MAX - 1,
+                                     "array primitive first+count overflows");
+    test_v3d_ct0_array_prim_rejected(
+        65537, 0, "coordinate shader vertex count 65537 exceeds limit");
 }
 
 static void test_v3d_ct1_store_zs_tformat_clear(void)
@@ -5026,6 +5191,10 @@ int main(int argc, char **argv)
                    test_v3d_fragment_unlock_irq_ack_immediate);
     qtest_add_func("/bcm2835/v3d/ct0_clip_stk_behind_eye_offscreen",
                    test_v3d_ct0_clip_stk_behind_eye_offscreen);
+    qtest_add_func("/bcm2835/v3d/ct0_array_prim_4680_vertices",
+                   test_v3d_ct0_array_prim_4680_vertices);
+    qtest_add_func("/bcm2835/v3d/ct0_array_prim_65537_vertices_rejected",
+                   test_v3d_ct0_array_prim_65537_vertices_rejected);
     qtest_add_func("/bcm2835/v3d/ct1_store_zs_tformat_clear",
                    test_v3d_ct1_store_zs_tformat_clear);
     if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_UNLOCK"), "1") == 0) {

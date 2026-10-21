@@ -108,7 +108,8 @@
 
 #define V3D_MAX_CL_COMMANDS    (1U << 16)
 #define V3D_MAX_PRIMITIVE_INDICES (1U << 20)
-#define V3D_MAX_SHADER_VERTICES 4096
+/* VC4/Mesa vc4 allow up to 65536 vertices per draw (16-bit indices). */
+#define V3D_MAX_SHADER_VERTICES 65536
 #define V3D_MAX_QPU_INSTRUCTIONS 4096
 #define V3D_QPU_INSTRUCTION_BUDGET (1U << 16)
 #define V3D_MAX_RASTER_WORK       (1U << 22)
@@ -739,6 +740,8 @@ static bool bcm2835_v3d_validate_draw(BCM2835V3DState *s,
         uint32_t base_index = ldl_le_p(packet + 6);
 
         if ((uint64_t)base_index + count - 1 > UINT32_MAX) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "bcm2835_v3d: array primitive first+count overflows\n");
             return false;
         }
         max_index = base_index + count - 1;
