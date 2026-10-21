@@ -3293,6 +3293,59 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         g_assert_cmphex(spill_block[0], ==, 56);
         g_assert_cmphex(spill_block[1], ==, 0x32);
     }
+
+    /* An intermediate clip-plane intersection may be behind the eye. */
+    static const uint32_t clip_space[3][4] = {
+        { 0x43bd3469, 0x441024f5, 0x43fe6087, 0x43fe9f69 },
+        { 0xc3b78c39, 0x440ffdef, 0x4402fd2c, 0x44031ba3 },
+        { 0xc3bd34ec, 0x4419ed2b, 0xc3eeaff4, 0xc3edf2d9 },
+    };
+    for (unsigned vertex = 0; vertex < G_N_ELEMENTS(clip_space); vertex++) {
+        static const unsigned input_word[] = { 4, 2, 7, 3 };
+
+        for (unsigned word = 0; word < G_N_ELEMENTS(input_word); word++) {
+            size_t offset = (vertex * G_N_ELEMENTS(reference_vertices[0]) +
+                             input_word[word]) * sizeof(uint32_t);
+
+            stl_le_p(vertex_data + offset, clip_space[vertex][word]);
+            stl_le_p(coordinate_data + offset, clip_space[vertex][word]);
+        }
+    }
+    memwrite(0x7000, vertex_data, sizeof(vertex_data));
+    memwrite(0x7400, coordinate_data, sizeof(coordinate_data));
+    bin_size = 0;
+    bin_cl[bin_size++] = 112;
+    append_u32(bin_cl, &bin_size, 0x3e000);
+    append_u32(bin_cl, &bin_size, 0x1000);
+    append_u32(bin_cl, &bin_size, 0x3f000);
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 1;
+    bin_cl[bin_size++] = 0x2c;
+    bin_cl[bin_size++] = 6;
+    bin_cl[bin_size++] = 64;
+    append_u32(bin_cl, &bin_size, 0x34002);
+    bin_cl[bin_size++] = 105;
+    append_u32(bin_cl, &bin_size, 0x45a00000);
+    append_u32(bin_cl, &bin_size, 0xc5480000);
+    bin_cl[bin_size++] = 33;
+    bin_cl[bin_size++] = 4;
+    append_u32(bin_cl, &bin_size, 3);
+    append_u32(bin_cl, &bin_size, 0);
+    bin_cl[bin_size++] = 4;
+    memwrite(CL_ADDR, bin_cl, bin_size);
+    writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
+    writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA), ==,
+                    CL_ADDR + bin_size);
+    {
+        uint8_t empty_tile_list;
+
+        memread(0x3e000, &empty_tile_list, sizeof(empty_tile_list));
+        g_assert_cmphex(empty_tile_list, ==, 18);
+    }
 }
 
 static void append_tile_buffer_packet(uint8_t *buffer, size_t *offset,

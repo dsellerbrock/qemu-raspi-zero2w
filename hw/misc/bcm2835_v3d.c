@@ -488,6 +488,12 @@ static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
     if (buffer != 1 || mode != 0 || memory_format > 2 ||
         color_format > 2 || (store && color_format == 1) ||
         !s->render_config_valid || !s->render_width || !s->render_height) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "bcm2835_v3d: tile buffer %s unsupported: buffer=%u mode=%u memfmt=%u colorfmt=%u base=0x%08x params=0x%012" PRIx64 " render_valid=%d %ux%u config=0x%04x\n",
+                      store ? "store" : "load", buffer, mode,
+                      memory_format, color_format, base, params,
+                      s->render_config_valid, s->render_width,
+                      s->render_height, s->render_config);
         return false;
     }
 
@@ -2267,6 +2273,8 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
 {
     BCM2835V3DVertex current[V3D_MAX_CLIPPED_VERTICES];
     BCM2835V3DVertex next[V3D_MAX_CLIPPED_VERTICES];
+    bool created[V3D_MAX_CLIPPED_VERTICES] = { false };
+    bool next_created[V3D_MAX_CLIPPED_VERTICES];
     unsigned current_count = 3;
     float scale_x = bcm2835_v3d_bits_float(s->clipper_xy_scale[0]);
     float scale_y = bcm2835_v3d_bits_float(s->clipper_xy_scale[1]);
@@ -2289,10 +2297,8 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
         }
     }
 
-    /*
-     * shortcut: Mesa omits packet 104; skip Z clipping until its default
-     * bounds are modeled for depth draws.
-     */
+    /* Project only after all planes: intermediate intersections may lie far
+     * outside the remaining planes (e.g. near w = 0) and are clipped later. */
     for (unsigned plane = 0;
          plane < (s->clipper_z_clip_valid ? 6 : 4) && current_count;
          plane++) {
@@ -2332,23 +2338,29 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
                 }
                 intersection = bcm2835_v3d_lerp_vertex(
                     &previous, &vertex, t, s->shader_record[3]);
-                if (!bcm2835_v3d_project_clipped_vertex(s, &intersection)) {
-                    return false;
-                }
-                next[next_count++] = intersection;
+                next[next_count] = intersection;
+                next_created[next_count++] = true;
             }
             if (inside) {
                 if (next_count == V3D_MAX_CLIPPED_VERTICES) {
                     return false;
                 }
-                next[next_count++] = vertex;
+                next[next_count] = vertex;
+                next_created[next_count++] = created[i];
             }
             previous = vertex;
             previous_distance = distance;
             previous_inside = inside;
         }
         memcpy(current, next, sizeof(BCM2835V3DVertex) * next_count);
+        memcpy(created, next_created, sizeof(bool) * next_count);
         current_count = next_count;
+    }
+    for (unsigned i = 0; i < current_count; i++) {
+        if (created[i] && !bcm2835_v3d_project_clipped_vertex(s,
+                                                              &current[i])) {
+            return false;
+        }
     }
     memcpy(polygon, current, sizeof(BCM2835V3DVertex) * current_count);
     *polygon_count = current_count;
