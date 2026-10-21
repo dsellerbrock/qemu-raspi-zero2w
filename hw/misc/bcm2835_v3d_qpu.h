@@ -35,9 +35,12 @@ typedef struct BCM2835V3DQPUTMU {
     uint32_t t[BCM2835_V3D_QPU_LANES];
     uint32_t result[BCM2835_V3D_QPU_LANES];
     uint32_t config0;
+    uint32_t config1;
     uint16_t t_mask;
     uint16_t instruction_write_mask[4];
     bool has_t;
+    bool has_b;
+    bool has_config1;
     bool pending;
 } BCM2835V3DQPUTMU;
 
@@ -60,6 +63,7 @@ typedef struct BCM2835V3DQPUState {
     uint16_t c;
     uint16_t tlb_color_write_mask;
     uint32_t pc;
+    uint32_t unsupported_line;
     uint64_t cycles;
     uint32_t uniform_address;
     uint32_t vpm_read_address;

@@ -538,6 +538,7 @@ static void bcm2835_v3d_thread_error(BCM2835V3DState *s, unsigned thread,
     s->ct_cs[thread] &= ~V3D_CS_CTRUN;
     s->ct_cs[thread] |= V3D_CS_CTSUBS | V3D_CS_CTERR;
     s->ct_waiting[thread] = false;
+    s->ct_return_depth[thread] = 0;
     if (thread == 0) {
         s->bin_draw_append_count = 0;
         s->bin_draw_resume = false;
@@ -1869,10 +1870,37 @@ static bool bcm2835_v3d_run_fragment_shader(BCM2835V3DState *s,
                 instruction = ldq_le_p(code + qpu.pc * sizeof(uint64_t));
             }
             qemu_log_mask(LOG_GUEST_ERROR,
-                          "bcm2835_v3d: fragment QPU 0x%08x result=%u pc=%u instruction=0x%016" PRIx64 " varying=%u/%u color-mask=0x%04x expected=0x%04x\n",
+                          "bcm2835_v3d: fragment QPU 0x%08x result=%u pc=%u instruction=0x%016" PRIx64 " varying=%u/%u color-mask=0x%04x expected=0x%04x src_line=%u tmu0 has_t=%d has_b=%d wm=%04x/%04x/%04x/%04x uniform_addr=0x%08x\n",
                           code_address, result, qpu.pc, instruction,
                           qpu.varying_index, varying.count,
-                          qpu.tlb_color_write_mask, expected_mask);
+                          qpu.tlb_color_write_mask, expected_mask,
+                          qpu.unsupported_line, qpu.tmu[0].has_t,
+                          qpu.tmu[0].has_b,
+                          qpu.tmu[0].instruction_write_mask[0],
+                          qpu.tmu[0].instruction_write_mask[1],
+                          qpu.tmu[0].instruction_write_mask[2],
+                          qpu.tmu[0].instruction_write_mask[3],
+                          qpu.uniform_address);
+            if (s->fragment_dump_count < 4) {
+                s->fragment_dump_count++;
+                for (uint32_t i = 0; i < 128 &&
+                     (uint64_t)(i + 1) * sizeof(uint64_t) <= code_size; i++) {
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "bcm2835_v3d: dump code 0x%08x [%u] 0x%016" PRIx64 "\n",
+                                  code_address, i,
+                                  ldq_le_p(code + i * sizeof(uint64_t)));
+                }
+                for (unsigned i = 0; i < 16; i++) {
+                    uint32_t u = 0;
+                    bool ok = bcm2835_v3d_dma_read(s, uniforms_address + i * 4,
+                                                   &u, sizeof(u));
+
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "bcm2835_v3d: dump uniform 0x%08x [%u] 0x%08x%s\n",
+                                  uniforms_address, i, le32_to_cpu(u),
+                                  ok ? "" : " (read failed)");
+                }
+            }
             g_free(code);
             return false;
         }
@@ -3607,6 +3635,7 @@ static void bcm2835_v3d_write_thread_ca(BCM2835V3DState *s,
         return;
     }
     s->ct_ca[thread] = value;
+    s->ct_return_depth[thread] = 0;
     s->ct_cs[thread] &= ~(V3D_CS_CTSUBS | V3D_CS_CTERR);
     s->ct_waiting[thread] = false;
 }

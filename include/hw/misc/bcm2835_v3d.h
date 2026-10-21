@@ -35,6 +35,7 @@ struct BCM2835V3DState {
     uint32_t regs[BCM2835_V3D_REG_SIZE / sizeof(uint32_t)];
     uint32_t irq_status;
     uint32_t irq_enable;
+    uint32_t fragment_dump_count;
 
     uint32_t ct_cs[2];
     uint32_t ct_ca[2];
