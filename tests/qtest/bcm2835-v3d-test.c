@@ -4571,6 +4571,9 @@ static void v3d_assert_no_guest_errors(const gchar *log_path)
     g_autofree gchar *log = NULL;
 
     g_assert_true(g_file_get_contents(log_path, &log, NULL, NULL));
+    if (*log) {
+        g_test_message("unexpected V3D guest-error log:\n%s", log);
+    }
     g_assert_null(strstr(log, "bcm2835_v3d:"));
     g_assert_cmpint(g_remove(log_path), ==, 0);
 }
@@ -4633,6 +4636,89 @@ static void test_v3d_ct0_clip_stk_behind_eye_offscreen(void)
 
     test_v3d_ct0_clip_case(behind_eye, 18);
     test_v3d_ct0_clip_case(visible, 56);
+}
+
+static void test_v3d_ct1_store_zs_tformat_clear(void)
+{
+    enum { zs_addr = FB_ADDR + FB_SIZE };
+    const uint32_t clear_color = 0xff102030;
+    const uint32_t clear_z = 0x00abcdef;
+    const uint8_t clear_stencil = 0x5a;
+    const uint32_t expected_zs = 0xabcdef5a;
+    uint8_t cl[64];
+    uint8_t initial[FB_SIZE];
+    uint8_t zs[FB_SIZE];
+    uint8_t fb[FB_SIZE];
+    g_autofree gchar *log_path = NULL;
+    g_autofree gchar *qemu_args = NULL;
+    size_t offset = 0;
+    int fd = g_file_open_tmp("bcm2835-v3d-guest-errors-XXXXXX",
+                             &log_path, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    qtest_end();
+    qemu_args = g_strdup_printf("-machine raspi3ap -smp 4 "
+                                "-d guest_errors -D %s", log_path);
+    qtest_start(qemu_args);
+
+    memset(initial, 0xa5, sizeof(initial));
+    memwrite(FB_ADDR, initial, sizeof(initial));
+    memwrite(zs_addr, initial, sizeof(initial));
+
+    cl[offset++] = 113;
+    append_u32(cl, &offset, FB_ADDR);
+    append_u16(cl, &offset, 64);
+    append_u16(cl, &offset, 64);
+    append_u16(cl, &offset, (1 << 6) | (V3D_FORMAT_RGBA8888 << 2));
+    cl[offset++] = 114;
+    append_u32(cl, &offset, clear_color);
+    append_u32(cl, &offset, clear_color);
+    append_u32(cl, &offset, clear_z);
+    cl[offset++] = clear_stencil;
+    cl[offset++] = 115;
+    cl[offset++] = 0;
+    cl[offset++] = 0;
+    cl[offset++] = 28;
+    append_u48(cl, &offset, ((uint64_t)(zs_addr >> 4) << 20) | 0x12);
+    cl[offset++] = 28;
+    append_u48(cl, &offset,
+               ((uint64_t)(FB_ADDR >> 4) << 20) | (1 << 4) | 1 |
+               (1ULL << 19));
+
+    uint32_t rfc_before = readl(RASPI3_V3D_BASE + V3D_RFC);
+
+    memwrite(CL_ADDR, cl, offset);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + offset);
+
+    uint32_t ct1cs = readl(RASPI3_V3D_BASE + V3D_CT1CS);
+    uint32_t ct1ca = readl(RASPI3_V3D_BASE + V3D_CT1CA);
+    uint32_t rfc_after = readl(RASPI3_V3D_BASE + V3D_RFC);
+
+    memread(zs_addr, zs, sizeof(zs));
+    memread(FB_ADDR, fb, sizeof(fb));
+    qtest_end();
+
+    v3d_assert_no_guest_errors(log_path);
+    g_assert_cmphex(ct1cs & V3D_CTERR, ==, 0);
+    g_assert_cmphex(ct1ca, ==, CL_ADDR + offset);
+    g_assert_cmphex(rfc_after, ==, rfc_before + 1);
+    for (unsigned y = 0; y < 64; y++) {
+        for (unsigned x = 0; x < 64; x++) {
+            size_t pixel = t_tiled_pixel_offset(64, x, y, sizeof(uint32_t));
+
+            g_assert_cmphex(read_u32(zs + pixel), ==, expected_zs);
+        }
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        static const unsigned sample[] = { 0, 31, 32, 4095 };
+        size_t pixel = t_tiled_pixel_offset(64, sample[i] % 64,
+                                             sample[i] / 64,
+                                             sizeof(uint32_t));
+
+        g_assert_cmphex(read_u32(fb + pixel), ==, clear_color);
+    }
 }
 
 int main(int argc, char **argv)
@@ -4765,6 +4851,8 @@ int main(int argc, char **argv)
                    test_v3d_fragment_worker_equivalence);
     qtest_add_func("/bcm2835/v3d/ct0_clip_stk_behind_eye_offscreen",
                    test_v3d_ct0_clip_stk_behind_eye_offscreen);
+    qtest_add_func("/bcm2835/v3d/ct1_store_zs_tformat_clear",
+                   test_v3d_ct1_store_zs_tformat_clear);
     if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_WORKERS"), "4") == 0) {
         qtest_start("-machine raspi3ap -smp 4 "
                     "-global bcm2835_v3d.fragment-workers=4");
