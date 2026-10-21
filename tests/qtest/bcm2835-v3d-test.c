@@ -5055,6 +5055,75 @@ static void test_v3d_ct1_store_zs_tformat_clear(void)
     }
 }
 
+static void test_v3d_ct1_store_zs_tformat_edge_tile(void)
+{
+    enum { WIDTH = 300, HEIGHT = 300, TILE_X = 4, TILE_Y = 4 };
+    const uint32_t zs_bus = 0xc6500000;
+    const uint32_t zs_phys = zs_bus - 0xc0000000;
+    const uint32_t clear_z = 0x00abcdef;
+    const uint8_t clear_stencil = 0x5a;
+    const uint32_t expected_zs = 0xabcdef5a;
+    const size_t surface_size = ((WIDTH + 31) / 32) * ((HEIGHT + 31) / 32) *
+                                32 * 32 * sizeof(uint32_t);
+    uint8_t cl[64];
+    g_autofree uint8_t *initial = g_malloc(surface_size);
+    g_autofree uint8_t *zs = g_malloc(surface_size);
+    g_autofree gchar *log_path = NULL;
+    g_autofree gchar *qemu_args = NULL;
+    size_t offset = 0;
+    int fd = g_file_open_tmp("bcm2835-v3d-guest-errors-XXXXXX",
+                             &log_path, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    qtest_end();
+    qemu_args = g_strdup_printf("-machine raspi3ap -smp 4 "
+                                "-d guest_errors -D %s", log_path);
+    qtest_start(qemu_args);
+
+    memset(initial, 0xa5, surface_size);
+    memwrite(zs_phys, initial, surface_size);
+
+    cl[offset++] = 113;
+    append_u32(cl, &offset, FB_ADDR);
+    append_u16(cl, &offset, WIDTH);
+    append_u16(cl, &offset, HEIGHT);
+    append_u16(cl, &offset, (1 << 6) | (V3D_FORMAT_RGBA8888 << 2));
+    cl[offset++] = 114;
+    append_u32(cl, &offset, 0xff102030);
+    append_u32(cl, &offset, 0xff102030);
+    append_u32(cl, &offset, clear_z);
+    cl[offset++] = clear_stencil;
+    cl[offset++] = 115;
+    cl[offset++] = TILE_X;
+    cl[offset++] = TILE_Y;
+    cl[offset++] = 28;
+    /* Mesa STORE_TILE_BUFFER_GENERAL: Z/S buffer 2, T-format 1, sample 0. */
+    append_u48(cl, &offset, ((uint64_t)(zs_bus >> 4) << 20) | 0x12);
+
+    memwrite(CL_ADDR, cl, offset);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + offset);
+
+    uint32_t ct1cs = readl(RASPI3_V3D_BASE + V3D_CT1CS);
+    uint32_t ct1ca = readl(RASPI3_V3D_BASE + V3D_CT1CA);
+
+    memread(zs_phys, zs, surface_size);
+    qtest_end();
+
+    v3d_assert_no_guest_errors(log_path);
+    g_assert_cmphex(ct1cs & V3D_CTERR, ==, 0);
+    g_assert_cmphex(ct1ca, ==, CL_ADDR + offset);
+    for (unsigned y = TILE_Y * 64; y < HEIGHT; y++) {
+        for (unsigned x = TILE_X * 64; x < WIDTH; x++) {
+            size_t pixel = t_tiled_pixel_offset(WIDTH, x, y,
+                                                 sizeof(uint32_t));
+
+            g_assert_cmphex(read_u32(zs + pixel), ==, expected_zs);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -5197,6 +5266,8 @@ int main(int argc, char **argv)
                    test_v3d_ct0_array_prim_65537_vertices_rejected);
     qtest_add_func("/bcm2835/v3d/ct1_store_zs_tformat_clear",
                    test_v3d_ct1_store_zs_tformat_clear);
+    qtest_add_func("/bcm2835/v3d/ct1_store_zs_tformat_edge_tile",
+                   test_v3d_ct1_store_zs_tformat_edge_tile);
     if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_UNLOCK"), "1") == 0) {
         qtest_start("-machine raspi3ap -smp 4 "
                     "-global bcm2835_v3d.fragment-workers=4 "
