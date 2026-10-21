@@ -2927,7 +2927,7 @@ static void test_v3d_wait_ct1(void)
 static void test_v3d_render_reference_geometry(
     const V3DTestFragmentShader *fragment,
     const uint32_t varyings[9][5], unsigned varying_count,
-    bool full_tile)
+    bool full_tile, const uint32_t (*clip_space)[4])
 {
     enum { fb_width = 64, fb_height = 65, max_shader_words = 64 };
     uint8_t bin_cl[128], render_cl[32], draw_cl[32];
@@ -2970,6 +2970,7 @@ static void test_v3d_render_reference_geometry(
         0x02000200, 0xfe000200, 0xfe00fe00,
         0x0200fe00, 0x02000200, 0xfe00fe00,
     };
+    static const unsigned clip_space_input_word[] = { 0, 1, 2, 3 };
 
     g_assert_cmpuint(varying_count, <=, 5);
     g_assert_cmpuint(fragment->code_words, <=, max_shader_words);
@@ -2983,6 +2984,14 @@ static void test_v3d_render_reference_geometry(
 
             if (full_tile && word == 4) {
                 value = coordinate_value = full_tile_screen_xy[vertex];
+            }
+            if (clip_space && vertex < 3) {
+                for (unsigned i = 0; i < G_N_ELEMENTS(clip_space_input_word);
+                     i++) {
+                    if (word == clip_space_input_word[i]) {
+                        value = coordinate_value = clip_space[vertex][i];
+                    }
+                }
             }
 
             if (word >= 3 && word < 3 + varying_count) {
@@ -3049,7 +3058,7 @@ static void test_v3d_render_reference_geometry(
 
     bin_cl[bin_size++] = 112;
     append_u32(bin_cl, &bin_size, 0x30000);
-    append_u32(bin_cl, &bin_size, 0x140);
+    append_u32(bin_cl, &bin_size, clip_space ? 0x1000 : 0x140);
     append_u32(bin_cl, &bin_size, 0x32000);
     bin_cl[bin_size++] = 1;
     bin_cl[bin_size++] = 1;
@@ -3061,44 +3070,58 @@ static void test_v3d_render_reference_geometry(
     append_u16(bin_cl, &bin_size, (full_tile ? 32 : 40) * 16);
     append_u16(bin_cl, &bin_size, 32 * 16);
     bin_cl[bin_size++] = 105;
-    append_u32(bin_cl, &bin_size, 0x44000000);
-    append_u32(bin_cl, &bin_size, 0xc4000000);
+    append_u32(bin_cl, &bin_size,
+               clip_space ? 0x45a00000 : 0x44000000);
+    append_u32(bin_cl, &bin_size,
+               clip_space ? 0xc5480000 : 0xc4000000);
     bin_cl[bin_size++] = 33;
     bin_cl[bin_size++] = 4;
-    append_u32(bin_cl, &bin_size, G_N_ELEMENTS(reference_vertices));
+    append_u32(bin_cl, &bin_size,
+               clip_space ? 3 : G_N_ELEMENTS(reference_vertices));
     append_u32(bin_cl, &bin_size, 0);
     bin_cl[bin_size++] = 4;
     memwrite(CL_ADDR, bin_cl, bin_size);
     writel(RASPI3_V3D_BASE + V3D_CT0CS, 1U << 15);
+    uint32_t bfc_before = readl(RASPI3_V3D_BASE + V3D_BFC);
     writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
     writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
 
     uint32_t ct0cs = readl(RASPI3_V3D_BASE + V3D_CT0CS);
 
-    g_assert_cmphex(ct0cs & (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
-                    ==, V3D_CTRUN | V3D_CTSUBS);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM,
-                    ==, V3D_BMOOM);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_OUTOMEM,
-                    ==, V3D_INT_OUTOMEM);
-    writel(RASPI3_V3D_BASE + V3D_BPOA, 0x35000);
-    writel(RASPI3_V3D_BASE + V3D_BPOS, 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
-                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
-                    ==, V3D_CTRUN | V3D_CTSUBS);
-    writel(RASPI3_V3D_BASE + V3D_BPOS,
-           varying_count > 2 ? 0x400 : 0x80);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR, ==, 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOA), ==, 0x35000);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOS), ==, 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCA), ==,
-                    varying_count > 2 ? 0x30100 : 0x30140);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCS), ==,
-                    varying_count > 2 ? 0x40 : 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_SPILLUSE,
-                    ==, V3D_INT_SPILLUSE);
+    if (clip_space) {
+        g_assert_cmphex(ct0cs & (V3D_CTRUN | V3D_CTERR), ==, 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CA), ==,
+                        readl(RASPI3_V3D_BASE + V3D_CT0EA));
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BFC), ==, bfc_before + 1);
+    } else {
+        g_assert_cmphex(ct0cs & (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
+                        ==, V3D_CTRUN | V3D_CTSUBS);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM,
+                        ==, V3D_BMOOM);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_OUTOMEM,
+                        ==, V3D_INT_OUTOMEM);
+        writel(RASPI3_V3D_BASE + V3D_BPOA, 0x35000);
+        writel(RASPI3_V3D_BASE + V3D_BPOS, 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
+                        (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
+                        ==, V3D_CTRUN | V3D_CTSUBS);
+        writel(RASPI3_V3D_BASE + V3D_BPOS,
+               varying_count > 2 ? 0x400 : 0x80);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR, ==, 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOA), ==, 0x35000);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOS), ==, 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCA), ==,
+                        varying_count > 2 ? 0x30100 : 0x30140);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCS), ==,
+                        varying_count > 2 ? 0x40 : 0);
+        g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_SPILLUSE,
+                        ==, V3D_INT_SPILLUSE);
+    }
+    if (clip_space) {
+        return;
+    }
 
     render_cl[render_size++] = 113;
     append_u32(render_cl, &render_size, FB_ADDR);
@@ -3170,7 +3193,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         varyings[vertex][0] = reference_vertices[vertex][5];
         varyings[vertex][1] = reference_vertices[vertex][6];
     }
-    test_v3d_render_reference_geometry(&fragment, varyings, 2, false);
+    test_v3d_render_reference_geometry(&fragment, varyings, 2, false, NULL);
     memread(FB_ADDR, fb, sizeof(fb));
     g_assert_cmphex(read_u32(fb + (30 * test_fb_width + 32) * 4),
                     ==, 0x5a5a5a5a);
@@ -4089,7 +4112,7 @@ static gchar *test_v3d_textured_reference_triangles(bool stk_5var,
         }
     }
     test_v3d_render_reference_geometry(&fragment, varyings, varying_count,
-                                       full_tile);
+                                       full_tile, NULL);
     memread(FB_ADDR, fb, sizeof(fb));
 
     for (unsigned y = 0; y < fb_height; y++) {
@@ -4543,6 +4566,75 @@ static void test_v3d_fragment_worker_equivalence(void)
                    stress_iterations, stress_iterations);
 }
 
+static void v3d_assert_no_guest_errors(const gchar *log_path)
+{
+    g_autofree gchar *log = NULL;
+
+    g_assert_true(g_file_get_contents(log_path, &log, NULL, NULL));
+    g_assert_null(strstr(log, "bcm2835_v3d:"));
+    g_assert_cmpint(g_remove(log_path), ==, 0);
+}
+
+static void test_v3d_ct0_clip_case(const uint32_t clip_space[3][4],
+                                   uint8_t expected_tile_head)
+{
+    const uint64_t fragment_code[] = {
+        qpu_test_add(35, 39, 0, true),
+        qpu_test_add(35, 39, 1, true),
+        qpu_test_fmul(15, 1, 46),
+        3ULL << 60,
+    };
+    uint32_t varyings[9][5] = { 0 };
+    uint8_t frame[64 * 65 * sizeof(uint32_t)];
+    V3DTestFragmentShader fragment = {
+        .code = fragment_code,
+        .code_words = G_N_ELEMENTS(fragment_code),
+        .initial_color = 0x5a5a5a5a,
+    };
+    g_autofree gchar *log_path = NULL;
+    g_autofree gchar *qemu_args = NULL;
+    int fd = g_file_open_tmp("bcm2835-v3d-guest-errors-XXXXXX",
+                             &log_path, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    qtest_end();
+    qemu_args = g_strdup_printf("-machine raspi3ap -smp 4 "
+                                "-d guest_errors -D %s", log_path);
+    qtest_start(qemu_args);
+
+    test_v3d_render_reference_geometry(&fragment, varyings, 0, false,
+                                       clip_space);
+    uint8_t tile_list_head;
+
+    memread(0x30000, &tile_list_head, sizeof(tile_list_head));
+    g_assert_cmphex(tile_list_head, ==, expected_tile_head);
+    memread(FB_ADDR, frame, sizeof(frame));
+    for (size_t offset = 0; offset < sizeof(frame); offset += sizeof(uint32_t)) {
+        g_assert_cmphex(read_u32(frame + offset), ==, fragment.initial_color);
+    }
+
+    qtest_end();
+    v3d_assert_no_guest_errors(log_path);
+}
+
+static void test_v3d_ct0_clip_stk_behind_eye_offscreen(void)
+{
+    static const uint32_t behind_eye[3][4] = {
+        { 0x43bd3469, 0x441024f5, 0x43fe6087, 0x43fe9f69 },
+        { 0xc3b78c39, 0x440ffdef, 0x4402fd2c, 0x44031ba3 },
+        { 0xc3bd34ec, 0x4419ed2b, 0xc3eeaff4, 0xc3edf2d9 },
+    };
+    static const uint32_t visible[3][4] = {
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0x3f000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0x00000000, 0x3f000000, 0x00000000, 0x3f800000 },
+    };
+
+    test_v3d_ct0_clip_case(behind_eye, 18);
+    test_v3d_ct0_clip_case(visible, 56);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -4671,6 +4763,8 @@ int main(int argc, char **argv)
                    test_v3d_ct1_frame_done_requires_eof);
     qtest_add_func("/bcm2835/v3d/fragment_worker_equivalence",
                    test_v3d_fragment_worker_equivalence);
+    qtest_add_func("/bcm2835/v3d/ct0_clip_stk_behind_eye_offscreen",
+                   test_v3d_ct0_clip_stk_behind_eye_offscreen);
     if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_WORKERS"), "4") == 0) {
         qtest_start("-machine raspi3ap -smp 4 "
                     "-global bcm2835_v3d.fragment-workers=4");

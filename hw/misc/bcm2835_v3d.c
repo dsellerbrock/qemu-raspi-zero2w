@@ -4058,7 +4058,9 @@ static void bcm2835_v3d_fragment_workers_init(BCM2835V3DState *s)
 
     s->fragment_workers = MIN(MIN(s->fragment_workers_requested, 4),
                               available);
-    qemu_log("bcm2835_v3d: fragment workers=%u\n", s->fragment_workers);
+    if (s->fragment_workers_requested) {
+        qemu_log("bcm2835_v3d: fragment workers=%u\n", s->fragment_workers);
+    }
     if (!s->fragment_workers) {
         return;
     }
