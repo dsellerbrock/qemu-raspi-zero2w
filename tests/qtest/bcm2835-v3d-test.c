@@ -77,9 +77,9 @@ typedef struct QPUTestVarying {
 } QPUTestVarying;
 
 typedef struct QPUTestCapturedShader {
-    uint32_t uniforms[8];
-    uint32_t varying[2][BCM2835_V3D_QPU_LANES];
-    uint32_t texels[4];
+    uint32_t uniforms[16];
+    uint32_t varying[5][BCM2835_V3D_QPU_LANES];
+    uint32_t texels[16 * 16];
     uint32_t texture_base;
     unsigned uniform_reads;
     unsigned texture_reads;
@@ -206,7 +206,8 @@ static bool qpu_test_read_captured_texture(void *opaque, uint32_t base,
     QPUTestCapturedShader *shader = opaque;
 
     if (base != shader->texture_base || memory_format != 2 ||
-        width != 2 || height != 2 || x >= width || y >= height) {
+        width != height || (width != 2 && width != 16) ||
+        x >= width || y >= height) {
         return false;
     }
     *value = shader->texels[y * width + x];
@@ -635,10 +636,12 @@ static uint64_t qpu_test_load_imm(unsigned waddr_add, uint32_t value)
            (39ULL << 32) | value;
 }
 
-static uint64_t qpu_test_branch(unsigned cond, bool relative, int32_t offset)
+static uint64_t qpu_test_branch(unsigned cond, bool relative, int32_t offset,
+                                unsigned link_destination)
 {
-    return (15ULL << 60) | (uint64_t)cond << 56 |
-           (uint64_t)relative << 55 | (39ULL << 42) | (39ULL << 36) |
+    return (15ULL << 60) | (uint64_t)cond << 52 |
+           (uint64_t)relative << 51 | (39ULL << 38) |
+           (uint64_t)link_destination << 32 |
            (uint32_t)offset;
 }
 
@@ -767,6 +770,198 @@ static void test_v3d_qpu_tmu0_rgba_texture_sampling(void)
                      4 * BCM2835_V3D_QPU_LANES);
     for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
         g_assert_cmphex(qpu.acc[4][lane], ==, 0x77889966);
+    }
+}
+
+static void test_v3d_qpu_tmu0_bias_texture_sampling(void)
+{
+    uint8_t code[5 * sizeof(uint64_t)];
+    BCM2835V3DQPUState qpu;
+    QPUTestTexture texture = {
+        .uniform_address = 0x1000,
+        .memory_base = 0x4000,
+        .texels = {
+            0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00,
+        },
+        .config = {
+            0x4000,
+            (1U << 31) | (2U << 20) | (2U << 8) | (1U << 7) |
+            (1U << 4) | (1U << 2) | 1U,
+        },
+    };
+    uint32_t executed;
+
+    stq_le_p(code, qpu_test_write_tmu(59, false));
+    stq_le_p(code + sizeof(uint64_t), qpu_test_write_tmu(57, false));
+    stq_le_p(code + 2 * sizeof(uint64_t), qpu_test_write_tmu(56, true));
+    stq_le_p(code + 3 * sizeof(uint64_t), 10ULL << 60); /* Load TMU0. */
+    stq_le_p(code + 4 * sizeof(uint64_t), 3ULL << 60); /* Program End. */
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.uniform_address = texture.uniform_address;
+    qpu.read_uniform = qpu_test_read_texture_uniform;
+    qpu.uniform_opaque = &texture;
+    qpu.read_memory = qpu_test_read_texture_memory;
+    qpu.memory_opaque = &texture;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.rf[0][0][lane] = qpu_test_float_bits(0.25f);
+        qpu.rf[1][0][lane] = qpu_test_float_bits(0.25f);
+    }
+
+    g_assert_cmpint(bcm2835_v3d_qpu_run(code, sizeof(code), 8, &qpu,
+                                         &executed),
+                    ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(texture.uniform_reads, ==, 2);
+    g_assert_cmphex(qpu.uniform_address, ==, 0x1008);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.acc[4][lane], ==, texture.texels[0]);
+    }
+}
+
+static void test_fragment_stk_txb_replay(void)
+{
+    static const uint64_t words[] = {
+        UINT64_C(0x100049e0203e303e), UINT64_C(0x10024821213e317e),
+        UINT64_C(0x100248a381827376), UINT64_C(0x60021e67159e7480),
+        UINT64_C(0x10021ee7159e76c0), UINT64_C(0x10021e27159e7000),
+        UINT64_C(0xa00009e7009e7000), UINT64_C(0x190208e7049e7900),
+        UINT64_C(0x1b424823849e791b), UINT64_C(0x1d524863849e7900),
+        UINT64_C(0x1f6248a3849e7909), UINT64_C(0x117049e3809e7012),
+        UINT64_C(0x10020ba7159e76c0), UINT64_C(0x300009e7009e7000),
+    };
+    BCM2835V3DQPUState qpu;
+    QPUTestCapturedShader shader = {
+        .uniforms = {
+            0x3f800000, 0x4001, 0x01001045, 0x40000001,
+        },
+        .texture_base = 0x4000,
+    };
+    uint8_t code[sizeof(words)];
+    uint32_t executed;
+    BCM2835V3DQPUResult result;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(shader.texels); i++) {
+        shader.texels[i] = 0xff336699;
+    }
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.fragment_shader = true;
+    qpu.uniform_address = 0x1000;
+    qpu.read_uniform = qpu_test_read_captured_uniform;
+    qpu.uniform_opaque = &shader;
+    qpu.read_texture = qpu_test_read_captured_texture;
+    qpu.texture_opaque = &shader;
+    qpu.read_varying = qpu_test_read_captured_varying;
+    qpu.varying_opaque = &shader;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.fragment_w[lane] = qpu_test_float_bits(1.0f);
+        shader.varying[0][lane] = qpu_test_float_bits(0.25f);
+        shader.varying[1][lane] = qpu_test_float_bits(0.5f);
+    }
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(words); i++) {
+        stq_le_p(code + i * sizeof(uint64_t), words[i]);
+    }
+    result = bcm2835_v3d_qpu_run(code, sizeof(code), 64, &qpu, &executed);
+    g_assert_cmpint(result, ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(qpu.unsupported_line, ==, 0);
+    g_assert_cmphex(qpu.tlb_color_write_mask, ==, UINT16_MAX);
+    /* PC 7–11 assemble r4's RGB; PC 12 sets alpha from r3 = 1.0. */
+    g_assert_cmphex(qpu.io[46][0], ==, 0xff336699);
+}
+
+static void test_fragment_stk_branch_replay(void)
+{
+    static const uint64_t words[] = {
+        UINT64_C(0x100049e0203e303e), UINT64_C(0x10024862213e317e),
+        UINT64_C(0x100248c1819e7549), UINT64_C(0x10025020353e36fe),
+        UINT64_C(0xd0020067159c0fc0), UINT64_C(0x10024862213e317e),
+        UINT64_C(0x100229e715827d80), UINT64_C(0x10025840819e7549),
+        UINT64_C(0xd0040067159c2fc0), UINT64_C(0x100049e3203e303e),
+        UINT64_C(0x100229e715067d80), UINT64_C(0x100208a7019e7740),
+        UINT64_C(0xf01809e700000050), UINT64_C(0x100009e7009e7000),
+        UINT64_C(0x100009e7009e7000), UINT64_C(0x100009e7009e7000),
+        UINT64_C(0xe002482700000008), UINT64_C(0x10020a270c827180),
+        UINT64_C(0x100229e715067d80), UINT64_C(0x100009e7009e7000),
+        UINT64_C(0x10021e67159e7480), UINT64_C(0x10021e27159e7240),
+        UINT64_C(0xa00009e7009e7000), UINT64_C(0x1d0099c020027034),
+        UINT64_C(0x1b0089c0209c003c), UINT64_C(0x190089c1209c103c),
+        UINT64_C(0x114049e380027036), UINT64_C(0x115049e3809c003f),
+        UINT64_C(0x116049e3809c103f), UINT64_C(0xe002486700000014),
+        UINT64_C(0xd17049e3809e003f), UINT64_C(0x10020a270c827380),
+        UINT64_C(0x10020ba7159e76c0), UINT64_C(0x300009e7009e7000),
+    };
+    BCM2835V3DQPUState qpu;
+    QPUTestCapturedShader shader = {
+        .uniforms = {
+            0xffffffff, 0x1000, 0x400b, 0x01001030,
+            0x1000, 0, 0, 0x3f800000,
+            0x3b4ccccd, 0, 0xbf800000, 0,
+            0, 0, 0, 0xbba3d70a,
+        },
+        .texture_base = 0x4000,
+    };
+    uint8_t code[sizeof(words)];
+    uint32_t executed;
+    BCM2835V3DQPUResult result;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(shader.texels); i++) {
+        shader.texels[i] = 0xff336699;
+    }
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.fragment_shader = true;
+    qpu.uniform_address = 0x1000;
+    qpu.read_uniform = qpu_test_read_captured_uniform;
+    qpu.uniform_opaque = &shader;
+    qpu.read_texture = qpu_test_read_captured_texture;
+    qpu.texture_opaque = &shader;
+    qpu.read_varying = qpu_test_read_captured_varying;
+    qpu.varying_opaque = &shader;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.fragment_w[lane] = qpu_test_float_bits(1.0f);
+        for (unsigned index = 0; index < G_N_ELEMENTS(shader.varying);
+             index++) {
+            shader.varying[index][lane] = qpu_test_float_bits(0.5f);
+        }
+    }
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(words); i++) {
+        stq_le_p(code + i * sizeof(uint64_t), words[i]);
+    }
+    result = bcm2835_v3d_qpu_run(code, sizeof(code), 64, &qpu, &executed);
+    g_assert_cmpint(result, ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(qpu.unsupported_line, ==, 0);
+    g_assert_cmpuint(executed, <=, G_N_ELEMENTS(words));
+    g_assert_cmpuint(qpu.varying_index, ==, G_N_ELEMENTS(shader.varying));
+    g_assert_cmphex(qpu.tlb_color_write_mask, ==, UINT16_MAX);
+    /* PC 10 sets Z from r1=0, so PC 12's all_zc branch falls through. */
+    /* With texel=0xff336699 and RGB varyings=0.5, PCs 23-28 pack
+     * byte0=texel[2]*vary2, byte1=texel[1]*vary1,
+     * byte2=texel[0]*vary0; PC 30 writes alpha=1. */
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.io[46][lane], ==, 0xff4d331a);
+    }
+
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        shader.varying[0][lane] = qpu_test_float_bits(1.0f);
+        shader.varying[1][lane] = qpu_test_float_bits(0.5f);
+        shader.varying[2][lane] = qpu_test_float_bits(0.25f);
+    }
+    bcm2835_v3d_qpu_init(&qpu);
+    qpu.fragment_shader = true;
+    qpu.uniform_address = 0x1000;
+    qpu.read_uniform = qpu_test_read_captured_uniform;
+    qpu.uniform_opaque = &shader;
+    qpu.read_texture = qpu_test_read_captured_texture;
+    qpu.texture_opaque = &shader;
+    qpu.read_varying = qpu_test_read_captured_varying;
+    qpu.varying_opaque = &shader;
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        qpu.fragment_w[lane] = qpu_test_float_bits(1.0f);
+    }
+    result = bcm2835_v3d_qpu_run(code, sizeof(code), 64, &qpu, &executed);
+    g_assert_cmpint(result, ==, BCM2835_V3D_QPU_END);
+    g_assert_cmpuint(qpu.unsupported_line, ==, 0);
+    for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
+        g_assert_cmphex(qpu.io[46][lane], ==, 0xff99330d);
     }
 }
 
@@ -2281,7 +2476,7 @@ static void test_v3d_qpu_branch_delay_slots(void)
     BCM2835V3DQPUState qpu;
     uint32_t executed;
 
-    stq_le_p(code, qpu_test_branch(15, true, 8));
+    stq_le_p(code, qpu_test_branch(15, true, 8, 32));
     stq_le_p(code + 8, qpu_test_load_imm(0, 0x11));
     stq_le_p(code + 16, qpu_test_load_imm(1, 0x22));
     stq_le_p(code + 24, qpu_test_load_imm(2, 0x33));
@@ -2299,6 +2494,7 @@ static void test_v3d_qpu_branch_delay_slots(void)
     g_assert_cmphex(qpu.rf[0][2][0], ==, 0x33);
     g_assert_cmphex(qpu.rf[0][3][0], ==, 0);
     g_assert_cmphex(qpu.rf[0][4][0], ==, 0x55);
+    g_assert_cmphex(qpu.acc[0][0], ==, 32);
 }
 
 static void test_v3d_identity_and_scratch(void)
@@ -2543,52 +2739,80 @@ static uint32_t read_u32(const uint8_t *buffer)
            ((uint32_t)buffer[2] << 16) | ((uint32_t)buffer[3] << 24);
 }
 
-static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
+typedef struct V3DTestFragmentShader {
+    const uint64_t *code;
+    size_t code_words;
+    const uint32_t *uniforms;
+    size_t uniform_words;
+    uint32_t initial_color;
+} V3DTestFragmentShader;
+
+static const uint32_t reference_vertices[9][8] = {
+    { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
+      0x0100ff00, 0x3f800000, 0x40000000, 0x3f800000 },
+    { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
+      0x01000400, 0x3f800000, 0x40000000, 0x3f800000 },
+    { 0x00000000, 0x3f800000, 0x00000000, 0x40000000,
+      0xff000000, 0x3fc00000, 0x40400000, 0x3f000000 },
+    { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
+      0x0100ff00, 0x3f800000, 0x3f800000, 0x3f800000 },
+    { 0x40000000, 0x00000000, 0x00000000, 0x3f800000,
+      0x01000400, 0x3f800000, 0x3f800000, 0x3f800000 },
+    { 0x40000000, 0x3f000000, 0x00000000, 0x3f800000,
+      0xff000000, 0x3f800000, 0x3f800000, 0x3f800000 },
+    { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
+      0x0100ff00, 0x3f800000, 0x40000000, 0x3f800000 },
+    { 0x3f000000, 0xbf000000, 0x00000000, 0x3f800000,
+      0x01000400, 0x3f800000, 0x40000000, 0x3f800000 },
+    { 0x00000000, 0x3f000000, 0x00000000, 0x3f800000,
+      0xff000000, 0x3fc00000, 0x40400000, 0x3f000000 },
+};
+/* Viewport offset=(40,32), scale=(32,-32): final screen XY for vertices 0-8. */
+static const int16_t reference_screen_xy[9][2] = {
+    { 24, 48 }, { 104, 48 }, { 40, 16 },
+    { 104, 48 }, { 104, 32 }, { 104, 16 },
+    { 24, 48 }, { 56, 48 }, { 40, 16 },
+};
+
+static void test_v3d_wait_ct1(void)
 {
-    enum { test_fb_width = 64, test_fb_height = 65 };
-    static const uint32_t vertices[9][8] = {
-        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0x0100ff00, 0x3f800000, 0x40000000, 0x3f800000 },
-        { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0x01000400, 0x3f800000, 0x40000000, 0x3f800000 },
-        { 0x00000000, 0x3f800000, 0x00000000, 0x40000000,
-          0xff000000, 0x3fc00000, 0x40400000, 0x3f000000 },
-        { 0x40000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0x0100ff00, 0x3f800000, 0x3f800000, 0x3f800000 },
-        { 0x40000000, 0x00000000, 0x00000000, 0x3f800000,
-          0x01000400, 0x3f800000, 0x3f800000, 0x3f800000 },
-        { 0x40000000, 0x3f000000, 0x00000000, 0x3f800000,
-          0xff000000, 0x3f800000, 0x3f800000, 0x3f800000 },
-        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0x0100ff00, 0x3f800000, 0x40000000, 0x3f800000 },
-        { 0x3f000000, 0xbf000000, 0x00000000, 0x3f800000,
-          0x01000400, 0x3f800000, 0x40000000, 0x3f800000 },
-        { 0x00000000, 0x3f000000, 0x00000000, 0x40000000,
-          0xff000000, 0x3fc00000, 0x40400000, 0x3f000000 },
-    };
-    uint8_t render_cl[32];
-    uint8_t bin_cl[128];
-    uint8_t draw_cl[32];
-    uint8_t tile_head[64];
-    uint8_t tile_list[64];
-    uint8_t tile_overflow[64];
-    uint8_t record[44] = { 0 };
-    uint8_t record_no_varying[44];
+    for (unsigned i = 0; i < 10000; i++) {
+        uint32_t ct1cs = readl(RASPI3_V3D_BASE + V3D_CT1CS);
+
+        if (ct1cs & V3D_CTERR) {
+            break;
+        }
+        if (readl(RASPI3_V3D_BASE + V3D_CT1CA) ==
+            readl(RASPI3_V3D_BASE + V3D_CT1EA)) {
+            return;
+        }
+        clock_step(1000000);
+    }
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTERR, ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CA), ==,
+                    readl(RASPI3_V3D_BASE + V3D_CT1EA));
+}
+
+static void test_v3d_render_reference_geometry(
+    const V3DTestFragmentShader *fragment,
+    const uint32_t varyings[9][5], unsigned varying_count)
+{
+    enum { fb_width = 64, fb_height = 65, max_shader_words = 64 };
+    uint8_t bin_cl[128], render_cl[32], draw_cl[32];
+    uint8_t record[52] = { 0 };
+    uint8_t vertex_data[sizeof(reference_vertices)];
+    uint8_t coordinate_data[sizeof(reference_vertices)];
     uint8_t vertex_code[19 * sizeof(uint64_t)] = { 0 };
-    uint8_t code[19 * sizeof(uint64_t)] = { 0 };
-    uint8_t fragment_code[4 * sizeof(uint64_t)];
-    uint8_t vertex_data[sizeof(vertices)];
-    uint8_t initial[test_fb_width * test_fb_height * sizeof(uint32_t)];
-    uint8_t fb[sizeof(initial)];
-    size_t render_size = 0;
-    size_t bin_size = 0;
-    size_t draw_size = 0;
-    uint32_t draw_color = 0xff00ff00;
-    uint32_t bin_count;
+    uint8_t coordinate_code[19 * sizeof(uint64_t)] = { 0 };
+    uint8_t fragment_code[max_shader_words * sizeof(uint64_t)] = { 0 };
+    uint8_t uniform_data[16 * sizeof(uint32_t)] = { 0 };
+    uint8_t initial[fb_width * fb_height * sizeof(uint32_t)];
+    size_t bin_size = 0, render_size = 0, draw_size = 0;
     uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8);
     uint32_t vertex_setup_read = (1U << 12) | (1U << 11) | (2U << 8);
     uint32_t coordinate_setup_read = vertex_setup_read | 7;
-    uint64_t instructions[] = {
+    uint64_t vertex_instructions[19] = { 0 };
+    uint64_t coordinate_instructions[] = {
         qpu_test_load_imm(49, setup_write) | (1ULL << 44),
         qpu_test_load_imm(49, coordinate_setup_read | (8U << 20)),
         qpu_test_add_imm(48, 0, 0),
@@ -2609,66 +2833,79 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
         qpu_test_add_imm(7, 48, 0) | (1ULL << 44),
         3ULL << 60,
     };
-    uint64_t vertex_instructions[] = {
-        qpu_test_load_imm(49, setup_write) | (1ULL << 44),
-        qpu_test_load_imm(49, vertex_setup_read | (8U << 20)),
-        qpu_test_add_imm(48, 0, 0),
-        qpu_test_add_imm(48, 1, 0),
-        qpu_test_add_imm(48, 2, 0),
-        qpu_test_add_imm(48, 3, 0),
-        qpu_test_add_imm(48, 4, 0),
-        qpu_test_add_imm(48, 5, 0),
-        qpu_test_add_imm(48, 6, 0),
-        qpu_test_add_imm(48, 7, 0),
-        qpu_test_add_imm(4, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(2, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(7, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(5, 48, 0) | (1ULL << 44),
-        qpu_test_add_imm(6, 48, 0) | (1ULL << 44),
-        3ULL << 60,
-    };
-    uint64_t fragment_instructions[] = {
-        qpu_test_add(35, 39, 0, true),
-        qpu_test_add(35, 39, 1, true),
-        qpu_test_fmul(15, 1, 46),
-        3ULL << 60,
-    };
 
-    memset(initial, 0x5a, sizeof(initial));
-    memwrite(FB_ADDR, initial, sizeof(initial));
-    for (unsigned i = 0; i < G_N_ELEMENTS(vertices); i++) {
-        for (unsigned word = 0; word < G_N_ELEMENTS(vertices[i]); word++) {
-            stl_le_p(vertex_data + (i * G_N_ELEMENTS(vertices[i]) + word) *
-                     sizeof(uint32_t), vertices[i][word]);
+    g_assert_cmpuint(varying_count, <=, 5);
+    g_assert_cmpuint(fragment->code_words, <=, max_shader_words);
+    g_assert_cmpuint(fragment->uniform_words, <=, 16);
+    for (unsigned vertex = 0; vertex < G_N_ELEMENTS(reference_vertices);
+         vertex++) {
+        for (unsigned word = 0; word < G_N_ELEMENTS(reference_vertices[0]);
+             word++) {
+            uint32_t value = reference_vertices[vertex][word];
+            uint32_t coordinate_value = value;
+
+            if (word >= 3 && word < 3 + varying_count) {
+                value = varyings[vertex][word - 3];
+            }
+            stl_le_p(vertex_data +
+                     (vertex * G_N_ELEMENTS(reference_vertices[0]) + word) * 4,
+                     value);
+            stl_le_p(coordinate_data +
+                     (vertex * G_N_ELEMENTS(reference_vertices[0]) + word) * 4,
+                     coordinate_value);
         }
     }
-    stl_le_p(record + 28, 0x6200);
-    stl_le_p(record + 4, 0x6400);
-    stl_le_p(record + 8, 0x6600);
-    record[3] = 2;
-    record[14] = 1;
-    stl_le_p(record + 16, 0x6000);
-    record[26] = 1;
-    record[0] = 1U << 2; /* Enable homogeneous clipping. */
-    stl_le_p(record + 36, 0x7000);
-    record[40] = sizeof(vertices[0]) - 1;
-    record[41] = sizeof(vertices[0]);
-    record[43] = 7 * sizeof(uint32_t);
-    memwrite(0x34000, record, sizeof(record));
-    memwrite(0x7000, vertex_data, sizeof(vertex_data));
-    for (unsigned i = 0; i < G_N_ELEMENTS(instructions); i++) {
-        stq_le_p(code + i * sizeof(uint64_t), instructions[i]);
+    vertex_instructions[0] = qpu_test_load_imm(49, vertex_setup_read) |
+                             (1ULL << 44);
+    vertex_instructions[1] =
+        qpu_test_load_imm(49, vertex_setup_read | (8U << 20));
+    static const unsigned output_inputs[] = { 4, 2, 7, 3, 4, 5, 6, 7 };
+
+    for (unsigned i = 0; i < 8; i++) {
+        vertex_instructions[i + 2] = qpu_test_add_imm(48, i, 0);
+        vertex_instructions[i + 10] =
+            qpu_test_add_imm(output_inputs[i], 48, 0) | (1ULL << 44);
     }
+    vertex_instructions[18] = 3ULL << 60;
     for (unsigned i = 0; i < G_N_ELEMENTS(vertex_instructions); i++) {
         stq_le_p(vertex_code + i * sizeof(uint64_t), vertex_instructions[i]);
     }
-    for (unsigned i = 0; i < G_N_ELEMENTS(fragment_instructions); i++) {
-        stq_le_p(fragment_code + i * sizeof(uint64_t),
-                 fragment_instructions[i]);
+    for (unsigned i = 0; i < G_N_ELEMENTS(coordinate_instructions); i++) {
+        stq_le_p(coordinate_code + i * sizeof(uint64_t),
+                 coordinate_instructions[i]);
     }
-    memwrite(0x6200, code, sizeof(code));
+    for (unsigned i = 0; i < fragment->code_words; i++) {
+        stq_le_p(fragment_code + i * sizeof(uint64_t), fragment->code[i]);
+    }
+    for (unsigned i = 0; i < fragment->uniform_words; i++) {
+        stl_le_p(uniform_data + i * sizeof(uint32_t), fragment->uniforms[i]);
+    }
+    for (size_t i = 0; i < sizeof(initial); i += sizeof(uint32_t)) {
+        stl_le_p(initial + i, fragment->initial_color);
+    }
+    memwrite(FB_ADDR, initial, sizeof(initial));
+    memwrite(0x7000, vertex_data, sizeof(vertex_data));
+    memwrite(0x7400, coordinate_data, sizeof(coordinate_data));
     memwrite(0x6000, vertex_code, sizeof(vertex_code));
-    memwrite(0x6400, fragment_code, sizeof(fragment_code));
+    memwrite(0x6200, coordinate_code, sizeof(coordinate_code));
+    memwrite(0x6400, fragment_code,
+             fragment->code_words * sizeof(uint64_t));
+    memwrite(0x6600, uniform_data, sizeof(uniform_data));
+
+    stl_le_p(record + 4, 0x6400);
+    stl_le_p(record + 8, 0x6600);
+    stl_le_p(record + 16, 0x6000);
+    stl_le_p(record + 28, 0x6200);
+    stl_le_p(record + 36, 0x7000);
+    stl_le_p(record + 44, 0x7400);
+    record[0] = 1U << 2;
+    record[3] = varying_count;
+    record[14] = 1;
+    record[26] = 2;
+    record[40] = record[48] = sizeof(reference_vertices[0]) - 1;
+    record[41] = record[49] = sizeof(reference_vertices[0]);
+    record[51] = 7 * sizeof(uint32_t);
+    memwrite(0x34000, record, sizeof(record));
 
     bin_cl[bin_size++] = 112;
     append_u32(bin_cl, &bin_size, 0x30000);
@@ -2676,21 +2913,19 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     append_u32(bin_cl, &bin_size, 0x32000);
     bin_cl[bin_size++] = 1;
     bin_cl[bin_size++] = 1;
-    bin_cl[bin_size++] = 0x2c;
+    bin_cl[bin_size++] = varying_count > 2 ? 0x54 : 0x2c;
     bin_cl[bin_size++] = 6;
     bin_cl[bin_size++] = 64;
-    append_u32(bin_cl, &bin_size, 0x34001);
+    append_u32(bin_cl, &bin_size, 0x34002);
     bin_cl[bin_size++] = 103;
-    /* VIEWPORT_OFFSET fields are signed 12.4 pixel coordinates. */
     append_u16(bin_cl, &bin_size, 40 * 16);
     append_u16(bin_cl, &bin_size, 32 * 16);
     bin_cl[bin_size++] = 105;
     append_u32(bin_cl, &bin_size, 0x44000000);
-    /* Negative Y scale mirrors Mesa's Y-flipped target; screen rows stay fixed. */
     append_u32(bin_cl, &bin_size, 0xc4000000);
     bin_cl[bin_size++] = 33;
     bin_cl[bin_size++] = 4;
-    append_u32(bin_cl, &bin_size, G_N_ELEMENTS(vertices));
+    append_u32(bin_cl, &bin_size, G_N_ELEMENTS(reference_vertices));
     append_u32(bin_cl, &bin_size, 0);
     bin_cl[bin_size++] = 4;
     memwrite(CL_ADDR, bin_cl, bin_size);
@@ -2698,8 +2933,9 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     writel(RASPI3_V3D_BASE + V3D_CT0CA, CL_ADDR);
     writel(RASPI3_V3D_BASE + V3D_CT0EA, CL_ADDR + bin_size);
 
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
-                    (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
+    uint32_t ct0cs = readl(RASPI3_V3D_BASE + V3D_CT0CS);
+
+    g_assert_cmphex(ct0cs & (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
                     ==, V3D_CTRUN | V3D_CTSUBS);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM,
                     ==, V3D_BMOOM);
@@ -2711,26 +2947,29 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) &
                     (V3D_CTRUN | V3D_CTSUBS | V3D_CTERR),
                     ==, V3D_CTRUN | V3D_CTSUBS);
-    writel(RASPI3_V3D_BASE + V3D_BPOS, 0x80);
+    writel(RASPI3_V3D_BASE + V3D_BPOS,
+           varying_count > 2 ? 0x400 : 0x80);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT0CS) & V3D_CTERR, ==, 0);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_PCS) & V3D_BMOOM, ==, 0);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOA), ==, 0x35000);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPOS), ==, 0);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCA), ==, 0x30140);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCS), ==, 0);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCA), ==,
+                    varying_count > 2 ? 0x30100 : 0x30140);
+    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_BPCS), ==,
+                    varying_count > 2 ? 0x40 : 0);
     g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_INTCTL) & V3D_INT_SPILLUSE,
                     ==, V3D_INT_SPILLUSE);
 
-    /* CT0 bins before CT1 supplies the render target configuration. */
     render_cl[render_size++] = 113;
     append_u32(render_cl, &render_size, FB_ADDR);
-    append_u16(render_cl, &render_size, test_fb_width);
-    append_u16(render_cl, &render_size, test_fb_height);
+    append_u16(render_cl, &render_size, fb_width);
+    append_u16(render_cl, &render_size, fb_height);
     append_u16(render_cl, &render_size, 1U << 2);
     render_cl[render_size++] = 114;
-    append_u32(render_cl, &render_size, draw_color);
+    append_u32(render_cl, &render_size, 0xff00ff00);
     append_u32(render_cl, &render_size, 0);
     append_u32(render_cl, &render_size, 0);
+    render_cl[render_size++] = 0;
     render_cl[render_size++] = 103;
     append_u16(render_cl, &render_size, 40 * 16);
     append_u16(render_cl, &render_size, 32 * 16);
@@ -2738,12 +2977,76 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     memwrite(CL_ADDR, render_cl, render_size);
     writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
     writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + render_size);
+    test_v3d_wait_ct1();
 
+    draw_cl[draw_size++] = 29;
+    append_u48(draw_cl, &draw_size,
+               ((uint64_t)(FB_ADDR >> 4) << 20) | 1);
+    draw_cl[draw_size++] = 115;
+    draw_cl[draw_size++] = 0;
+    draw_cl[draw_size++] = 0;
+    draw_cl[draw_size++] = 17;
+    append_u32(draw_cl, &draw_size, 0x30000);
+    draw_cl[draw_size++] = 28;
+    append_u48(draw_cl, &draw_size,
+               ((uint64_t)(FB_ADDR >> 4) << 20) | 1 | (1ULL << 19));
+    memwrite(CL_ADDR, draw_cl, draw_size);
+    writel(RASPI3_V3D_BASE + V3D_CT1CS, 1U << 15);
+    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
+    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + draw_size);
+    test_v3d_wait_ct1();
+}
+
+static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
+{
+    enum { test_fb_width = 64, test_fb_height = 65 };
+    uint64_t fragment_instructions[] = {
+        qpu_test_add(35, 39, 0, true),
+        qpu_test_add(35, 39, 1, true),
+        qpu_test_fmul(15, 1, 46),
+        3ULL << 60,
+    };
+    uint32_t varyings[9][5] = { 0 };
+    V3DTestFragmentShader fragment = {
+        .code = fragment_instructions,
+        .code_words = G_N_ELEMENTS(fragment_instructions),
+        .initial_color = 0x5a5a5a5a,
+    };
+    uint8_t bin_cl[128];
+    uint8_t tile_head[64];
+    uint8_t tile_list[64];
+    uint8_t tile_overflow[64];
+    uint8_t record[52];
+    uint8_t record_no_varying[52];
+    uint8_t vertex_data[sizeof(reference_vertices)];
+    uint8_t coordinate_data[sizeof(reference_vertices)];
+    uint8_t fb[test_fb_width * test_fb_height * sizeof(uint32_t)];
+    size_t bin_size = 0;
+    uint32_t bin_count;
+    unsigned coverage = 0;
+
+    for (unsigned vertex = 0; vertex < G_N_ELEMENTS(reference_vertices);
+         vertex++) {
+        varyings[vertex][0] = reference_vertices[vertex][5];
+        varyings[vertex][1] = reference_vertices[vertex][6];
+    }
+    test_v3d_render_reference_geometry(&fragment, varyings, 2);
     memread(FB_ADDR, fb, sizeof(fb));
-    g_assert_cmphex(read_u32(fb + (30 * test_fb_width + 32) * sizeof(uint32_t)),
+    g_assert_cmphex(read_u32(fb + (30 * test_fb_width + 32) * 4),
                     ==, 0x5a5a5a5a);
-    g_assert_cmphex(read_u32(fb + (1 * test_fb_width + 1) * sizeof(uint32_t)),
+    g_assert_cmphex(read_u32(fb + (1 * test_fb_width + 1) * 4),
                     ==, 0x5a5a5a5a);
+    {
+        uint32_t bits = read_u32(fb + (40 * test_fb_width + 50) * 4);
+        float value;
+
+        memcpy(&value, &bits, sizeof(value));
+        g_assert_cmpfloat_with_epsilon(value, 2.132743f, 0.001f);
+    }
+    for (size_t i = 0; i < sizeof(fb); i += sizeof(uint32_t)) {
+        coverage += read_u32(fb + i) != fragment.initial_color;
+    }
+    g_test_message("reference covered pixels=%u", coverage);
     memread(0x30000, tile_head, sizeof(tile_head));
     memread(0x30100, tile_list, sizeof(tile_list));
     memread(0x35000, tile_overflow, sizeof(tile_overflow));
@@ -2774,43 +3077,23 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     g_assert_cmphex(tile_overflow[1], ==, 0x32);
     g_assert_cmphex(tile_overflow[57], ==, 128);
     g_assert_cmphex(tile_overflow[58], ==, 18);
-
-    /* CT1 loads the tile, follows the binner's tile sublist, and stores it. */
-    draw_cl[draw_size++] = 29;
-    append_u48(draw_cl, &draw_size,
-               ((uint64_t)(FB_ADDR >> 4) << 20) | 1);
-    draw_cl[draw_size++] = 115;
-    draw_cl[draw_size++] = 0;
-    draw_cl[draw_size++] = 0;
-    draw_cl[draw_size++] = 17;
-    append_u32(draw_cl, &draw_size, 0x30000);
-    draw_cl[draw_size++] = 28;
-    append_u48(draw_cl, &draw_size,
-               ((uint64_t)(FB_ADDR >> 4) << 20) | 1 | (1ULL << 19));
-    memwrite(CL_ADDR, draw_cl, draw_size);
-    writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
-    writel(RASPI3_V3D_BASE + V3D_CT1EA, CL_ADDR + draw_size);
-    g_assert_cmphex(readl(RASPI3_V3D_BASE + V3D_CT1CS) & V3D_CTERR, ==, 0);
-
-    memread(FB_ADDR, fb, sizeof(fb));
-    {
-        uint32_t bits = read_u32(fb + (40 * test_fb_width + 50) *
-                                 sizeof(uint32_t));
-        float value;
-
-        memcpy(&value, &bits, sizeof(value));
-        g_assert_cmpfloat_with_epsilon(value, 2.132743f, 0.001f);
-    }
-    g_assert_cmphex(read_u32(fb + (1 * test_fb_width + 1) * sizeof(uint32_t)),
-                    ==, 0x5a5a5a5a);
-
+    bin_count = readl(RASPI3_V3D_BASE + V3D_BFC);
+    memread(0x34000, record, sizeof(record));
+    memread(0x7000, vertex_data, sizeof(vertex_data));
+    memread(0x7400, coordinate_data, sizeof(coordinate_data));
     /* Also clip Mesa's four-vertex fan with the negative Y scale it emits. */
     bin_count = readl(RASPI3_V3D_BASE + V3D_BFC);
-    memmove(vertex_data, vertex_data + 6 * sizeof(vertices[0]),
-            3 * sizeof(vertices[0]));
-    memcpy(vertex_data + 3 * sizeof(vertices[0]), vertex_data,
-           sizeof(vertices[0]));
+    memmove(vertex_data, vertex_data + 6 * sizeof(reference_vertices[0]),
+            3 * sizeof(reference_vertices[0]));
+    memcpy(vertex_data + 3 * sizeof(reference_vertices[0]), vertex_data,
+           sizeof(reference_vertices[0]));
+    memmove(coordinate_data,
+            coordinate_data + 6 * sizeof(reference_vertices[0]),
+            3 * sizeof(reference_vertices[0]));
+    memcpy(coordinate_data + 3 * sizeof(reference_vertices[0]),
+           coordinate_data, sizeof(reference_vertices[0]));
     memwrite(0x7000, vertex_data, sizeof(vertex_data));
+    memwrite(0x7400, coordinate_data, sizeof(coordinate_data));
     record[0] = 1U << 2;
     memwrite(0x34000, record, sizeof(record));
     bin_size = 0;
@@ -2823,7 +3106,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     bin_cl[bin_size++] = 0x2c;
     bin_cl[bin_size++] = 6;
     bin_cl[bin_size++] = 64;
-    append_u32(bin_cl, &bin_size, 0x34001);
+    append_u32(bin_cl, &bin_size, 0x34002);
     bin_cl[bin_size++] = 103;
     append_u16(bin_cl, &bin_size, 40 * 16);
     append_u16(bin_cl, &bin_size, 32 * 16);
@@ -2871,7 +3154,7 @@ static void test_v3d_ct0_clips_and_rasterizes_varying_triangles(void)
     for (unsigned primitive = 0; primitive < 5; primitive++) {
         bin_cl[bin_size++] = 64;
         append_u32(bin_cl, &bin_size,
-                   primitive ? 0x34101 : 0x34001);
+                   primitive ? 0x34102 : 0x34002);
         bin_cl[bin_size++] = 33;
         bin_cl[bin_size++] = 4;
         append_u32(bin_cl, &bin_size, 3);
@@ -3403,6 +3686,7 @@ static size_t t_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
     const uint8_t *stile_map = (tile_y & 1) ? odd_stile_map :
                                                even_stile_map;
 
+    /* Independent reference for Mesa vc4_t_utile_address() in vc4_tiling.c. */
     if (tile_y & 1) {
         tile_x = tiles_x - tile_x - 1;
     }
@@ -3410,6 +3694,316 @@ static size_t t_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
            bytes_per_pixel + stile_map[stile] * 16 * 16 * bytes_per_pixel +
            utile * 16 * bytes_per_pixel +
            ((local_y & 3) * 4 + (local_x & 3)) * bytes_per_pixel;
+}
+
+static int64_t test_v3d_edge_fixed(int32_t ax, int32_t ay,
+                                   int32_t bx, int32_t by,
+                                   int32_t px, int32_t py)
+{
+    return (int64_t)(px - ax) * (by - ay) -
+           (int64_t)(py - ay) * (bx - ax);
+}
+
+static bool test_v3d_reference_varyings_at(unsigned pixel_x,
+                                            unsigned pixel_y,
+                                            double *s, double *t)
+{
+    static const unsigned triangles[3][3] = {
+        { 0, 1, 2 }, { 3, 4, 5 }, { 6, 7, 8 },
+    };
+    int32_t x[9], y[9];
+    int32_t px = pixel_x * 16 + 8;
+    int32_t py = pixel_y * 16 + 8;
+    bool covered = false;
+
+    for (unsigned vertex = 0; vertex < G_N_ELEMENTS(reference_screen_xy);
+         vertex++) {
+        x[vertex] = reference_screen_xy[vertex][0] * 16;
+        y[vertex] = reference_screen_xy[vertex][1] * 16;
+    }
+    for (unsigned triangle = 0; triangle < G_N_ELEMENTS(triangles);
+         triangle++) {
+        const unsigned *v = triangles[triangle];
+        int64_t area = test_v3d_edge_fixed(x[v[0]], y[v[0]], x[v[1]], y[v[1]],
+                                            x[v[2]], y[v[2]]);
+        int64_t edge[3];
+        double barycentric[3];
+        double inv_w = 0.0;
+        double s_partial = 0.0;
+        double t_partial = 0.0;
+        int sign = area < 0 ? -1 : 1;
+        bool inside = area != 0;
+
+        if (!inside) {
+            continue;
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            unsigned next = (i + 1) % 3;
+            int32_t dx = x[v[next]] - x[v[i]];
+            int32_t dy = y[v[next]] - y[v[i]];
+            int32_t oriented_dx = dx * sign;
+            int32_t oriented_dy = dy * sign;
+            bool top_left = oriented_dy > 0 ||
+                            (oriented_dy == 0 && oriented_dx < 0);
+            int64_t threshold = top_left ? 0 : 1;
+
+            edge[i] = test_v3d_edge_fixed(x[v[i]], y[v[i]],
+                                           x[v[next]], y[v[next]], px, py) *
+                        sign;
+            if (edge[i] < threshold) {
+                inside = false;
+            }
+        }
+        if (!inside) {
+            continue;
+        }
+        barycentric[0] = (double)edge[1] / (area * sign);
+        barycentric[1] = (double)edge[2] / (area * sign);
+        barycentric[2] = (double)edge[0] / (area * sign);
+        for (unsigned i = 0; i < 3; i++) {
+            uint32_t bits = reference_vertices[v[i]][7];
+            float reciprocal_w;
+
+            memcpy(&reciprocal_w, &bits, sizeof(reciprocal_w));
+            inv_w += barycentric[i] * reciprocal_w;
+            s_partial += barycentric[i] *
+                         (reference_screen_xy[v[i]][0] / 64.0) *
+                         reciprocal_w;
+            t_partial += barycentric[i] *
+                         (reference_screen_xy[v[i]][1] / 64.0) *
+                         reciprocal_w;
+        }
+        /* Match the reference rasterizer: sum(lambda*a/w) / sum(lambda/w). */
+        if (inv_w != 0.0) {
+            *s = s_partial / inv_w;
+            *t = t_partial / inv_w;
+            covered = true;
+        }
+    }
+    return covered;
+}
+
+static size_t lt_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
+                                    unsigned bytes_per_pixel);
+
+static void test_v3d_textured_reference_triangles(bool stk_5var)
+{
+    enum {
+        fb_width = 64,
+        fb_height = 65,
+        reference_covered_pixels = 880,
+        clear_color = 0xff00ff00,
+    };
+    /* The captured shader uses a 16x16 LT descriptor; 2var tests T-format. */
+    unsigned texture_width = stk_5var ? 16 : 512;
+    unsigned texture_height = stk_5var ? 16 : 256;
+    uint32_t texture_base = stk_5var ? 0x4000 : 0x80000;
+    size_t texture_size = texture_width * texture_height * sizeof(uint32_t);
+    static const uint64_t stk_fragment_words[] = {
+        UINT64_C(0x100049e0203e303e), UINT64_C(0x10024862213e317e),
+        UINT64_C(0x100248c1819e7549), UINT64_C(0x10025020353e36fe),
+        UINT64_C(0xd0020067159c0fc0), UINT64_C(0x10024862213e317e),
+        UINT64_C(0x100229e715827d80), UINT64_C(0x10025840819e7549),
+        UINT64_C(0xd0040067159c2fc0), UINT64_C(0x100049e3203e303e),
+        UINT64_C(0x100229e715067d80), UINT64_C(0x100208a7019e7740),
+        UINT64_C(0xf01809e700000050), UINT64_C(0x100009e7009e7000),
+        UINT64_C(0x100009e7009e7000), UINT64_C(0x100009e7009e7000),
+        UINT64_C(0xe002482700000008), UINT64_C(0x10020a270c827180),
+        UINT64_C(0x100229e715067d80), UINT64_C(0x100009e7009e7000),
+        UINT64_C(0x10021e67159e7480), UINT64_C(0x10021e27159e7240),
+        UINT64_C(0xa00009e7009e7000), UINT64_C(0x1d0099c020027034),
+        UINT64_C(0x1b0089c0209c003c), UINT64_C(0x190089c1209c103c),
+        UINT64_C(0x114049e380027036), UINT64_C(0x115049e3809c003f),
+        UINT64_C(0x116049e3809c103f), UINT64_C(0xe002486700000014),
+        UINT64_C(0xd17049e3809e003f), UINT64_C(0x10020a270c827380),
+        UINT64_C(0x10020ba7159e76c0), UINT64_C(0x300009e7009e7000),
+    };
+    uint64_t simple_fragment_words[] = {
+        qpu_test_fmul(15, 35, 0) | (1ULL << 44),
+        qpu_test_fmul(15, 35, 57),
+        qpu_test_add(0, 39, 56, false),
+        10ULL << 60,
+        qpu_test_read_r4(8),
+        qpu_test_add(8, 39, 45, false),
+        3ULL << 60,
+    };
+    uint32_t uniforms[16] = {
+        0xffffffff, 0x1000, 0x400b, 0x01001030,
+        0x1000, 0, 0, 0x3f800000,
+        0x3b4ccccd, 0, 0xbf800000, 0,
+        0, 0, 0, 0xbba3d70a,
+    };
+    uint32_t varyings[9][5] = { 0 };
+    const uint64_t *fragment_words = stk_5var ? stk_fragment_words :
+                                               simple_fragment_words;
+    size_t fragment_word_count = stk_5var ? G_N_ELEMENTS(stk_fragment_words) :
+                                             G_N_ELEMENTS(simple_fragment_words);
+    unsigned varying_count = stk_5var ? 5 : 2;
+    V3DTestFragmentShader fragment = {
+        .code = fragment_words,
+        .code_words = fragment_word_count,
+        .uniforms = uniforms,
+        .uniform_words = G_N_ELEMENTS(uniforms),
+        .initial_color = clear_color,
+    };
+    uint8_t fb[fb_width * fb_height * sizeof(uint32_t)];
+    g_autofree uint8_t *texture = g_malloc0(texture_size);
+    unsigned covered_pixels = 0;
+    unsigned reference_pixels = 0;
+    unsigned exact_matches = 0;
+    unsigned within1_only = 0;
+    unsigned mismatch_count = 0;
+    GString *first_mismatches = g_string_new(NULL);
+
+    g_assert_cmpuint(texture_base % 4096, ==, 0);
+    for (unsigned y = 0; y < texture_height; y++) {
+        for (unsigned x = 0; x < texture_width; x++) {
+            uint32_t texel = stk_5var ? 0xff336699 :
+                             0xff000000 | (y << 12) | x;
+            size_t offset = stk_5var ?
+                lt_tiled_pixel_offset(texture_width, x, y, sizeof(texel)) :
+                t_tiled_pixel_offset(texture_width, x, y, sizeof(texel));
+
+            stl_le_p(texture + offset, texel);
+        }
+    }
+    memwrite(texture_base, texture, texture_size);
+    if (stk_5var) {
+        /* The captured shader rewinds to these absolute uniform addresses. */
+        uniforms[1] = 0x6600;
+        uniforms[4] = 0x6600;
+    } else {
+        uniforms[0] = texture_base;
+        /* T-format 512x256, nearest sampling, clamp-to-edge P0/P1. */
+        uniforms[1] = (texture_height << 20) | (texture_width << 8) |
+                      (1U << 7) | (1U << 4) | (1U << 2) | 1U;
+    }
+    for (unsigned vertex = 0; vertex < G_N_ELEMENTS(reference_screen_xy);
+         vertex++) {
+        float s = 0.5f;
+        float t = stk_5var ? 0.5f : 0.25f;
+
+        if (stk_5var) {
+            varyings[vertex][0] = qpu_test_float_bits(0.5f);
+            varyings[vertex][1] = qpu_test_float_bits(0.5f);
+            varyings[vertex][2] = qpu_test_float_bits(0.5f);
+            varyings[vertex][3] = qpu_test_float_bits(s);
+            varyings[vertex][4] = qpu_test_float_bits(t);
+        } else {
+            varyings[vertex][0] = qpu_test_float_bits(s);
+            varyings[vertex][1] = qpu_test_float_bits(t);
+        }
+    }
+    test_v3d_render_reference_geometry(&fragment, varyings, varying_count);
+    memread(FB_ADDR, fb, sizeof(fb));
+
+    for (unsigned y = 0; y < fb_height; y++) {
+        for (unsigned x = 0; x < fb_width; x++) {
+            uint32_t actual = read_u32(fb + (y * fb_width + x) * 4);
+            bool actual_covered = actual != clear_color;
+            double sample_s = 0.0, sample_t = 0.0;
+            bool expected_covered = test_v3d_reference_varyings_at(
+                x, y, &sample_s, &sample_t);
+            uint32_t expected = clear_color;
+            uint32_t decoded = stk_5var ?
+                (actual & 0xff00ff00) | ((actual & 0xff) << 16) |
+                ((actual >> 16) & 0xff) : actual;
+            unsigned texel_x = MIN((unsigned)(0.5 * texture_width),
+                                   texture_width - 1);
+            unsigned texel_y = MIN((unsigned)(0.25 * texture_height),
+                                   texture_height - 1);
+
+            covered_pixels += actual_covered;
+            reference_pixels += expected_covered;
+            if (expected_covered) {
+                uint32_t texel = stk_5var ? 0xff336699 :
+                                 0xff000000 | (texel_y << 12) | texel_x;
+
+                /* STK scales sampled RGB by 0.5; compare in RGBA order. */
+                expected = stk_5var ? 0xff1a334d : texel;
+
+                if (actual_covered && decoded == expected) {
+                    exact_matches++;
+                } else if (stk_5var && actual_covered) {
+                    bool within_one = true;
+
+                    /* Fixed-point interpolation can round a color by 1. */
+                    for (unsigned shift = 0; shift < 32; shift += 8) {
+                        int actual_channel = (decoded >> shift) & 0xff;
+                        int expected_channel = (expected >> shift) & 0xff;
+
+                        within_one &= ABS(actual_channel - expected_channel) <=
+                                      1;
+                    }
+                    if (within_one) {
+                        within1_only++;
+                    } else {
+                        mismatch_count++;
+                        if (mismatch_count <= 8) {
+                            g_string_append_printf(first_mismatches,
+                                " (%u,%u) expected=%08x actual=%08x",
+                                x, y, expected, decoded);
+                        }
+                    }
+                } else if (!stk_5var && actual_covered &&
+                           (decoded >> 24) == 0xff) {
+                    int dx = (int)(decoded & 0xfff) - (int)texel_x;
+                    int dy = (int)((decoded >> 12) & 0xff) - (int)texel_y;
+
+                    if (ABS(dx) <= 1 && ABS(dy) <= 1) {
+                        within1_only++;
+                    } else {
+                        mismatch_count++;
+                    }
+                    if (mismatch_count && mismatch_count <= 8) {
+                        g_string_append_printf(first_mismatches,
+                            " (%u,%u) expected=(%u,%u) actual=(%u,%u) pixel=%08x",
+                            x, y, texel_x, texel_y, decoded & 0xfff,
+                            (decoded >> 12) & 0xff, actual);
+                    }
+                } else {
+                    mismatch_count++;
+                    if (mismatch_count <= 8) {
+                        if (stk_5var) {
+                            g_string_append_printf(first_mismatches,
+                                " (%u,%u) expected=%08x actual=%08x",
+                                x, y, expected, decoded);
+                        } else {
+                            g_string_append_printf(first_mismatches,
+                                " (%u,%u) expected=(%u,%u) actual=(%u,%u) pixel=%08x",
+                                x, y, texel_x, texel_y, decoded & 0xfff,
+                                (decoded >> 12) & 0xff, actual);
+                        }
+                    }
+                }
+            } else if (actual_covered) {
+                mismatch_count++;
+                if (mismatch_count <= 8) {
+                    g_string_append_printf(first_mismatches,
+                        " (%u,%u) expected=clear actual=%08x", x, y, actual);
+                }
+            }
+        }
+    }
+    g_test_message("%s covered=%u reference=%u exact=%u within1-only=%u "
+                   "outside1=%u first8=%s",
+                   stk_5var ? "STK-5-varying" : "2-varying",
+                   covered_pixels, reference_pixels, exact_matches,
+                   within1_only, mismatch_count, first_mismatches->str);
+    g_string_free(first_mismatches, TRUE);
+    g_assert_cmpuint(reference_pixels, ==, reference_covered_pixels);
+    g_assert_cmpuint(covered_pixels, ==, reference_covered_pixels);
+    g_assert_cmpuint(mismatch_count, ==, 0);
+}
+
+static void test_v3d_textured_tformat_2var(void)
+{
+    test_v3d_textured_reference_triangles(false);
+}
+
+static void test_v3d_textured_lt_stk5var(void)
+{
+    test_v3d_textured_reference_triangles(true);
 }
 
 static size_t lt_tiled_pixel_offset(uint32_t width, unsigned x, unsigned y,
@@ -3653,6 +4247,12 @@ int main(int argc, char **argv)
                    test_v3d_qpu_uniform_read);
     qtest_add_func("/bcm2835/v3d/qpu_tmu0_rgba_texture_sampling",
                    test_v3d_qpu_tmu0_rgba_texture_sampling);
+    qtest_add_func("/bcm2835/v3d/qpu_tmu0_bias_texture_sampling",
+                   test_v3d_qpu_tmu0_bias_texture_sampling);
+    qtest_add_func("/bcm2835/v3d/fragment_stk_txb_replay",
+                   test_fragment_stk_txb_replay);
+    qtest_add_func("/bcm2835/v3d/fragment_stk_branch_replay",
+                   test_fragment_stk_branch_replay);
     qtest_add_func("/bcm2835/v3d/qpu_captured_labwc_shaders",
                    test_v3d_qpu_captured_labwc_shaders);
     qtest_add_func("/bcm2835/v3d/qpu_tmu1_rgba_texture_sampling",
@@ -3726,6 +4326,10 @@ int main(int argc, char **argv)
                    test_v3d_ct0_shader_state_dma);
     qtest_add_func("/bcm2835/v3d/ct0_clips_and_rasterizes_varying",
                    test_v3d_ct0_clips_and_rasterizes_varying_triangles);
+    qtest_add_func("/bcm2835/v3d/textured_tformat_2var",
+                   test_v3d_textured_tformat_2var);
+    qtest_add_func("/bcm2835/v3d/textured_lt_stk5var",
+                   test_v3d_textured_lt_stk5var);
     qtest_add_func("/bcm2835/v3d/ct0_primitive_packet_lengths",
                    test_v3d_ct0_primitive_packet_lengths);
     qtest_add_func("/bcm2835/v3d/ct1_clear_linear",
