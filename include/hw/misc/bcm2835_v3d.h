@@ -10,6 +10,7 @@
 #include "hw/core/sysbus.h"
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_BCM2835_V3D "bcm2835_v3d"
@@ -21,10 +22,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(BCM2835V3DState, BCM2835_V3D)
 #define BCM2835_V3D_INTDIS 0x038
 #define BCM2835_V3D_MAX_TILES 4096
 
+typedef struct BCM2835V3DDeferredMMIO {
+    struct BCM2835V3DDeferredMMIO *next;
+    hwaddr offset;
+    uint64_t value;
+    unsigned size;
+} BCM2835V3DDeferredMMIO;
+
 struct BCM2835V3DState {
     SysBusDevice parent_obj;
 
     QEMUBH *ct1_bh;
+    QEMUTimer *ct1_timer;
     int64_t ct1_start_us;
     void *wgpu_context;
     void *wgpu_batch;
@@ -47,6 +56,16 @@ struct BCM2835V3DState {
     unsigned fragment_worker_completed;
     void *fragment_worker_job;
     bool fragment_worker_quit;
+    bool fragment_unlock_requested;
+    bool ct1_top_level;
+    bool mmio_deferred;
+    bool debug_defer_probe_requested;
+    bool debug_defer_probe_pending;
+    bool debug_worker_fallback_requested;
+    uint32_t mmio_deferred_count;
+    uint32_t debug_worker_fallback_count;
+    BCM2835V3DDeferredMMIO *deferred_mmio_head;
+    BCM2835V3DDeferredMMIO **deferred_mmio_tail;
 
     uint32_t ct_cs[2];
     uint32_t ct_ca[2];

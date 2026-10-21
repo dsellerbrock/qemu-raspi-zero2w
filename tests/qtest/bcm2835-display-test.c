@@ -147,7 +147,16 @@ int main(int argc, char **argv)
                    test_hvs_primary_plane);
     qtest_add_func("/bcm2835/display/pixelvalve_vblank_irq",
                    test_pixelvalve_vblank_irq);
-    qtest_start("-machine raspi3ap -smp 4");
+    if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_UNLOCK"), "1") == 0) {
+        qtest_start("-machine raspi3ap -smp 4 "
+                    "-global bcm2835_v3d.fragment-workers=4 "
+                    "-global bcm2835_v3d.fragment-unlock=on");
+    } else if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_WORKERS"), "4") == 0) {
+        qtest_start("-machine raspi3ap -smp 4 "
+                    "-global bcm2835_v3d.fragment-workers=4");
+    } else {
+        qtest_start("-machine raspi3ap -smp 4");
+    }
     ret = g_test_run();
     qtest_end();
 

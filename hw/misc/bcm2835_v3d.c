@@ -18,6 +18,7 @@
 #include "qemu/rcu.h"
 #include "qemu/timer.h"
 #include "system/dma.h"
+#include "system/cpus.h"
 #include "trace.h"
 #ifdef CONFIG_V3D_WGPU
 #include "bcm2835_v3d_wgpu.h"
@@ -28,6 +29,7 @@
 #define V3D_IDENT0             0x000
 #define V3D_IDENT1             0x004
 #define V3D_IDENT2             0x008
+#define V3D_SCRATCH             0x010
 #define V3D_CT0CS              0x100
 #define V3D_CT1CS              0x104
 #define V3D_CT0EA              0x108
@@ -62,6 +64,9 @@
 #define V3D_INT_FLDONE         (1U << 1)
 #define V3D_INT_FRDONE         (1U << 0)
 #define V3D_INT_MASK           0x0f
+
+#define V3D_DEBUG_FALLBACK_COUNT 0x014
+#define V3D_DEBUG_DEFER_VALUE  0xa6d3feed
 
 #define V3D_BIN_FLAG_AUTO_INIT_TSDA (1U << 2)
 #define V3D_BIN_FLAG_UNSUPPORTED   ((1U << 7) | (1U << 1) | (1U << 0))
@@ -664,6 +669,9 @@ static bool bcm2835_v3d_clear_tile(BCM2835V3DState *s)
 
 static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread);
 static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread);
+static void bcm2835_v3d_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size);
+static void bcm2835_v3d_replay_deferred(BCM2835V3DState *s);
 
 static bool bcm2835_v3d_validate_vertex_arrays(BCM2835V3DState *s,
                                                uint32_t max_index)
@@ -1271,12 +1279,84 @@ static bool bcm2835_v3d_fragment_pixels_unique(const uint16_t *pixels,
     return true;
 }
 
+static void bcm2835_v3d_defer_mmio(BCM2835V3DState *s, hwaddr offset,
+                                    uint64_t value, unsigned size)
+{
+    BCM2835V3DDeferredMMIO *write = g_new(BCM2835V3DDeferredMMIO, 1);
+
+    write->next = NULL;
+    write->offset = offset;
+    write->value = value;
+    write->size = size;
+    if (!s->deferred_mmio_tail) {
+        s->deferred_mmio_tail = &s->deferred_mmio_head;
+    }
+    *s->deferred_mmio_tail = write;
+    s->deferred_mmio_tail = &write->next;
+    s->mmio_deferred_count++;
+}
+
+static void bcm2835_v3d_clear_deferred(BCM2835V3DState *s)
+{
+    BCM2835V3DDeferredMMIO *write;
+
+    while ((write = s->deferred_mmio_head)) {
+        s->deferred_mmio_head = write->next;
+        g_free(write);
+    }
+    s->deferred_mmio_tail = &s->deferred_mmio_head;
+}
+
+static void bcm2835_v3d_debug_defer_probe(BCM2835V3DState *s)
+{
+    uint32_t scratch_before;
+    uint32_t deferred_before;
+
+    if (!s->debug_defer_probe_requested) {
+        return;
+    }
+    bql_lock();
+    g_assert(bql_locked());
+    g_assert(s->mmio_deferred);
+    scratch_before = s->regs[V3D_SCRATCH >> 2];
+    deferred_before = s->mmio_deferred_count;
+    bcm2835_v3d_write(s, V3D_SCRATCH, V3D_DEBUG_DEFER_VALUE, 4);
+    g_assert_cmphex(s->regs[V3D_SCRATCH >> 2], ==, scratch_before);
+    g_assert_cmpuint(s->mmio_deferred_count, ==, deferred_before + 1);
+    if (s->irq_status & V3D_INT_FRDONE) {
+        bcm2835_v3d_write(s, BCM2835_V3D_INTCTL, V3D_INT_FRDONE, 4);
+        g_assert_cmphex(s->irq_status & V3D_INT_FRDONE, ==, 0);
+    }
+    s->debug_defer_probe_pending = true;
+    bql_unlock();
+}
+
+static void bcm2835_v3d_replay_deferred(BCM2835V3DState *s)
+{
+    BCM2835V3DDeferredMMIO *write;
+
+    g_assert(bql_locked());
+    g_assert(!s->mmio_deferred);
+    while ((write = s->deferred_mmio_head)) {
+        s->deferred_mmio_head = write->next;
+        bcm2835_v3d_write(s, write->offset, write->value, write->size);
+        g_free(write);
+    }
+    s->deferred_mmio_tail = &s->deferred_mmio_head;
+    if (s->debug_defer_probe_pending) {
+        g_assert_cmphex(s->regs[V3D_SCRATCH >> 2], ==,
+                        V3D_DEBUG_DEFER_VALUE);
+        s->debug_defer_probe_pending = false;
+    }
+}
+
 static bool bcm2835_v3d_fragment_try_workers(
     BCM2835V3DState *s, const uint16_t *pixels,
     const uint32_t *varying_partial, const uint32_t *fragment_w,
     unsigned count, uint32_t uniforms_address, unsigned varying_count,
     const uint8_t *code, uint32_t code_size)
 {
+    bool unlock;
     BCM2835V3DFragmentWorkerJob job = {
         .s = s,
         .code = code,
@@ -1305,6 +1385,14 @@ static bool bcm2835_v3d_fragment_try_workers(
     qemu_cond_broadcast(&s->fragment_worker_cond);
     qemu_mutex_unlock(&s->fragment_worker_mutex);
 
+    unlock = s->fragment_unlock_requested && s->fragment_workers &&
+             s->ct1_top_level && !qemu_in_vcpu_thread();
+    if (unlock) {
+        g_assert(bql_locked());
+        s->mmio_deferred = true;
+        bql_unlock();
+        bcm2835_v3d_debug_defer_probe(s);
+    }
     bcm2835_v3d_fragment_worker_run_batches(&job);
 
     qemu_mutex_lock(&s->fragment_worker_mutex);
@@ -1313,6 +1401,12 @@ static bool bcm2835_v3d_fragment_try_workers(
     }
     s->fragment_worker_job = NULL;
     qemu_mutex_unlock(&s->fragment_worker_mutex);
+    if (unlock) {
+        bql_lock();
+        g_assert(bql_locked());
+        s->mmio_deferred = false;
+    }
+    g_assert(bql_locked());
 
     for (unsigned i = 0; i < job.batches; i++) {
         BCM2835V3DFragmentWorkerSlot *slot = &job.slots[i];
@@ -1324,6 +1418,14 @@ static bool bcm2835_v3d_fragment_try_workers(
         if (slot->fallback || slot->result != BCM2835_V3D_QPU_END ||
             slot->varying_index != varying_count ||
             (slot->color_write_mask & expected_mask) != expected_mask) {
+            return false;
+        }
+        if (s->debug_worker_fallback_requested &&
+            i == job.batches - 1) {
+            s->debug_worker_fallback_requested = false;
+            s->debug_worker_fallback_count++;
+            s->regs[V3D_DEBUG_FALLBACK_COUNT >> 2] =
+                s->debug_worker_fallback_count;
             return false;
         }
     }
@@ -3696,6 +3798,9 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 {
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    if (thread == 0) {
+        g_assert(!s->mmio_deferred);
+    }
     trace_bcm2835_v3d_thread_start(thread, s->ct_ca[thread],
                                    s->ct_ea[thread]);
     bcm2835_v3d_run_thread_body(s, thread, false);
@@ -3706,6 +3811,7 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
 
 static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread)
 {
+    g_assert(!s->mmio_deferred);
     if (thread != 1) {
         bcm2835_v3d_run_thread(s, thread);
         return;
@@ -3716,15 +3822,21 @@ static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread)
         trace_bcm2835_v3d_thread_start(thread, s->ct_ca[thread],
                                       s->ct_ea[thread]);
     }
-    qemu_bh_schedule(s->ct1_bh);
+    if (s->ct1_timer) {
+        timer_mod_ns(s->ct1_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1);
+    } else {
+        qemu_bh_schedule(s->ct1_bh);
+    }
 }
 
-static void bcm2835_v3d_ct1_bh(void *opaque)
+static void bcm2835_v3d_ct1_continue(BCM2835V3DState *s, bool top_level)
 {
-    BCM2835V3DState *s = opaque;
     int64_t slice_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     int64_t now_us;
 
+    g_assert(bql_locked());
+    s->ct1_top_level = top_level;
     bcm2835_v3d_run_thread_body(s, 1, true);
     now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     trace_bcm2835_v3d_thread_slice(1, now_us - slice_start_us);
@@ -3736,21 +3848,42 @@ static void bcm2835_v3d_ct1_bh(void *opaque)
             s->ct1_start_us = 0;
         } else {
             /* shortcut: ordinary tile stores yield promptly; split dense tiles if needed. */
-            qemu_bh_schedule(s->ct1_bh);
+            if (s->ct1_timer) {
+                timer_mod_ns(s->ct1_timer,
+                             qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1);
+            } else {
+                qemu_bh_schedule(s->ct1_bh);
+            }
         }
-        return;
+        goto out;
     }
 
     trace_bcm2835_v3d_thread_end(1, s->ct_ca[1], s->ct_cs[1],
                                  now_us - s->ct1_start_us);
     s->ct1_start_us = 0;
+
+out:
+    s->ct1_top_level = false;
+    bcm2835_v3d_replay_deferred(s);
+}
+
+static void bcm2835_v3d_ct1_bh(void *opaque)
+{
+    bcm2835_v3d_ct1_continue(opaque, false);
+}
+
+static void bcm2835_v3d_ct1_timer(void *opaque)
+{
+    bcm2835_v3d_ct1_continue(opaque, true);
 }
 
 static void bcm2835_v3d_resume_binner_if_ready(BCM2835V3DState *s)
 {
-    uint32_t base = s->regs[V3D_BPOA >> 2];
-    uint32_t size = s->regs[V3D_BPOS >> 2];
+    uint32_t base, size;
 
+    g_assert(!s->mmio_deferred);
+    base = s->regs[V3D_BPOA >> 2];
+    size = s->regs[V3D_BPOS >> 2];
     if (!s->bin_oom_waiting ||
         !bcm2835_v3d_overflow_range_valid(s, base, size)) {
         return;
@@ -3841,6 +3974,9 @@ static void bcm2835_v3d_write_thread_cs(BCM2835V3DState *s,
     if (value & V3D_CS_CTRSTA) {
         if (thread == 1) {
             qemu_bh_cancel(s->ct1_bh);
+            if (s->ct1_timer) {
+                timer_del(s->ct1_timer);
+            }
             s->ct1_start_us = 0;
         }
         s->ct_cs[thread] = 0;
@@ -3905,6 +4041,11 @@ static void bcm2835_v3d_write(void *opaque, hwaddr offset, uint64_t value,
     uint32_t value32 = value;
 
     assert(size == 4);
+    if (s->mmio_deferred && offset != BCM2835_V3D_INTCTL &&
+        offset != BCM2835_V3D_INTENA && offset != BCM2835_V3D_INTDIS) {
+        bcm2835_v3d_defer_mmio(s, offset, value, size);
+        return;
+    }
     switch (offset) {
     case V3D_IDENT0:
     case V3D_IDENT1:
@@ -3999,6 +4140,15 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     if (s->ct1_bh) {
         qemu_bh_cancel(s->ct1_bh);
     }
+    if (s->ct1_timer) {
+        timer_del(s->ct1_timer);
+    }
+    s->ct1_top_level = false;
+    s->mmio_deferred = false;
+    s->debug_defer_probe_pending = false;
+    s->mmio_deferred_count = 0;
+    s->debug_worker_fallback_count = 0;
+    bcm2835_v3d_clear_deferred(s);
     bcm2835_v3d_wgpu_batch_free(s);
     s->ct1_start_us = 0;
     memset(s->regs, 0, sizeof(s->regs));
@@ -4128,6 +4278,7 @@ static void bcm2835_v3d_realize(DeviceState *dev, Error **errp)
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_V3D "-memory");
     bcm2835_v3d_fragment_workers_init(s);
+    s->deferred_mmio_tail = &s->deferred_mmio_head;
 #ifdef CONFIG_V3D_WGPU
     const char *library = g_getenv("QEMU_V3D_WGPU_LIBRARY");
     const char *verify = g_getenv("QEMU_V3D_WGPU_VERIFY");
@@ -4138,6 +4289,10 @@ static void bcm2835_v3d_realize(DeviceState *dev, Error **errp)
     }
 #endif
     s->ct1_bh = qemu_bh_new(bcm2835_v3d_ct1_bh, s);
+    if (s->fragment_unlock_requested && s->fragment_workers) {
+        s->ct1_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                    bcm2835_v3d_ct1_timer, s);
+    }
     bcm2835_v3d_reset(dev);
 }
 
@@ -4150,6 +4305,9 @@ static void bcm2835_v3d_unrealize(DeviceState *dev)
         qemu_bh_delete(s->ct1_bh);
         s->ct1_bh = NULL;
     }
+    timer_free(s->ct1_timer);
+    s->ct1_timer = NULL;
+    bcm2835_v3d_clear_deferred(s);
     bcm2835_v3d_fragment_workers_destroy(s);
     bcm2835_v3d_wgpu_batch_free(s);
 #ifdef CONFIG_V3D_WGPU
@@ -4325,6 +4483,12 @@ static void bcm2835_v3d_class_init(ObjectClass *klass, const void *data)
     static const Property properties[] = {
         DEFINE_PROP_UINT32("fragment-workers", BCM2835V3DState,
                            fragment_workers_requested, 0),
+        DEFINE_PROP_BOOL("fragment-unlock", BCM2835V3DState,
+                         fragment_unlock_requested, false),
+        DEFINE_PROP_BOOL("debug-defer-probe", BCM2835V3DState,
+                         debug_defer_probe_requested, false),
+        DEFINE_PROP_BOOL("debug-worker-fallback", BCM2835V3DState,
+                         debug_worker_fallback_requested, false),
     };
 
     dc->realize = bcm2835_v3d_realize;
