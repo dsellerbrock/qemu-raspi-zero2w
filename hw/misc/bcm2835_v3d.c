@@ -2712,7 +2712,6 @@ static bool bcm2835_v3d_clip_triangle(BCM2835V3DState *s,
 
 static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
                                              const BCM2835V3DVertex *triangle,
-                                             uint64_t *binned_tiles,
                                              uint32_t *append_index)
 {
     int32_t center_x = s->viewport_offset_valid ? s->viewport_center_x :
@@ -2757,9 +2756,6 @@ static bool bcm2835_v3d_bin_screen_triangle(BCM2835V3DState *s,
          tile_y <= (uint32_t)pixel_max_y / V3D_TILE_SIZE; tile_y++) {
         for (uint32_t tile_x = pixel_min_x / V3D_TILE_SIZE;
              tile_x <= (uint32_t)pixel_max_x / V3D_TILE_SIZE; tile_x++) {
-            if (++*binned_tiles > V3D_MAX_RASTER_TILES) {
-                return false;
-            }
             if ((*append_index)++ < s->bin_draw_append_count) {
                 continue;
             }
@@ -2779,7 +2775,6 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
                                       const BCM2835V3DVertex *vertices,
                                       unsigned count)
 {
-    uint64_t binned_tiles = 0;
     uint32_t append_index = 0;
 
     if (!s->bin_draw_resume) {
@@ -2828,7 +2823,6 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
                 };
 
                 if (!bcm2835_v3d_bin_screen_triangle(s, triangle,
-                                                     &binned_tiles,
                                                      &append_index)) {
                     qemu_log_mask(LOG_GUEST_ERROR,
                                   "bcm2835_v3d: clipped triangle bin failed at vertex %u\n",
@@ -2837,7 +2831,6 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
                 }
             }
         } else if (!bcm2835_v3d_bin_screen_triangle(s, vertices + vertex,
-                                                    &binned_tiles,
                                                     &append_index)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "bcm2835_v3d: triangle bin failed at vertex %u\n",

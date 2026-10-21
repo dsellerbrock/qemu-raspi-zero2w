@@ -2884,6 +2884,8 @@ typedef struct V3DTestGeometryInput {
     unsigned count;
     uint32_t vertex_address;
     uint32_t coordinate_address;
+    uint32_t bin_alloc_base;
+    uint32_t bin_alloc_size;
     uint32_t first;
     bool expect_ct0_error;
     uint8_t tiles_x;
@@ -2964,6 +2966,8 @@ static void test_v3d_render_reference_geometry(
     g_autofree uint8_t *coordinate_data = NULL;
     size_t bin_size = 0, render_size = 0, draw_size = 0;
     size_t vertex_data_size;
+    uint32_t bin_alloc_base;
+    uint32_t bin_alloc_size;
     uint32_t setup_write = (1U << 12) | (1U << 11) | (2U << 8);
     uint32_t vertex_setup_read = (1U << 12) | (1U << 11) | (2U << 8);
     uint32_t coordinate_setup_read = vertex_setup_read | 7;
@@ -2999,6 +3003,10 @@ static void test_v3d_render_reference_geometry(
     if (!geometry) {
         geometry = &default_geometry;
     }
+    bin_alloc_base = geometry->bin_alloc_base ? geometry->bin_alloc_base :
+                     0x30000;
+    bin_alloc_size = geometry->bin_alloc_size ? geometry->bin_alloc_size :
+                     clip_space ? 0x1000 : 0x140;
     g_assert(!varying_count ||
              geometry->count <= G_N_ELEMENTS(reference_vertices));
     g_assert(!full_tile ||
@@ -3090,8 +3098,8 @@ static void test_v3d_render_reference_geometry(
     memwrite(0x34000, record, sizeof(record));
 
     bin_cl[bin_size++] = 112;
-    append_u32(bin_cl, &bin_size, 0x30000);
-    append_u32(bin_cl, &bin_size, clip_space ? 0x1000 : 0x140);
+    append_u32(bin_cl, &bin_size, bin_alloc_base);
+    append_u32(bin_cl, &bin_size, bin_alloc_size);
     append_u32(bin_cl, &bin_size, 0x32000);
     bin_cl[bin_size++] = geometry->tiles_x;
     bin_cl[bin_size++] = geometry->tiles_y;
@@ -4842,6 +4850,63 @@ static void test_v3d_ct0_clip_stk_behind_eye_offscreen(void)
     test_v3d_ct0_clip_case(visible, 56);
 }
 
+static void test_v3d_ct0_array_prim_tile_ref_limit(void)
+{
+    enum { triangle_count = 4097, vertex_count = triangle_count * 3,
+           vertex_address = 0x100000, coordinate_address = 0x130000,
+           bin_alloc_base = 0x500000 };
+    static const uint32_t visible[3][4] = {
+        { 0xbf000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0x3f000000, 0xbf000000, 0x00000000, 0x3f800000 },
+        { 0x00000000, 0x3f000000, 0x00000000, 0x3f800000 },
+    };
+    const uint64_t fragment_code[] = { 3ULL << 60 };
+    g_autofree uint32_t *vertex_words = g_new(uint32_t, vertex_count * 8);
+    const uint32_t (*vertices)[8] =
+        (const uint32_t (*)[8])vertex_words;
+    V3DTestGeometryInput geometry = {
+        .vertices = vertices,
+        .count = vertex_count,
+        .vertex_address = vertex_address,
+        .coordinate_address = coordinate_address,
+        .bin_alloc_base = bin_alloc_base,
+        .bin_alloc_size = 0x100000,
+        .tiles_x = 1,
+        .tiles_y = 1,
+    };
+    V3DTestFragmentShader fragment = {
+        .code = fragment_code,
+        .code_words = G_N_ELEMENTS(fragment_code),
+        .initial_color = 0x5a5a5a5a,
+    };
+    g_autofree gchar *log_path = NULL;
+    g_autofree gchar *qemu_args = NULL;
+    int fd = g_file_open_tmp("bcm2835-v3d-guest-errors-XXXXXX",
+                             &log_path, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    for (unsigned vertex = 0; vertex < vertex_count; vertex++) {
+        unsigned source = vertex % 3;
+
+        memcpy(vertex_words + vertex * 8, reference_vertices[source],
+               sizeof(reference_vertices[0]));
+        memcpy(vertex_words + vertex * 8, visible[source],
+               sizeof(visible[0]));
+    }
+    qtest_end();
+    qemu_args = g_strdup_printf("-machine raspi3ap -smp 4 "
+                                "-d guest_errors -D %s", log_path);
+    qtest_start(qemu_args);
+
+    /* Mesa's VC4 GL_ARRAY_PRIMITIVE encoding, 4097 refs in a 1-tile grid. */
+    test_v3d_render_reference_geometry(&fragment, NULL, 0, false, visible,
+                                       true, &geometry);
+
+    qtest_end();
+    v3d_assert_no_guest_errors(log_path);
+}
+
 static void test_v3d_ct0_array_prim_4680_vertices(void)
 {
     enum { vertex_count = 4680, vertex_data_address = 0x100000,
@@ -5260,6 +5325,8 @@ int main(int argc, char **argv)
                    test_v3d_fragment_unlock_irq_ack_immediate);
     qtest_add_func("/bcm2835/v3d/ct0_clip_stk_behind_eye_offscreen",
                    test_v3d_ct0_clip_stk_behind_eye_offscreen);
+    qtest_add_func("/bcm2835/v3d/ct0_array_prim_tile_ref_limit",
+                   test_v3d_ct0_array_prim_tile_ref_limit);
     qtest_add_func("/bcm2835/v3d/ct0_array_prim_4680_vertices",
                    test_v3d_ct0_array_prim_4680_vertices);
     qtest_add_func("/bcm2835/v3d/ct0_array_prim_65537_vertices_rejected",
