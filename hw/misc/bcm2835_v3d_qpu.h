@@ -53,6 +53,9 @@ typedef struct BCM2835V3DQPUState {
     uint32_t varying_index;
     uint32_t varying_c_pending[BCM2835_V3D_QPU_LANES];
     uint32_t vpm[BCM2835_V3D_QPU_VPM_ROWS][BCM2835_V3D_QPU_LANES];
+    /* GL VS/CS read the VPM input segment and write a separate output segment. */
+    uint32_t vpm_out[BCM2835_V3D_QPU_VPM_ROWS][BCM2835_V3D_QPU_LANES];
+    bool separate_vpm_output;
     uint32_t io[64][BCM2835_V3D_QPU_LANES];
     uint32_t sfu_result[3][BCM2835_V3D_QPU_LANES];
     uint64_t sfu_ready_at[3];

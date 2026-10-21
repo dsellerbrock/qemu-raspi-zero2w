@@ -1829,6 +1829,119 @@ static void test_v3d_qpu_vpm_vector_io(void)
     }
 }
 
+static void test_qpu_stk_vs_vpm_replay(void)
+{
+    static const uint64_t program[] = {
+        UINT64_C(0xe0024c6700501a00), UINT64_C(0x100210e715c27d80),
+        UINT64_C(0x100210a715c27d80), UINT64_C(0x100049e020803037),
+        UINT64_C(0x100049e320802037), UINT64_C(0x1002584181c201f6),
+        UINT64_C(0x10024122218032f7), UINT64_C(0x100049e120802037),
+        UINT64_C(0x100258b4811205f6), UINT64_C(0x100240e021803477),
+        UINT64_C(0x100049e120802037), UINT64_C(0x1002082701827180),
+        UINT64_C(0x1002506321803077), UINT64_C(0x100049e220802037),
+        UINT64_C(0x100248e1211207f4), UINT64_C(0x100248e0210e06b7),
+        UINT64_C(0xd00208a7029e1e40), UINT64_C(0x100059c2209e7022),
+        UINT64_C(0x100049e22082701e), UINT64_C(0x100049e1200a7006),
+        UINT64_C(0x10124023270a7256), UINT64_C(0x10224023278016fe),
+        UINT64_C(0xe0025c6700001a00), UINT64_C(0x100049e0200a701e),
+        UINT64_C(0x10020c2715027d80), UINT64_C(0x10024c2081c201f6),
+        UINT64_C(0x10020c27150a7d80), UINT64_C(0x1c020c2704067d80),
+        UINT64_C(0x1a020c2704067d80), UINT64_C(0x18020c2704067d80),
+        UINT64_C(0x1e020c2704067d80), UINT64_C(0x10024c2195c27036),
+        UINT64_C(0x10020c27159e7240), UINT64_C(0x300009e7009e7000),
+    };
+    static const uint32_t input[2][5][3] = {
+        {
+            { 0x438e8000, 0x43b18000, 0x43b18000 },
+            { 0x43170000, 0x43170000, 0x435d0000 },
+            { 0xffffffff, 0xffffffff, 0xffffffff },
+            { 0x00000000, 0x3f800000, 0x3f800000 },
+            { 0x00000000, 0x00000000, 0x3f800000 },
+        },
+        {
+            { 0x438e8000, 0x438e8000, 0x43930000 },
+            { 0x43700000, 0x43610000, 0x43610000 },
+            { 0xff000000, 0xff000000, 0xff000000 },
+            { 0x3f6a0000, 0x3f6a0000, 0x3f6e8000 },
+            { 0x3cf00000, 0x00000000, 0x00000000 },
+        },
+    };
+    static const uint32_t expected[2][3][6] = {
+        {
+            { 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+              0x00000000, 0x00000000 },
+            { 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+              0x3f800000, 0x00000000 },
+            { 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000,
+              0x3f800000, 0x3f800000 },
+        },
+        {
+            { 0x00000000, 0x00000000, 0x00000000, 0x3f800000,
+              0x3f6a0000, 0x3cf00000 },
+            { 0x00000000, 0x00000000, 0x00000000, 0x3f800000,
+              0x3f6a0000, 0x00000000 },
+            { 0x00000000, 0x00000000, 0x00000000, 0x3f800000,
+              0x3f6e8000, 0x00000000 },
+        },
+    };
+    uint8_t code[sizeof(program)];
+    uint32_t actual[2][3][6];
+    QPUTestCapturedShader shader = {
+        .uniforms = {
+            0x00000000, 0x00000000, 0x3f800000, 0x3b4ccccd,
+            0x00000000, 0xbf800000, 0x00000000, 0x00000000,
+            0x00000000, 0x00000000, 0xbba3d70a, 0x3f800000,
+            0x45a00000, 0xc5480000, 0x3f000000, 0x3f000000,
+        },
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(program); i++) {
+        stq_le_p(code + i * sizeof(uint64_t), program[i]);
+    }
+    for (unsigned draw = 0; draw < G_N_ELEMENTS(input); draw++) {
+        BCM2835V3DQPUState qpu;
+        uint32_t executed;
+
+        bcm2835_v3d_qpu_init(&qpu);
+        qpu.separate_vpm_output = true;
+        memset(qpu.vpm_out, 0, sizeof(qpu.vpm_out));
+        qpu.uniform_address = 0x1000;
+        qpu.read_uniform = qpu_test_read_captured_uniform;
+        qpu.uniform_opaque = &shader;
+        /* GL position, color and texcoord attributes occupy VPM rows 0-4. */
+        for (unsigned row = 0; row < G_N_ELEMENTS(input[draw]); row++) {
+            for (unsigned lane = 0; lane < G_N_ELEMENTS(input[draw][row]);
+                 lane++) {
+                qpu.vpm[row][lane] = input[draw][row][lane];
+            }
+        }
+        shader.uniform_reads = 0;
+        g_assert_cmpint(bcm2835_v3d_qpu_run(
+                            code, sizeof(code), 128, &qpu, &executed),
+                        ==, BCM2835_V3D_QPU_END);
+        g_assert_cmpuint(executed, ==, G_N_ELEMENTS(program));
+        for (unsigned vertex = 0; vertex < 3; vertex++) {
+            for (unsigned row = 3; row <= 8; row++) {
+                actual[draw][vertex][row - 3] = qpu.vpm_out[row][vertex];
+            }
+            g_assert_cmphex(qpu.vpm[3][vertex], ==,
+                            input[draw][3][vertex]);
+            g_assert_cmphex(qpu.vpm[4][vertex], ==,
+                            input[draw][4][vertex]);
+        }
+    }
+    for (unsigned draw = 0; draw < G_N_ELEMENTS(expected); draw++) {
+        for (unsigned vertex = 0; vertex < G_N_ELEMENTS(expected[draw]);
+             vertex++) {
+            for (unsigned row = 0; row < G_N_ELEMENTS(expected[draw][vertex]);
+                 row++) {
+                g_assert_cmphex(actual[draw][vertex][row], ==,
+                                expected[draw][vertex][row]);
+            }
+        }
+    }
+}
+
 static void test_v3d_qpu_vpm_vertical_32bit(void)
 {
     uint8_t code[3 * sizeof(uint64_t)];
@@ -4289,6 +4402,8 @@ int main(int argc, char **argv)
     qtest_add_func("/bcm2835/v3d/qpu_sfu", test_v3d_qpu_sfu);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vector_io",
                    test_v3d_qpu_vpm_vector_io);
+    qtest_add_func("/bcm2835/v3d/qpu_stk_vs_vpm_replay",
+                   test_qpu_stk_vs_vpm_replay);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_vertical_32bit",
                    test_v3d_qpu_vpm_vertical_32bit);
     qtest_add_func("/bcm2835/v3d/qpu_vpm_subword_io",

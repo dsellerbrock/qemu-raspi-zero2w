@@ -883,6 +883,10 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
         BCM2835V3DQPUResult result;
 
         bcm2835_v3d_qpu_init(&qpu);
+        if (output_vpm || vertices) {
+            qpu.separate_vpm_output = true;
+            memset(qpu.vpm_out, 0, sizeof(qpu.vpm_out));
+        }
         qpu.uniform_address = uniforms_address;
         qpu.read_uniform = bcm2835_v3d_qpu_read_uniform;
         qpu.uniform_opaque = s;
@@ -932,8 +936,8 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
             return false;
         }
         if (output_vpm) {
-            memcpy(output_vpm[first / BCM2835_V3D_QPU_LANES], qpu.vpm,
-                   sizeof(qpu.vpm));
+            memcpy(output_vpm[first / BCM2835_V3D_QPU_LANES], qpu.vpm_out,
+                   sizeof(qpu.vpm_out));
         }
         if (vertices) {
             if (qpu.vpm_write_total != 7 ||
@@ -973,7 +977,7 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
                      BCM2835_V3D_QPU_LANES; lane++) {
                     if (first + lane < count) {
                         vertices[first + lane].word[word] =
-                            qpu.vpm[coordinate_row][lane];
+                            qpu.vpm_out[coordinate_row][lane];
                     }
                 }
             }
@@ -981,10 +985,10 @@ static bool bcm2835_v3d_run_qpu_stage(BCM2835V3DState *s,
             for (unsigned lane = 0; lane < BCM2835_V3D_QPU_LANES; lane++) {
                 if (first + lane < count) {
                     vertices[first + lane].word[4] =
-                        qpu.vpm[qpu.vpm_write_history[4]][lane];
+                        qpu.vpm_out[qpu.vpm_write_history[4]][lane];
                     vertices[first + lane].word[
                         5 + s->shader_record[3]] =
-                        qpu.vpm[qpu.vpm_write_history[6]][lane];
+                        qpu.vpm_out[qpu.vpm_write_history[6]][lane];
                 }
             }
             if (input_vpm) {

@@ -1993,6 +1993,8 @@ static BCM2835V3DQPUResult bcm2835_v3d_qpu_run_internal(
         writes_vpm = (waddr_add == QPU_W_VPM && active_add) ||
                      (waddr_mul == QPU_W_VPM && active_mul);
         if (writes_vpm) {
+            uint32_t (*dst)[BCM2835_V3D_QPU_LANES] =
+                qpu->separate_vpm_output ? qpu->vpm_out : qpu->vpm;
             unsigned row, column, shift;
 
             qpu_vpm_decode(qpu->vpm_write_address,
@@ -2010,7 +2012,7 @@ static BCM2835V3DQPUResult bcm2835_v3d_qpu_run_internal(
                                qpu->vpm_write_laned, qpu->vpm_write_size,
                                lane,
                                &row, &column, &shift);
-                qpu->vpm_write_pending[lane] = qpu->vpm[row][column];
+                qpu->vpm_write_pending[lane] = dst[row][column];
             }
         }
 
@@ -2118,6 +2120,9 @@ static BCM2835V3DQPUResult bcm2835_v3d_qpu_run_internal(
             memcpy(qpu->acc[4], qpu->io[45], sizeof(qpu->acc[4]));
         }
         if (writes_vpm) {
+            uint32_t (*dst)[BCM2835_V3D_QPU_LANES] =
+                qpu->separate_vpm_output ? qpu->vpm_out : qpu->vpm;
+
             if (qpu->vpm_write_total < UINT8_MAX) {
                 qpu->vpm_write_total++;
             }
@@ -2142,7 +2147,7 @@ static BCM2835V3DQPUResult bcm2835_v3d_qpu_run_internal(
                                qpu->vpm_write_laned, qpu->vpm_write_size,
                                lane,
                                &row, &column, &shift);
-                qpu->vpm[row][column] = qpu->vpm_write_pending[lane];
+                dst[row][column] = qpu->vpm_write_pending[lane];
             }
             qpu->vpm_write_address = (qpu->vpm_write_address +
                                       qpu->vpm_write_stride) &
