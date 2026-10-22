@@ -490,7 +490,8 @@ EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win)
 
 /* ---------------------------------------------------------------------- */
 
-#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
+#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || \
+    defined(__APPLE__)
 
 /*
  * Taken from glamor_egl.h from the Xorg xserver, which is MIT licensed
@@ -524,19 +525,36 @@ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
                                 EGLenum platform)
 {
     EGLDisplay dpy = EGL_NO_DISPLAY;
+#ifdef __APPLE__
+    static const EGLint angle_metal_attribs[] = {
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,
+        EGL_NONE,
+    };
+#endif
 
     /* In practise any EGL 1.5 implementation would support the EXT extension */
     if (epoxy_has_egl_extension(NULL, "EGL_EXT_platform_base")) {
         if (platform != 0) {
 #ifdef __APPLE__
-            dpy = eglGetPlatformDisplayEXT(platform, (void *)(intptr_t)native, NULL);
+            if (platform == EGL_PLATFORM_ANGLE_ANGLE) {
+                dpy = eglGetPlatformDisplayEXT(platform,
+                                               (void *)(intptr_t)native,
+                                               angle_metal_attribs);
+            } else {
+                dpy = eglGetPlatformDisplayEXT(platform,
+                                               (void *)(intptr_t)native, NULL);
+            }
 #else
             dpy = eglGetPlatformDisplayEXT(platform, native, NULL);
 #endif
         }
     }
 
-    if (dpy == EGL_NO_DISPLAY) {
+    if (dpy == EGL_NO_DISPLAY
+#ifdef __APPLE__
+        && platform != EGL_PLATFORM_ANGLE_ANGLE
+#endif
+        ) {
         /* fallback */
         dpy = eglGetDisplay(native);
     }
@@ -714,6 +732,20 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
 
 #ifdef WIN32
     if (qemu_egl_init_dpy_win32(EGL_DEFAULT_DISPLAY, mode) < 0) {
+        error_setg(errp, "egl: init failed");
+        return false;
+    }
+    qemu_egl_rn_ctx = qemu_egl_init_ctx();
+    if (!qemu_egl_rn_ctx) {
+        error_setg(errp, "egl: egl_init_ctx failed");
+        return false;
+    }
+#elif defined(__APPLE__)
+    if (mode == DISPLAY_GL_MODE_ON) {
+        mode = DISPLAY_GL_MODE_ES;
+    }
+    if (qemu_egl_init_dpy(EGL_DEFAULT_DISPLAY, EGL_PLATFORM_ANGLE_ANGLE,
+                          mode) < 0) {
         error_setg(errp, "egl: init failed");
         return false;
     }
