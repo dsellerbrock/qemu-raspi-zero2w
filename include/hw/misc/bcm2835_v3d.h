@@ -49,6 +49,20 @@ struct BCM2835V3DState {
     uint32_t fragment_workers_requested;
     uint32_t fragment_workers;
     QemuThread *fragment_worker_threads;
+    bool profile_enabled;
+    struct {
+        uint64_t bql_parse_us;
+        uint64_t bql_unlocked_us;
+        uint64_t worker_wait_us;
+        uint64_t bql_worker_wait_us;
+        uint64_t publish_us;
+        uint64_t idle_us;
+        uint64_t worker_busy_us;
+        uint64_t worker_window_us;
+        uint64_t last_end_us;
+        unsigned tiles;
+        unsigned lists;
+    } profile;
     QemuMutex fragment_worker_mutex;
     QemuCond fragment_worker_cond;
     QemuCond fragment_worker_done;
@@ -135,6 +149,7 @@ struct BCM2835V3DState {
     uint8_t pending_tile_load_memory_format;
     uint8_t pending_tile_load_color_format;
     bool pending_tile_load;
+    bool pending_tile_load_zs;
 };
 
 #endif /* HW_MISC_BCM2835_V3D_H */

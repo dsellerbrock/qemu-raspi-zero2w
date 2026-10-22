@@ -120,6 +120,7 @@
 #define V3D_TILE_SIZE          64
 #define V3D_T_MEMORY_TILE_SIZE 32
 #define V3D_UTILE_PIXELS       16
+#define BCM2835_V3D_PROFILE_LISTS 60
 
 typedef struct BCM2835V3DVertex {
     uint32_t word[6 + V3D_MAX_FRAGMENT_VARYINGS];
@@ -152,6 +153,8 @@ typedef struct BCM2835V3DFragmentWorkerJob {
     uint32_t uniforms_address;
     BCM2835V3DFragmentWorkerSlot *slots;
     int next_batch;
+    bool profile_enabled;
+    uint64_t worker_busy_us;
 } BCM2835V3DFragmentWorkerJob;
 
 static GPrivate bcm2835_v3d_fragment_worker_slot = G_PRIVATE_INIT(NULL);
@@ -544,20 +547,24 @@ static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
     unsigned memory_format = (params >> 4) & 3;
     unsigned mode = (params >> 6) & 3;
     unsigned color_format = (params >> 8) & 3;
-    bool zs_store = store && buffer == 2;
+    bool zs_buffer = buffer == 2;
+    bool zs_store = store && zs_buffer;
+    bool zs_load = !store && zs_buffer;
 
     if (buffer == 0 || (buffer == 1 && (params & (1ULL << 16)))) {
         return true;
     }
-    /* shortcut: Z/S stores are clear-only, add loads/depth writes when modeled. */
-    if ((buffer != 1 && !zs_store) || mode != 0 || memory_format > 2 ||
-        (zs_store ? color_format != 0 :
+    /* shortcut: limit Z/S to buffer 2/sample 0/RGBA8888 until other modes
+     * and buffers have qtest coverage.
+     */
+    if ((buffer != 1 && !zs_buffer) || mode != 0 || memory_format > 2 ||
+        (zs_buffer ? color_format != 0 :
          (color_format > 2 || (store && color_format == 1))) ||
         !s->render_config_valid || !s->render_width || !s->render_height) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "bcm2835_v3d: tile buffer %s unsupported: buffer=%u mode=%u memfmt=%u colorfmt=%u base=0x%08x params=0x%012" PRIx64 " "
-                      "(supports color buffer 1 and Z/S store buffer 2; "
-                      "Z/S loads, buffers 3-5, and modes != 0 remain unsupported) "
+                      "(supports color buffer 1 and Z/S buffer 2 loads/stores; "
+                      "buffers 3-5 and modes != 0 remain unsupported) "
                       "render_valid=%d %ux%u config=0x%04x\n",
                       store ? "store" : "load", buffer, mode,
                       memory_format, color_format, base, params,
@@ -599,6 +606,7 @@ static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
         s->pending_tile_load_base = base;
         s->pending_tile_load_memory_format = memory_format;
         s->pending_tile_load_color_format = color_format;
+        s->pending_tile_load_zs = zs_load;
         s->pending_tile_load = true;
     }
     return true;
@@ -1197,7 +1205,7 @@ static void bcm2835_v3d_init_fragment_qpu(
 }
 
 static void bcm2835_v3d_fragment_worker_run_batches(
-    BCM2835V3DFragmentWorkerJob *job)
+    BCM2835V3DFragmentWorkerJob *job, bool worker)
 {
     int index;
 
@@ -1210,6 +1218,8 @@ static void bcm2835_v3d_fragment_worker_run_batches(
         uint32_t count = MIN(job->count - first,
                              BCM2835_V3D_QPU_LANES);
         uint32_t executed;
+        int64_t start_us = job->profile_enabled && worker ?
+                           g_get_monotonic_time() : 0;
 
         g_private_set(&bcm2835_v3d_fragment_worker_slot, slot);
         bcm2835_v3d_qpu_set_worker_mode(true);
@@ -1220,6 +1230,10 @@ static void bcm2835_v3d_fragment_worker_run_batches(
         slot->result = bcm2835_v3d_qpu_run(
             job->code, job->code_size, V3D_QPU_INSTRUCTION_BUDGET,
             &qpu, &executed);
+        if (start_us) {
+            qatomic_fetch_add(&job->worker_busy_us,
+                              g_get_monotonic_time() - start_us);
+        }
         slot->varying_index = qpu.varying_index;
         slot->color_write_mask = qpu.tlb_color_write_mask;
         memcpy(slot->colors, qpu.io[46], sizeof(slot->colors));
@@ -1249,7 +1263,7 @@ static void *bcm2835_v3d_fragment_worker_thread(void *opaque)
         generation = s->fragment_worker_generation;
         job = s->fragment_worker_job;
         qemu_mutex_unlock(&s->fragment_worker_mutex);
-        bcm2835_v3d_fragment_worker_run_batches(job);
+        bcm2835_v3d_fragment_worker_run_batches(job, true);
         qemu_mutex_lock(&s->fragment_worker_mutex);
         s->fragment_worker_completed++;
         if (s->fragment_worker_completed == s->fragment_workers) {
@@ -1360,6 +1374,9 @@ static bool bcm2835_v3d_fragment_try_workers(
     const uint8_t *code, uint32_t code_size)
 {
     bool unlock;
+    int64_t worker_start_us = 0;
+    int64_t worker_wait_start_us = 0;
+    int64_t unlock_start_us = 0;
     BCM2835V3DFragmentWorkerJob job = {
         .s = s,
         .code = code,
@@ -1371,6 +1388,7 @@ static bool bcm2835_v3d_fragment_try_workers(
         .batches = DIV_ROUND_UP(count, BCM2835_V3D_QPU_LANES),
         .varying_count = varying_count,
         .uniforms_address = uniforms_address,
+        .profile_enabled = s->profile_enabled,
     };
 
     if (!s->fragment_workers || job.batches < 2 || s->wgpu_context ||
@@ -1380,6 +1398,9 @@ static bool bcm2835_v3d_fragment_try_workers(
     g_autofree BCM2835V3DFragmentWorkerSlot *slots =
         g_new0(BCM2835V3DFragmentWorkerSlot, job.batches);
 
+    if (s->profile_enabled) {
+        worker_start_us = g_get_monotonic_time();
+    }
     job.slots = slots;
     qemu_mutex_lock(&s->fragment_worker_mutex);
     s->fragment_worker_job = &job;
@@ -1393,19 +1414,40 @@ static bool bcm2835_v3d_fragment_try_workers(
     if (unlock) {
         g_assert(bql_locked());
         s->mmio_deferred = true;
+        if (s->profile_enabled) {
+            unlock_start_us = g_get_monotonic_time();
+        }
         bql_unlock();
         bcm2835_v3d_debug_defer_probe(s);
     }
-    bcm2835_v3d_fragment_worker_run_batches(&job);
+    bcm2835_v3d_fragment_worker_run_batches(&job, false);
 
+    if (s->profile_enabled) {
+        worker_wait_start_us = g_get_monotonic_time();
+    }
     qemu_mutex_lock(&s->fragment_worker_mutex);
     while (s->fragment_worker_completed < s->fragment_workers) {
         qemu_cond_wait(&s->fragment_worker_done, &s->fragment_worker_mutex);
     }
     s->fragment_worker_job = NULL;
     qemu_mutex_unlock(&s->fragment_worker_mutex);
+    if (s->profile_enabled) {
+        int64_t end_us = g_get_monotonic_time();
+
+        s->profile.worker_wait_us += end_us - worker_wait_start_us;
+        s->profile.worker_window_us += end_us - worker_start_us;
+        s->profile.worker_busy_us += qatomic_read(&job.worker_busy_us);
+        if (!unlock) {
+            s->profile.bql_worker_wait_us +=
+                end_us - worker_wait_start_us;
+        }
+    }
     if (unlock) {
         bql_lock();
+        if (s->profile_enabled) {
+            s->profile.bql_unlocked_us +=
+                g_get_monotonic_time() - unlock_start_us;
+        }
         g_assert(bql_locked());
         s->mmio_deferred = false;
     }
@@ -1432,11 +1474,18 @@ static bool bcm2835_v3d_fragment_try_workers(
             return false;
         }
     }
+    int64_t publish_start_us = s->profile_enabled ?
+                               g_get_monotonic_time() : 0;
     for (unsigned i = 0; i < count; i++) {
         unsigned batch = i / BCM2835_V3D_QPU_LANES;
         unsigned lane = i % BCM2835_V3D_QPU_LANES;
 
         s->tile_color[pixels[i]] = job.slots[batch].colors[lane];
+    }
+    if (publish_start_us) {
+        s->profile.publish_us +=
+            g_get_monotonic_time() - publish_start_us;
+        s->profile.tiles++;
     }
     return true;
 }
@@ -3664,8 +3713,14 @@ static void bcm2835_v3d_run_thread_body(BCM2835V3DState *s, unsigned thread,
             s->tile_color_valid = false;
             s->tile_zs_valid = false;
             if (s->pending_tile_load) {
+                uint32_t *tile_pixels = s->pending_tile_load_zs ?
+                                        s->tile_zs : s->tile_color;
+                bool *tile_valid = s->pending_tile_load_zs ?
+                                   &s->tile_zs_valid :
+                                   &s->tile_color_valid;
+
                 if (!bcm2835_v3d_copy_tile(
-                        s, s->tile_color, s->pending_tile_load_base,
+                        s, tile_pixels, s->pending_tile_load_base,
                         s->pending_tile_load_memory_format,
                         s->pending_tile_load_color_format, false)) {
                     qemu_log_mask(LOG_GUEST_ERROR,
@@ -3681,8 +3736,9 @@ static void bcm2835_v3d_run_thread_body(BCM2835V3DState *s, unsigned thread,
                                              "tile buffer load DMA failed");
                     return;
                 }
-                s->tile_color_valid = true;
+                *tile_valid = true;
                 s->pending_tile_load = false;
+                s->pending_tile_load_zs = false;
             }
             s->tile_primitive_format_valid = false;
             break;
@@ -3805,6 +3861,41 @@ static void bcm2835_v3d_run_thread(BCM2835V3DState *s, unsigned thread)
                                  start_us);
 }
 
+static void bcm2835_v3d_profile_list_done(BCM2835V3DState *s)
+{
+    uint64_t worker_capacity_us;
+
+    s->profile.last_end_us = g_get_monotonic_time();
+    if (++s->profile.lists < BCM2835_V3D_PROFILE_LISTS) {
+        return;
+    }
+
+    worker_capacity_us = s->profile.worker_window_us * s->fragment_workers;
+    qemu_log("A6_V3D_PROFILE lists=%u workers=%u tiles=%u "
+             "bql_parse_us=%llu worker_wait_us=%llu bql_publish_us=%llu "
+             "interlist_idle_us=%llu worker_busy_us=%llu "
+             "worker_window_us=%llu worker_busy_pct=%.1f\n",
+             s->profile.lists, s->fragment_workers, s->profile.tiles,
+             (unsigned long long)s->profile.bql_parse_us,
+             (unsigned long long)s->profile.worker_wait_us,
+             (unsigned long long)s->profile.publish_us,
+             (unsigned long long)s->profile.idle_us,
+             (unsigned long long)s->profile.worker_busy_us,
+             (unsigned long long)s->profile.worker_window_us,
+             worker_capacity_us ?
+             100.0 * s->profile.worker_busy_us / worker_capacity_us : 0.0);
+    s->profile.bql_parse_us = 0;
+    s->profile.bql_unlocked_us = 0;
+    s->profile.worker_wait_us = 0;
+    s->profile.bql_worker_wait_us = 0;
+    s->profile.publish_us = 0;
+    s->profile.idle_us = 0;
+    s->profile.worker_busy_us = 0;
+    s->profile.worker_window_us = 0;
+    s->profile.tiles = 0;
+    s->profile.lists = 0;
+}
+
 static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread)
 {
     g_assert(!s->mmio_deferred);
@@ -3814,6 +3905,13 @@ static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread)
     }
 
     if (!s->ct1_start_us) {
+        if (s->profile_enabled) {
+            int64_t now_us = g_get_monotonic_time();
+
+            if (s->profile.last_end_us) {
+                s->profile.idle_us += now_us - s->profile.last_end_us;
+            }
+        }
         s->ct1_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         trace_bcm2835_v3d_thread_start(thread, s->ct_ca[thread],
                                       s->ct_ea[thread]);
@@ -3829,12 +3927,32 @@ static void bcm2835_v3d_start_thread(BCM2835V3DState *s, unsigned thread)
 static void bcm2835_v3d_ct1_continue(BCM2835V3DState *s, bool top_level)
 {
     int64_t slice_start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    int64_t profile_start_us = s->profile_enabled ?
+                               g_get_monotonic_time() : 0;
+    uint64_t unlocked_before = profile_start_us ?
+                              s->profile.bql_unlocked_us : 0;
+    uint64_t bql_wait_before = profile_start_us ?
+                               s->profile.bql_worker_wait_us : 0;
+    uint64_t publish_before = profile_start_us ?
+                              s->profile.publish_us : 0;
+    bool list_finished = false;
     int64_t now_us;
 
     g_assert(bql_locked());
     s->ct1_top_level = top_level;
     bcm2835_v3d_run_thread_body(s, 1, true);
     now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    if (profile_start_us) {
+        uint64_t elapsed_us = g_get_monotonic_time() - profile_start_us;
+
+        elapsed_us -= MIN(elapsed_us,
+                          s->profile.bql_unlocked_us - unlocked_before);
+        elapsed_us -= MIN(elapsed_us,
+                          s->profile.bql_worker_wait_us - bql_wait_before);
+        elapsed_us -= MIN(elapsed_us,
+                          s->profile.publish_us - publish_before);
+        s->profile.bql_parse_us += elapsed_us;
+    }
     trace_bcm2835_v3d_thread_slice(1, now_us - slice_start_us);
 
     if (s->ct_waiting[1] || (s->ct_cs[1] & V3D_CS_CTRUN)) {
@@ -3842,6 +3960,7 @@ static void bcm2835_v3d_ct1_continue(BCM2835V3DState *s, bool top_level)
             trace_bcm2835_v3d_thread_end(1, s->ct_ca[1], s->ct_cs[1],
                                          now_us - s->ct1_start_us);
             s->ct1_start_us = 0;
+            list_finished = true;
         } else {
             /* shortcut: ordinary tile stores yield promptly; split dense tiles if needed. */
             if (s->ct1_timer) {
@@ -3857,9 +3976,13 @@ static void bcm2835_v3d_ct1_continue(BCM2835V3DState *s, bool top_level)
     trace_bcm2835_v3d_thread_end(1, s->ct_ca[1], s->ct_cs[1],
                                  now_us - s->ct1_start_us);
     s->ct1_start_us = 0;
+    list_finished = true;
 
 out:
     s->ct1_top_level = false;
+    if (s->profile_enabled && list_finished) {
+        bcm2835_v3d_profile_list_done(s);
+    }
     bcm2835_v3d_replay_deferred(s);
 }
 
@@ -4147,6 +4270,7 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     bcm2835_v3d_clear_deferred(s);
     bcm2835_v3d_wgpu_batch_free(s);
     s->ct1_start_us = 0;
+    memset(&s->profile, 0, sizeof(s->profile));
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->ct_cs, 0, sizeof(s->ct_cs));
     memset(s->ct_ca, 0, sizeof(s->ct_ca));
@@ -4214,6 +4338,7 @@ static void bcm2835_v3d_reset(DeviceState *dev)
     s->pending_tile_load_memory_format = 0;
     s->pending_tile_load_color_format = 0;
     s->pending_tile_load = false;
+    s->pending_tile_load_zs = false;
     s->irq_status = 0;
     s->irq_enable = 0;
     bcm2835_v3d_update_irq(s);
@@ -4273,6 +4398,11 @@ static void bcm2835_v3d_realize(DeviceState *dev, Error **errp)
     obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_V3D "-memory");
+    s->profile_enabled = g_strcmp0(g_getenv("A6_V3D_PROFILE"), "1") == 0;
+    if (s->profile_enabled) {
+        qemu_log("A6_V3D_PROFILE enabled; reporting every %u CT1 lists\n",
+                 BCM2835_V3D_PROFILE_LISTS);
+    }
     bcm2835_v3d_fragment_workers_init(s);
     s->deferred_mmio_tail = &s->deferred_mmio_head;
 #ifdef CONFIG_V3D_WGPU
@@ -4350,6 +4480,9 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
         s->viewport_center_y = 0;
         s->viewport_offset_valid = false;
     }
+    if (version_id < 14) {
+        s->pending_tile_load_zs = false;
+    }
     if (version_id < 10) {
         s->bin_alloc_next = 0;
         s->bin_alloc_block_size = 0;
@@ -4382,7 +4515,7 @@ static int bcm2835_v3d_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_bcm2835_v3d = {
     .name = TYPE_BCM2835_V3D,
-    .version_id = 13,
+    .version_id = 14,
     .minimum_version_id = 1,
     .post_load = bcm2835_v3d_post_load,
     .fields = (const VMStateField[]) {
@@ -4458,6 +4591,7 @@ static const VMStateDescription vmstate_bcm2835_v3d = {
         VMSTATE_UINT8_V(pending_tile_load_memory_format, BCM2835V3DState, 7),
         VMSTATE_UINT8_V(pending_tile_load_color_format, BCM2835V3DState, 7),
         VMSTATE_BOOL_V(pending_tile_load, BCM2835V3DState, 7),
+        VMSTATE_BOOL_V(pending_tile_load_zs, BCM2835V3DState, 14),
         VMSTATE_END_OF_LIST()
     },
 };
