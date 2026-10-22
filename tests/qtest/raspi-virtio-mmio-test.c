@@ -24,6 +24,9 @@ static void test_virtio_gpu(void)
                           VIRTIO_MMIO_VERSION), ==, 2);
     g_assert_cmphex(readl(RASPI3AP_VIRTIO_MMIO_BASE +
                           VIRTIO_MMIO_DEVICE_ID), ==, VIRTIO_ID_GPU);
+    g_assert_cmphex(readl(RASPI3AP_VIRTIO_MMIO_BASE + VIRTIO_MMIO_CONFIG +
+                          offsetof(struct virtio_gpu_config, num_capsets)),
+                    ==, 1);
 
     writel(RASPI3AP_VIRTIO_MMIO_BASE + VIRTIO_MMIO_SHM_SEL, 0x101);
     g_assert_cmphex(readl(RASPI3AP_VIRTIO_MMIO_BASE + VIRTIO_MMIO_SHM_LEN_LOW),
@@ -51,7 +54,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/raspi/virtio-mmio/gpu", test_virtio_gpu);
     qtest_start("-machine raspi3ap -smp 4 -snapshot "
-                "-device virtio-gpu-device,hostmem=16M");
+                "-device virtio-gpu-gl-device,venus=on,blob=on,hostmem=16M");
     ret = g_test_run();
     qtest_end();
     return ret;

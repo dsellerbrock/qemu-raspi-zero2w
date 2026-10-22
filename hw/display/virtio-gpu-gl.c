@@ -124,13 +124,19 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
         return;
     }
 
-    if (!display_opengl) {
+    if (!display_opengl && !virtio_gpu_venus_enabled(b->conf)) {
         error_setg(errp,
                    "The display backend does not have OpenGL support enabled");
         error_append_hint(errp,
                           "It can be enabled with '-display BACKEND,gl=on' "
                           "where BACKEND is the name of the display backend "
                           "to use.\n");
+        return;
+    }
+
+    if (virtio_gpu_venus_enabled(b->conf) &&
+        !virtio_gpu_hostmem_enabled(b->conf)) {
+        error_setg(errp, "venus requires hostmem");
         return;
     }
 

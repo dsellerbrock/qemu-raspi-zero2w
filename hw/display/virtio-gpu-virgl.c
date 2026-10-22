@@ -173,37 +173,40 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
     }
 
 #if VIRGL_HAS_MAP_FIXED
-    /*
-     * virgl_renderer_resource_map_fixed() allows to create multiple
-     * mappings of the same resource, while virgl_renderer_resource_map()
-     * not. Don't allow mapping same resource twice.
-     */
-    if (res->map_fixed || res->mr) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: failed to map(fixed) virgl resource: already mapped\n",
-                      __func__);
-        return -EBUSY;
-    }
-
-    ret = virgl_renderer_resource_map_fixed(res->base.resource_id,
-                                            gl->hostmem_mmap + offset);
-    switch (ret) {
-    case 0:
-        res->map_fixed = gl->hostmem_mmap + offset;
-        return 0;
-
-    case -EOPNOTSUPP:
+    /* Venus maps blobs through the hostmem subregion path below. */
+    if (!virtio_gpu_venus_enabled(b->conf)) {
         /*
-         * MAP_FIXED is unsupported by this resource.
-         * Mapping falls back to a blob subregion method in that case.
+         * virgl_renderer_resource_map_fixed() allows to create multiple
+         * mappings of the same resource, while virgl_renderer_resource_map()
+         * not. Don't allow mapping same resource twice.
          */
-        break;
+        if (res->map_fixed || res->mr) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: failed to map(fixed) virgl resource: already mapped\n",
+                          __func__);
+            return -EBUSY;
+        }
 
-    default:
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: failed to map(fixed) virgl resource: %s\n",
-                      __func__, strerror(-ret));
-        return ret;
+        ret = virgl_renderer_resource_map_fixed(res->base.resource_id,
+                                                gl->hostmem_mmap + offset);
+        switch (ret) {
+        case 0:
+            res->map_fixed = gl->hostmem_mmap + offset;
+            return 0;
+
+        case -EOPNOTSUPP:
+            /*
+             * MAP_FIXED is unsupported by this resource.
+             * Mapping falls back to a blob subregion method in that case.
+             */
+            break;
+
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: failed to map(fixed) virgl resource: %s\n",
+                          __func__, strerror(-ret));
+            return ret;
+        }
     }
 #endif
 
@@ -1456,7 +1459,8 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #endif
 #if VIRGL_VERSION_MAJOR >= 1
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
-        flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
+        flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER |
+                 VIRGL_RENDERER_NO_VIRGL;
     }
     if (virtio_gpu_drm_enabled(g->parent_obj.conf)) {
         flags |= VIRGL_RENDERER_DRM;
@@ -1550,14 +1554,16 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
 
     capset_ids = g_array_new(false, false, sizeof(uint32_t));
 
-    /* VIRGL is always supported. */
-    virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL);
+    if (!virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+        /* Venus mode disables the GL-based vrend renderer. */
+        virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL);
 
-    virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
-                               &capset_max_ver,
-                               &capset_max_size);
-    if (capset_max_ver) {
-        virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL2);
+        virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
+                                   &capset_max_ver,
+                                   &capset_max_size);
+        if (capset_max_ver) {
+            virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL2);
+        }
     }
 
     if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
