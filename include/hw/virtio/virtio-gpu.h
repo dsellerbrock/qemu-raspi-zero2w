@@ -157,6 +157,9 @@ struct VirtIOGPUBase {
     int enable;
 
     MemoryRegion hostmem;
+    MemoryRegion hostmem_shmem;
+    bool hostmem_initialized;
+    bool hostmem_shmem_initialized;
 
     struct virtio_gpu_scanout scanout[VIRTIO_GPU_MAX_SCANOUTS];
 
@@ -327,6 +330,7 @@ bool virtio_gpu_base_device_realize(DeviceState *qdev,
                                     VirtIOHandleOutput ctrl_cb,
                                     VirtIOHandleOutput cursor_cb,
                                     Error **errp);
+void virtio_gpu_hostmem_region_init(VirtIOGPUBase *g);
 void virtio_gpu_base_device_unrealize(DeviceState *qdev);
 void virtio_gpu_base_reset(VirtIOGPUBase *g);
 void virtio_gpu_base_fill_display_info(VirtIOGPUBase *g,

@@ -158,6 +158,8 @@ static void raspi3ap_virtio_mmio_init(BCM283XState *soc)
 
     object_property_set_bool(OBJECT(vmmio), "force-legacy", false,
                              &error_fatal);
+    object_property_set_uint(OBJECT(vmmio), "shm-base", 0x80000000,
+                             &error_fatal);
     sysbus_realize_and_unref(vmmio, &error_fatal);
     memory_region_add_subregion(&ps->peri_mr, RASPI3AP_VIRTIO_MMIO_OFFSET,
                                 sysbus_mmio_get_region(vmmio, 0));

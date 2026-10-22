@@ -178,6 +178,15 @@ static const GraphicHwOps virtio_gpu_ops = {
     .gl_block = virtio_gpu_gl_block,
 };
 
+void virtio_gpu_hostmem_region_init(VirtIOGPUBase *g)
+{
+    if (virtio_gpu_hostmem_enabled(g->conf) && !g->hostmem_initialized) {
+        memory_region_init(&g->hostmem, OBJECT(g), "virtio-gpu-hostmem",
+                           g->conf.hostmem);
+        g->hostmem_initialized = true;
+    }
+}
+
 bool
 virtio_gpu_base_device_realize(DeviceState *qdev,
                                VirtIOHandleOutput ctrl_cb,
@@ -232,9 +241,24 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
         }
     }
 
+    virtio_gpu_hostmem_region_init(g);
+
     g->virtio_config.num_scanouts = cpu_to_le32(g->conf.max_outputs);
     virtio_init(VIRTIO_DEVICE(g), VIRTIO_ID_GPU,
                 sizeof(struct virtio_gpu_config));
+
+    if (virtio_gpu_hostmem_enabled(g->conf)) {
+        VirtioSharedMemory *shmem = virtio_new_shmem_region(
+            vdev, VIRTIO_GPU_SHM_ID_HOST_VISIBLE, g->conf.hostmem);
+
+        if (!g->hostmem_shmem_initialized) {
+            memory_region_init_alias(&g->hostmem_shmem, OBJECT(g),
+                                     "virtio-gpu-hostmem-shmem",
+                                     &g->hostmem, 0, g->conf.hostmem);
+            g->hostmem_shmem_initialized = true;
+        }
+        memory_region_add_subregion(&shmem->mr, 0, &g->hostmem_shmem);
+    }
 
     if (virtio_gpu_virgl_enabled(g->conf)) {
         /* use larger control queue in 3d mode */

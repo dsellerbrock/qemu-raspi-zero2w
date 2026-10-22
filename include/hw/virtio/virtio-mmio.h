@@ -60,10 +60,12 @@ struct VirtIOMMIOProxy {
     qemu_irq irq;
     bool legacy;
     uint32_t flags;
+    uint64_t shm_base;
     /* Guest accessible state needing migration and reset */
     uint32_t host_features_sel;
     uint32_t guest_features_sel;
     uint32_t guest_page_shift;
+    uint32_t shm_sel;
     /* virtio-bus */
     VirtioBusState bus;
     /* Fields only used for non-legacy (v2) devices */

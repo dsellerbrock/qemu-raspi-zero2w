@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/address-spaces.h"
 #include "standard-headers/linux/virtio_mmio.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -78,6 +79,81 @@ static void virtio_mmio_soft_reset(VirtIOMMIOProxy *proxy)
     if (!proxy->legacy) {
         for (i = 0; i < VIRTIO_QUEUE_MAX; i++) {
             proxy->vqs[i].enabled = 0;
+        }
+    }
+}
+
+static VirtioSharedMemory *virtio_mmio_get_shmem(VirtIOMMIOProxy *proxy,
+                                                  uint64_t *base)
+{
+    VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    VirtioSharedMemory *shmem;
+    uint64_t addr = proxy->shm_base;
+
+    if (!vdev || !addr || proxy->shm_sel > UINT8_MAX) {
+        return NULL;
+    }
+
+    QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
+        uint64_t size = memory_region_size(&shmem->mr);
+
+        if (shmem->shmid == proxy->shm_sel) {
+            *base = addr;
+            return shmem;
+        }
+        if (UINT64_MAX - addr < size) {
+            return NULL;
+        }
+        addr += size;
+    }
+    return NULL;
+}
+
+static void virtio_mmio_device_plugged(DeviceState *d, Error **errp)
+{
+    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
+    VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    VirtioSharedMemory *shmem;
+    uint64_t addr = proxy->shm_base;
+
+    if (!vdev || !addr) {
+        return;
+    }
+
+    QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
+        uint64_t size = memory_region_size(&shmem->mr);
+
+        if (memory_region_is_mapped(&shmem->mr)) {
+            error_setg(errp, "virtio-mmio shared memory region is already mapped");
+            return;
+        }
+        if (UINT64_MAX - addr < size) {
+            error_setg(errp, "virtio-mmio shared memory exceeds address space");
+            return;
+        }
+        addr += size;
+    }
+
+    addr = proxy->shm_base;
+    QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
+        memory_region_add_subregion(get_system_memory(), addr, &shmem->mr);
+        addr += memory_region_size(&shmem->mr);
+    }
+}
+
+static void virtio_mmio_device_unplugged(DeviceState *d)
+{
+    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
+    VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    VirtioSharedMemory *shmem;
+
+    if (!vdev || !proxy->shm_base) {
+        return;
+    }
+
+    QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
+        if (memory_region_is_mapped(&shmem->mr)) {
+            memory_region_del_subregion(get_system_memory(), &shmem->mr);
         }
     }
 }
@@ -205,14 +281,34 @@ static uint64_t virtio_mmio_read(void *opaque, hwaddr offset, unsigned size)
             return 0;
         }
         return vdev->generation;
-   case VIRTIO_MMIO_SHM_LEN_LOW:
-   case VIRTIO_MMIO_SHM_LEN_HIGH:
+    case VIRTIO_MMIO_SHM_SEL:
+        return proxy->shm_sel;
+    case VIRTIO_MMIO_SHM_LEN_LOW:
+    case VIRTIO_MMIO_SHM_LEN_HIGH: {
+        uint64_t base;
+        VirtioSharedMemory *shmem = virtio_mmio_get_shmem(proxy, &base);
+
         /*
-         * VIRTIO_MMIO_SHM_SEL is unimplemented
-         * according to the linux driver, if region length is -1
-         * the shared memory doesn't exist
+         * According to the Linux driver, a length of -1 means the region
+         * selected by VIRTIO_MMIO_SHM_SEL does not exist.
          */
-        return -1;
+        if (!shmem) {
+            return -1;
+        }
+        return offset == VIRTIO_MMIO_SHM_LEN_LOW ?
+            (uint32_t)memory_region_size(&shmem->mr) :
+            memory_region_size(&shmem->mr) >> 32;
+    }
+    case VIRTIO_MMIO_SHM_BASE_LOW:
+    case VIRTIO_MMIO_SHM_BASE_HIGH: {
+        uint64_t base;
+
+        if (!virtio_mmio_get_shmem(proxy, &base)) {
+            return 0;
+        }
+        return offset == VIRTIO_MMIO_SHM_BASE_LOW ?
+            (uint32_t)base : base >> 32;
+    }
     case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
     case VIRTIO_MMIO_DRIVER_FEATURES:
     case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
@@ -326,6 +422,9 @@ static void virtio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
         } else {
             proxy->guest_features_sel = 0;
         }
+        break;
+    case VIRTIO_MMIO_SHM_SEL:
+        proxy->shm_sel = value;
         break;
     case VIRTIO_MMIO_GUEST_PAGE_SIZE:
         if (!proxy->legacy) {
@@ -582,13 +681,14 @@ static const VMStateDescription vmstate_virtio_mmio_queue_state = {
 
 static const VMStateDescription vmstate_virtio_mmio_state_sub = {
     .name = "virtio_mmio/state",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(guest_features, VirtIOMMIOProxy, 2),
         VMSTATE_STRUCT_ARRAY(vqs, VirtIOMMIOProxy, VIRTIO_QUEUE_MAX, 0,
                              vmstate_virtio_mmio_queue_state,
                              VirtIOMMIOQueue),
+        VMSTATE_UINT32_V(shm_sel, VirtIOMMIOProxy, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -648,6 +748,7 @@ static void virtio_mmio_reset(DeviceState *d)
     proxy->host_features_sel = 0;
     proxy->guest_features_sel = 0;
     proxy->guest_page_shift = 0;
+    proxy->shm_sel = 0;
 
     if (!proxy->legacy) {
         proxy->guest_features[0] = proxy->guest_features[1] = 0;
@@ -733,6 +834,7 @@ static void virtio_mmio_pre_plugged(DeviceState *d, Error **errp)
 
 static const Property virtio_mmio_properties[] = {
     DEFINE_PROP_BOOL("force-legacy", VirtIOMMIOProxy, legacy, true),
+    DEFINE_PROP_UINT64("shm-base", VirtIOMMIOProxy, shm_base, 0),
     DEFINE_PROP_BIT("ioeventfd", VirtIOMMIOProxy, flags,
                     VIRTIO_IOMMIO_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT16(VIRTIO_QUEUE_SIZE_OVERRIDE, VirtIOMMIOProxy,
@@ -837,6 +939,8 @@ static void virtio_mmio_bus_class_init(ObjectClass *klass, const void *data)
     k->ioeventfd_enabled = virtio_mmio_ioeventfd_enabled;
     k->ioeventfd_assign = virtio_mmio_ioeventfd_assign;
     k->pre_plugged = virtio_mmio_pre_plugged;
+    k->device_plugged = virtio_mmio_device_plugged;
+    k->device_unplugged = virtio_mmio_device_unplugged;
     k->vmstate_change = virtio_mmio_vmstate_change;
     k->has_variable_vring_alignment = true;
     bus_class->max_dev = 1;
