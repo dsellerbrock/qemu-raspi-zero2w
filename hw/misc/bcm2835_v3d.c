@@ -11,6 +11,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/bcm2835_v3d.h"
+#include "bcm2835_v3d_wgpu.h"
 #include "bcm2835_v3d_qpu.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
@@ -20,9 +21,6 @@
 #include "system/dma.h"
 #include "system/cpus.h"
 #include "trace.h"
-#ifdef CONFIG_V3D_WGPU
-#include "bcm2835_v3d_wgpu.h"
-#endif
 #include <math.h>
 #include <unistd.h>
 
