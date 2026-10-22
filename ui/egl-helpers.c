@@ -108,6 +108,30 @@ void egl_fb_setup_default(egl_fb *fb, int width, int height, int x, int y)
     fb->framebuffer = 0; /* default framebuffer */
 }
 
+static void egl_fb_convert_rgba(DisplaySurface *dst, uint8_t *pixels,
+                                int width, int height)
+{
+    /* GLES readback is RGBA; DisplaySurface pixels follow host byte order. */
+    int stride = surface_stride(dst);
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            uint8_t *pixel = pixels + y * stride + x * 4;
+            uint8_t red = pixel[0];
+
+#if HOST_BIG_ENDIAN
+            pixel[0] = pixel[3];
+            pixel[3] = pixel[2];
+            pixel[2] = pixel[1];
+            pixel[1] = red;
+#else
+            pixel[0] = pixel[2];
+            pixel[2] = red;
+#endif
+        }
+    }
+}
+
 void egl_fb_setup_for_tex(egl_fb *fb, int width, int height,
                           GLuint texture, bool delete)
 {
@@ -129,11 +153,12 @@ void egl_fb_setup_for_tex(egl_fb *fb, int width, int height,
 void egl_fb_setup_new_tex(egl_fb *fb, int width, int height)
 {
     GLuint texture;
+    GLenum format = epoxy_is_desktop_gl() ? GL_BGRA : GL_RGBA;
 
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
-                 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+                 0, format, GL_UNSIGNED_BYTE, 0);
 
     egl_fb_setup_for_tex(fb, width, height, texture, true);
 }
@@ -173,14 +198,22 @@ void egl_fb_blit(egl_fb *dst, egl_fb *src, bool flip)
 
 void egl_fb_read(DisplaySurface *dst, egl_fb *src)
 {
+    GLenum format = epoxy_is_desktop_gl() ? GL_BGRA : GL_RGBA;
+
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src->framebuffer);
     glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
     glReadPixels(0, 0, surface_width(dst), surface_height(dst),
-                 GL_BGRA, GL_UNSIGNED_BYTE, surface_data(dst));
+                 format, GL_UNSIGNED_BYTE, surface_data(dst));
+    if (format == GL_RGBA) {
+        egl_fb_convert_rgba(dst, surface_data(dst),
+                            surface_width(dst), surface_height(dst));
+    }
 }
 
 void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int h)
 {
+    GLenum format = epoxy_is_desktop_gl() ? GL_BGRA : GL_RGBA;
+
     assert(surface_width(dst) == src->width);
     assert(surface_height(dst) == src->height);
     assert(surface_format(dst) == PIXMAN_x8r8g8b8);
@@ -189,8 +222,12 @@ void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int
     glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
     glPixelStorei(GL_PACK_ROW_LENGTH, surface_stride(dst) / 4);
     glReadPixels(x, y, w, h,
-                 GL_BGRA, GL_UNSIGNED_BYTE, surface_data(dst) + x * 4);
+                 format, GL_UNSIGNED_BYTE, surface_data(dst) + x * 4);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    if (format == GL_RGBA && x >= 0 && y >= 0 && w >= 0 && h >= 0 &&
+        x <= surface_width(dst) - w && y <= surface_height(dst) - h) {
+        egl_fb_convert_rgba(dst, surface_data(dst) + x * 4, w, h);
+    }
 }
 
 void egl_texture_blit(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip)
