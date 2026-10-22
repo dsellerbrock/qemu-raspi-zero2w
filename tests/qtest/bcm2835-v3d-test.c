@@ -5165,7 +5165,9 @@ static void test_v3d_ct1_store_zs_tformat_clear(void)
     cl[offset++] = 0;
     cl[offset++] = 0;
     cl[offset++] = 28;
-    append_u48(cl, &offset, ((uint64_t)(zs_addr >> 4) << 20) | 0x12);
+    /* Mode decimation applies to non-HDR color stores, not Z/S. */
+    append_u48(cl, &offset,
+               ((uint64_t)(zs_addr >> 4) << 20) | (1 << 6) | 0x12);
     cl[offset++] = 28;
     append_u48(cl, &offset,
                ((uint64_t)(FB_ADDR >> 4) << 20) | (1 << 4) | 1 |
@@ -5249,8 +5251,9 @@ static void test_v3d_ct1_store_zs_tformat_edge_tile(void)
     cl[offset++] = TILE_X;
     cl[offset++] = TILE_Y;
     cl[offset++] = 28;
-    /* Mesa STORE_TILE_BUFFER_GENERAL: Z/S buffer 2, T-format 1, sample 0. */
-    append_u48(cl, &offset, ((uint64_t)(zs_bus >> 4) << 20) | 0x12);
+    /* Z/S ignores the color-store mode; Mesa uses packet 28 / buffer 2. */
+    append_u48(cl, &offset,
+               ((uint64_t)(zs_bus >> 4) << 20) | (3 << 6) | 0x12);
 
     memwrite(CL_ADDR, cl, offset);
     writel(RASPI3_V3D_BASE + V3D_CT1CA, CL_ADDR);
@@ -5324,10 +5327,10 @@ static void test_v3d_ct1_load_zs_buffer2_layouts(void)
         append_u16(cl, &offset,
                    (memory_format << 6) | (V3D_FORMAT_RGBA8888 << 2));
         cl[offset++] = 29;
-        /* Mesa LOAD_TILE_BUFFER_GENERAL: Z/S buffer 2, sample 0. */
+        /* Mesa LOAD_TILE_BUFFER_GENERAL: mode bits are unused for loads. */
         append_u48(cl, &offset,
                    ((uint64_t)(src >> 4) << 20) |
-                   (memory_format << 4) | 2);
+                   (2 << 6) | (memory_format << 4) | 2);
         cl[offset++] = 115;
         cl[offset++] = 0;
         cl[offset++] = 0;

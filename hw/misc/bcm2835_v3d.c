@@ -554,10 +554,12 @@ static bool bcm2835_v3d_tile_buffer_packet(BCM2835V3DState *s,
     if (buffer == 0 || (buffer == 1 && (params & (1ULL << 16)))) {
         return true;
     }
-    /* shortcut: limit Z/S to buffer 2/sample 0/RGBA8888 until other modes
-     * and buffers have qtest coverage.
+    /* Load mode is unused; store mode only decimates non-HDR color. */
+    /* shortcut: limit Z/S to buffer 2/RGBA8888 and color stores to mode 0;
+     * expand with qtests for more modes and buffers.
      */
-    if ((buffer != 1 && !zs_buffer) || mode != 0 || memory_format > 2 ||
+    if ((buffer != 1 && !zs_buffer) ||
+        (store && !zs_buffer && mode != 0) || memory_format > 2 ||
         (zs_buffer ? color_format != 0 :
          (color_format > 2 || (store && color_format == 1))) ||
         !s->render_config_valid || !s->render_width || !s->render_height) {
