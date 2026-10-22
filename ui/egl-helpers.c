@@ -528,7 +528,11 @@ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
     /* In practise any EGL 1.5 implementation would support the EXT extension */
     if (epoxy_has_egl_extension(NULL, "EGL_EXT_platform_base")) {
         if (platform != 0) {
+#ifdef __APPLE__
+            dpy = eglGetPlatformDisplayEXT(platform, (void *)(intptr_t)native, NULL);
+#else
             dpy = eglGetPlatformDisplayEXT(platform, native, NULL);
+#endif
         }
     }
 
