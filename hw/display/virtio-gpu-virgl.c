@@ -56,11 +56,25 @@ virtio_gpu_virgl_find_resource(VirtIOGPU *g, uint32_t resource_id)
     struct virtio_gpu_simple_resource *res;
 
     res = virtio_gpu_find_resource(g, resource_id);
-    if (!res) {
+    if (!res || res->image) {
         return NULL;
     }
 
     return container_of(res, struct virtio_gpu_virgl_resource, base);
+}
+
+static bool virtio_gpu_virgl_venus_2d_resource(VirtIOGPU *g,
+                                               uint32_t resource_id)
+{
+    struct virtio_gpu_simple_resource *res;
+
+    /* Venus keeps ordinary 2D scanout in pixman; Vulkan blobs stay in virgl. */
+    if (!virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+        return false;
+    }
+
+    res = virtio_gpu_find_resource(g, resource_id);
+    return res && res->image;
 }
 
 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
@@ -319,6 +333,11 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
     struct virgl_renderer_resource_create_args args;
     struct virtio_gpu_virgl_resource *res;
 
+    if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
+        virtio_gpu_simple_process_cmd(g, cmd);
+        return;
+    }
+
     VIRTIO_GPU_FILL_CMD(c2d);
     trace_virtio_gpu_cmd_res_create_2d(c2d.resource_id, c2d.format,
                                        c2d.width, c2d.height);
@@ -330,8 +349,7 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
         return;
     }
 
-    res = virtio_gpu_virgl_find_resource(g, c2d.resource_id);
-    if (res) {
+    if (virtio_gpu_find_resource(g, c2d.resource_id)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, c2d.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
@@ -378,8 +396,7 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
         return;
     }
 
-    res = virtio_gpu_virgl_find_resource(g, c3d.resource_id);
-    if (res) {
+    if (virtio_gpu_find_resource(g, c3d.resource_id)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, c3d.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
@@ -448,9 +465,16 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
 {
     struct virtio_gpu_resource_unref unref;
     struct virtio_gpu_virgl_resource *res;
+    struct virtio_gpu_simple_resource *simple;
 
     VIRTIO_GPU_FILL_CMD(unref);
     trace_virtio_gpu_cmd_res_unref(unref.resource_id);
+
+    if (virtio_gpu_virgl_venus_2d_resource(g, unref.resource_id)) {
+        simple = virtio_gpu_find_resource(g, unref.resource_id);
+        virtio_gpu_simple_resource_destroy(g, simple, NULL);
+        return;
+    }
 
     res = virtio_gpu_virgl_find_resource(g, unref.resource_id);
     if (!res) {
@@ -469,6 +493,11 @@ void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
 {
     struct virtio_gpu_virgl_resource *res;
     bool suspended = false;
+
+    if (base->image) {
+        virtio_gpu_simple_resource_destroy(g, base, errp);
+        return;
+    }
 
     res = container_of(base, struct virtio_gpu_virgl_resource, base);
 
@@ -537,6 +566,11 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
     trace_virtio_gpu_cmd_res_flush(rf.resource_id,
                                    rf.r.width, rf.r.height, rf.r.x, rf.r.y);
 
+    if (virtio_gpu_virgl_venus_2d_resource(g, rf.resource_id)) {
+        virtio_gpu_simple_process_cmd(g, cmd);
+        return;
+    }
+
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
         if (g->parent_obj.scanout[i].resource_id != rf.resource_id) {
             continue;
@@ -554,6 +588,13 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
     VIRTIO_GPU_FILL_CMD(ss);
     trace_virtio_gpu_cmd_set_scanout(ss.scanout_id, ss.resource_id,
                                      ss.r.width, ss.r.height, ss.r.x, ss.r.y);
+
+    if (virtio_gpu_venus_enabled(g->parent_obj.conf) &&
+        (!ss.resource_id ||
+         virtio_gpu_virgl_venus_2d_resource(g, ss.resource_id))) {
+        virtio_gpu_simple_process_cmd(g, cmd);
+        return;
+    }
 
     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
@@ -653,6 +694,11 @@ static void virgl_cmd_transfer_to_host_2d(VirtIOGPU *g,
     VIRTIO_GPU_FILL_CMD(t2d);
     trace_virtio_gpu_cmd_res_xfer_toh_2d(t2d.resource_id);
 
+    if (virtio_gpu_virgl_venus_2d_resource(g, t2d.resource_id)) {
+        virtio_gpu_simple_process_cmd(g, cmd);
+        return;
+    }
+
     box.x = t2d.r.x;
     box.y = t2d.r.y;
     box.z = 0;
@@ -716,6 +762,11 @@ static void virgl_resource_attach_backing(VirtIOGPU *g,
     VIRTIO_GPU_FILL_CMD(att_rb);
     trace_virtio_gpu_cmd_res_back_attach(att_rb.resource_id);
 
+    if (virtio_gpu_virgl_venus_2d_resource(g, att_rb.resource_id)) {
+        virtio_gpu_simple_process_cmd(g, cmd);
+        return;
+    }
+
     ret = virtio_gpu_create_mapping_iov(g, att_rb.nr_entries, sizeof(att_rb),
                                         cmd, NULL, &res_iovs, &res_niov);
     if (ret < 0) {
@@ -739,6 +790,11 @@ static void virgl_resource_detach_backing(VirtIOGPU *g,
 
     VIRTIO_GPU_FILL_CMD(detach_rb);
     trace_virtio_gpu_cmd_res_back_detach(detach_rb.resource_id);
+
+    if (virtio_gpu_virgl_venus_2d_resource(g, detach_rb.resource_id)) {
+        virtio_gpu_simple_process_cmd(g, cmd);
+        return;
+    }
 
     virgl_renderer_resource_detach_iov(detach_rb.resource_id,
                                        &res_iovs,
@@ -845,7 +901,7 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
         return;
     }
 
-    if (virtio_gpu_virgl_find_resource(g, cblob.resource_id)) {
+    if (virtio_gpu_find_resource(g, cblob.resource_id)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
                       __func__, cblob.resource_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;

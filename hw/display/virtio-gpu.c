@@ -408,9 +408,9 @@ void virtio_gpu_disable_scanout(VirtIOGPU *g, int scanout_id)
     scanout->height = 0;
 }
 
-static void virtio_gpu_resource_destroy(VirtIOGPU *g,
-                                        struct virtio_gpu_simple_resource *res,
-                                        Error **errp)
+void virtio_gpu_simple_resource_destroy(VirtIOGPU *g,
+                                       struct virtio_gpu_simple_resource *res,
+                                       Error **errp)
 {
     int i;
 
@@ -450,7 +450,7 @@ static void virtio_gpu_resource_unref(VirtIOGPU *g,
      * virtio_gpu_resource_destroy does not set any errors, so pass a NULL errp
      * to ignore them.
      */
-    virtio_gpu_resource_destroy(g, res, NULL);
+    virtio_gpu_simple_resource_destroy(g, res, NULL);
 }
 
 static void virtio_gpu_transfer_to_host_2d(VirtIOGPU *g,
@@ -1838,7 +1838,7 @@ static void virtio_gpu_class_init(ObjectClass *klass, const void *data)
     vgc->handle_ctrl = virtio_gpu_handle_ctrl;
     vgc->process_cmd = virtio_gpu_simple_process_cmd;
     vgc->update_cursor_data = virtio_gpu_update_cursor_data;
-    vgc->resource_destroy = virtio_gpu_resource_destroy;
+    vgc->resource_destroy = virtio_gpu_simple_resource_destroy;
     vgbc->gl_flushed = virtio_gpu_handle_gl_flushed;
 
     vdc->realize = virtio_gpu_device_realize;
