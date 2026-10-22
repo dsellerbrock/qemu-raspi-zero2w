@@ -21,14 +21,24 @@
 #include "hw/arm/bcm2838.h"
 #include "hw/arm/raspi_platform.h"
 #include "hw/core/registerfields.h"
+#include "hw/core/sysbus.h"
+#include "hw/intc/bcm2835_ic.h"
+#include "hw/virtio/virtio-mmio.h"
 #include "qemu/error-report.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/arm/machines-qom.h"
+#include "system/device_tree.h"
 #include "qom/object.h"
+#include <libfdt.h>
 
 #define TYPE_RASPI_MACHINE  MACHINE_TYPE_NAME("raspi-common")
 OBJECT_DECLARE_SIMPLE_TYPE(RaspiMachineState, RASPI_MACHINE)
+
+#define RASPI3AP_BOARD_REV 0x9020e0
+/* Reserve the unused final page of the BCM peripheral window. */
+#define RASPI3AP_VIRTIO_MMIO_OFFSET 0xf00000
+#define RASPI3AP_VIRTIO_MMIO_IRQ INTERRUPT_AVSPMON
 
 #define SMPBOOT_ADDR    0x300 /* this should leave enough space for ATAGS */
 #define MVBAR_ADDR      0x400 /* secure vectors */
@@ -96,6 +106,65 @@ const char *board_soc_type(uint32_t board_rev)
 static int cores_count(uint32_t board_rev)
 {
     return soc_property[board_processor_id(board_rev)].cores_count;
+}
+
+static void raspi3ap_modify_dtb(const struct arm_boot_info *info, void *fdt)
+{
+    const hwaddr base = 0x3f000000 + RASPI3AP_VIRTIO_MMIO_OFFSET;
+    const hwaddr size = 0x200;
+    int intc_offset;
+    uint32_t intc, interrupt_parent, interrupts[2];
+    uint32_t acells, scells;
+    int rc;
+    char *nodename;
+
+    intc_offset = fdt_node_offset_by_compatible(fdt, -1,
+                                                 "brcm,bcm2836-armctrl-ic");
+    if (intc_offset < 0 || !(intc = fdt_get_phandle(fdt, intc_offset))) {
+        warn_report("couldn't find BCM2836 interrupt controller in dtb; "
+                    "virtio-mmio device will not be usable");
+        return;
+    }
+    (void)info;
+
+    acells = qemu_fdt_getprop_cell(fdt, "/", "#address-cells", NULL,
+                                   &error_fatal);
+    scells = qemu_fdt_getprop_cell(fdt, "/", "#size-cells", NULL,
+                                   &error_fatal);
+    interrupt_parent = cpu_to_be32(intc);
+    interrupts[0] = cpu_to_be32(2);
+    interrupts[1] = cpu_to_be32(RASPI3AP_VIRTIO_MMIO_IRQ - 32);
+    nodename = g_strdup_printf("/virtio_mmio@%" PRIx64, base);
+    rc = qemu_fdt_add_subnode(fdt, nodename);
+    rc |= qemu_fdt_setprop_string(fdt, nodename, "compatible", "virtio,mmio");
+    rc |= qemu_fdt_setprop_sized_cells(fdt, nodename, "reg",
+                                       acells, base, scells, size);
+    rc |= qemu_fdt_setprop(fdt, nodename, "interrupt-parent",
+                           &interrupt_parent, sizeof(interrupt_parent));
+    rc |= qemu_fdt_setprop(fdt, nodename, "interrupts", interrupts,
+                           sizeof(interrupts));
+    rc |= qemu_fdt_setprop(fdt, nodename, "dma-coherent", NULL, 0);
+    g_free(nodename);
+    if (rc < 0) {
+        error_report("couldn't add raspi3ap virtio-mmio node to dtb");
+    }
+}
+
+static void raspi3ap_virtio_mmio_init(BCM283XState *soc)
+{
+    BCMSocPeripheralBaseState *ps =
+        BCM_SOC_PERIPHERALS_BASE(&soc->peripherals);
+    SysBusDevice *vmmio = SYS_BUS_DEVICE(qdev_new(TYPE_VIRTIO_MMIO));
+
+    object_property_set_bool(OBJECT(vmmio), "force-legacy", false,
+                             &error_fatal);
+    sysbus_realize_and_unref(vmmio, &error_fatal);
+    memory_region_add_subregion(&ps->peri_mr, RASPI3AP_VIRTIO_MMIO_OFFSET,
+                                sysbus_mmio_get_region(vmmio, 0));
+    sysbus_connect_irq(vmmio, 0,
+                       qdev_get_gpio_in_named(DEVICE(&ps->ic),
+                                              BCM2835_IC_GPU_IRQ,
+                                              RASPI3AP_VIRTIO_MMIO_IRQ));
 }
 
 static const char *board_type(uint32_t board_rev)
@@ -309,10 +378,16 @@ void raspi_machine_init(MachineState *machine)
     BCM283XState *soc = &s->soc;
 
     s_base->binfo.board_id = MACH_TYPE_BCM2708;
+    if (mc->board_rev == RASPI3AP_BOARD_REV) {
+        s_base->binfo.modify_dtb = raspi3ap_modify_dtb;
+    }
 
     object_initialize_child(OBJECT(machine), "soc", soc,
                             board_soc_type(mc->board_rev));
     raspi_base_machine_init(machine, &soc->parent_obj);
+    if (mc->board_rev == RASPI3AP_BOARD_REV) {
+        raspi3ap_virtio_mmio_init(soc);
+    }
 }
 
 void raspi_machine_class_common_init(MachineClass *mc,
@@ -373,7 +448,7 @@ static void raspi3ap_machine_class_init(ObjectClass *oc, const void *data)
     RaspiBaseMachineClass *rmc = RASPI_BASE_MACHINE_CLASS(oc);
 
     mc->auto_create_sdcard = true;
-    rmc->board_rev = 0x9020e0; /* Revision 1.0 */
+    rmc->board_rev = RASPI3AP_BOARD_REV; /* Revision 1.0 */
     raspi_machine_class_init(mc, rmc->board_rev);
 };
 
