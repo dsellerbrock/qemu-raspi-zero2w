@@ -4707,6 +4707,32 @@ static void v3d_assert_no_guest_errors(const gchar *log_path)
     g_assert_cmpint(g_remove(log_path), ==, 0);
 }
 
+static void test_v3d_ct0_oom_spill_has_no_guest_errors(void)
+{
+    g_autofree gchar *log_path = NULL;
+    g_autofree gchar *fractional_hash = NULL;
+
+    v3d_start_error_log_qtest(&log_path, "");
+    test_v3d_ct0_clips_and_rasterizes_varying_triangles();
+    fractional_hash = test_v3d_fractional_edge_triangles();
+    g_assert_cmpstr(fractional_hash, ==,
+                    "ae61d106a00e973f9b15726c72b1e96f93cbc05f"
+                    "01647a4e88a0c4f1d5c02c21");
+    qtest_end();
+    v3d_assert_no_guest_errors(log_path);
+    if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_UNLOCK"), "1") == 0) {
+        qtest_start("-machine raspi3ap -smp 4 "
+                    "-global bcm2835_v3d.fragment-workers=4 "
+                    "-global bcm2835_v3d.fragment-unlock=on");
+    } else if (g_strcmp0(g_getenv("QEMU_TEST_V3D_FRAGMENT_WORKERS"),
+                         "4") == 0) {
+        qtest_start("-machine raspi3ap -smp 4 "
+                    "-global bcm2835_v3d.fragment-workers=4");
+    } else {
+        qtest_start("-machine raspi3ap -smp 4");
+    }
+}
+
 static void v3d_assert_guest_errors_match(const gchar *serial_path,
                                           const gchar *unlock_path)
 {
@@ -5416,6 +5442,8 @@ int main(int argc, char **argv)
                    test_v3d_ct0_shader_state_dma);
     qtest_add_func("/bcm2835/v3d/ct0_clips_and_rasterizes_varying",
                    test_v3d_ct0_clips_and_rasterizes_varying_triangles);
+    qtest_add_func("/bcm2835/v3d/ct0_oom_spill_no_guest_errors",
+                   test_v3d_ct0_oom_spill_has_no_guest_errors);
     qtest_add_func("/bcm2835/v3d/textured_tformat_2var",
                    test_v3d_textured_tformat_2var);
     qtest_add_func("/bcm2835/v3d/textured_lt_stk5var",

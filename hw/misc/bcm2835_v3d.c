@@ -2873,17 +2873,21 @@ static bool bcm2835_v3d_bin_triangles(BCM2835V3DState *s,
 
                 if (!bcm2835_v3d_bin_screen_triangle(s, triangle,
                                                      &append_index)) {
-                    qemu_log_mask(LOG_GUEST_ERROR,
-                                  "bcm2835_v3d: clipped triangle bin failed at vertex %u\n",
-                                  vertex);
+                    if (!s->bin_oom_waiting) {
+                        qemu_log_mask(LOG_GUEST_ERROR,
+                                      "bcm2835_v3d: clipped triangle bin failed at vertex %u\n",
+                                      vertex);
+                    }
                     return false;
                 }
             }
         } else if (!bcm2835_v3d_bin_screen_triangle(s, vertices + vertex,
                                                     &append_index)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "bcm2835_v3d: triangle bin failed at vertex %u\n",
-                          vertex);
+            if (!s->bin_oom_waiting) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm2835_v3d: triangle bin failed at vertex %u\n",
+                              vertex);
+            }
             return false;
         }
     }
@@ -3427,10 +3431,13 @@ static bool bcm2835_v3d_execute_coordinate_shader(BCM2835V3DState *s,
             success = bcm2835_v3d_bin_triangles(s, vertices, count);
         }
         if (!success) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "bcm2835_v3d: triangle binning rejected render %ux%u config 0x%08x tiles %ux%u\n",
-                          s->render_width, s->render_height,
-                          s->render_config, s->bin_tiles_x, s->bin_tiles_y);
+            if (!s->bin_oom_waiting) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "bcm2835_v3d: triangle binning rejected render %ux%u config 0x%08x tiles %ux%u\n",
+                              s->render_width, s->render_height,
+                              s->render_config, s->bin_tiles_x,
+                              s->bin_tiles_y);
+            }
         }
     }
     g_free(fan_vertices);
