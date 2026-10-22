@@ -2886,6 +2886,7 @@ typedef struct V3DTestGeometryInput {
     uint32_t coordinate_address;
     uint32_t bin_alloc_base;
     uint32_t bin_alloc_size;
+    const uint32_t *screen_xy;
     uint32_t first;
     bool expect_ct0_error;
     uint8_t tiles_x;
@@ -3024,7 +3025,9 @@ static void test_v3d_render_reference_geometry(
             uint32_t coordinate_value = value;
 
             if (full_tile && word == 4) {
-                value = coordinate_value = full_tile_screen_xy[vertex];
+                value = coordinate_value = geometry->screen_xy ?
+                    geometry->screen_xy[vertex] :
+                    full_tile_screen_xy[vertex];
             }
             if (clip_space && vertex < 3) {
                 for (unsigned i = 0; i < G_N_ELEMENTS(clip_space_input_word);
@@ -4524,6 +4527,52 @@ static void test_v3d_ct1_load_store_layout_conversion(void)
     }
 }
 
+static gchar *test_v3d_fractional_edge_triangles(void)
+{
+    enum { frame_size = 64 * 65 * sizeof(uint32_t) };
+    static const uint32_t screen_xy[9] = {
+        0x0208fe08, 0x02080208, 0xfe08fe08,
+        0x02080208, 0xfe080208, 0xfe08fe08,
+        0x0208fe08, 0x02080208, 0xfe08fe08,
+    };
+    static const uint32_t varyings[9][5] = {
+        { 0x3f800000, 0x40000000 },
+        { 0x3f800000, 0x40000000 },
+        { 0x3fc00000, 0x40400000 },
+    };
+    const uint64_t fragment_code[] = {
+        qpu_test_add(35, 39, 0, true),
+        qpu_test_add(35, 39, 1, true),
+        qpu_test_fmul(15, 1, 46),
+        3ULL << 60,
+    };
+    const V3DTestGeometryInput geometry = {
+        .vertices = reference_vertices,
+        .count = G_N_ELEMENTS(reference_vertices),
+        .vertex_address = 0x7800,
+        .coordinate_address = 0x7c00,
+        .screen_xy = screen_xy,
+        .tiles_x = 1,
+        .tiles_y = 1,
+    };
+    const V3DTestFragmentShader fragment = {
+        .code = fragment_code,
+        .code_words = G_N_ELEMENTS(fragment_code),
+        .initial_color = 0x5a5a5a5a,
+    };
+    uint8_t frame[frame_size];
+    unsigned covered = 0;
+
+    test_v3d_render_reference_geometry(&fragment, varyings, 2, true,
+                                       NULL, true, &geometry);
+    memread(FB_ADDR, frame, sizeof(frame));
+    for (size_t offset = 0; offset < sizeof(frame); offset += sizeof(uint32_t)) {
+        covered += read_u32(frame + offset) != fragment.initial_color;
+    }
+    g_assert_cmpuint(covered, >, 0);
+    return test_v3d_hash_frame(frame, sizeof(frame));
+}
+
 static void test_v3d_fragment_worker_equivalence(void)
 {
     enum { frame_size = 64 * 65 * sizeof(uint32_t), stress_iterations = 20 };
@@ -4542,6 +4591,7 @@ static void test_v3d_fragment_worker_equivalence(void)
     g_autofree gchar *serial_stk_pixels = NULL;
     g_autofree gchar *serial_full = NULL;
     g_autofree gchar *serial_full_pixels = NULL;
+    g_autofree gchar *serial_fractional = NULL;
     g_autofree gchar *worker_varying = NULL;
     g_autofree gchar *worker_texture = NULL;
     g_autofree gchar *worker_stk = NULL;
@@ -4549,6 +4599,7 @@ static void test_v3d_fragment_worker_equivalence(void)
     g_autofree gchar *worker_stk_pixels = NULL;
     g_autofree gchar *worker_full = NULL;
     g_autofree gchar *worker_full_pixels = NULL;
+    g_autofree gchar *worker_fractional = NULL;
 
     qtest_end();
     qtest_start("-machine raspi3ap -smp 4");
@@ -4564,6 +4615,7 @@ static void test_v3d_fragment_worker_equivalence(void)
     serial_full = test_v3d_textured_reference_triangles(true, true, true);
     memread(FB_ADDR, frame, sizeof(frame));
     serial_full_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    serial_fractional = test_v3d_fractional_edge_triangles();
     for (unsigned i = 0; i < stress_iterations; i++) {
         g_free(test_v3d_textured_reference_triangles(false, false, true));
         memread(FB_ADDR, frame, sizeof(frame));
@@ -4574,10 +4626,12 @@ static void test_v3d_fragment_worker_equivalence(void)
         g_free(test_v3d_textured_reference_triangles(true, true, true));
         memread(FB_ADDR, frame, sizeof(frame));
         g_autofree gchar *full = test_v3d_hash_frame(frame, sizeof(frame));
+        g_autofree gchar *fractional = test_v3d_fractional_edge_triangles();
 
         g_assert_cmpstr(texture, ==, serial_texture_pixels);
         g_assert_cmpstr(stk, ==, serial_stk_pixels);
         g_assert_cmpstr(full, ==, serial_full_pixels);
+        g_assert_cmpstr(fractional, ==, serial_fractional);
     }
 
     qtest_end();
@@ -4594,10 +4648,12 @@ static void test_v3d_fragment_worker_equivalence(void)
     worker_full = test_v3d_textured_reference_triangles(true, true, true);
     memread(FB_ADDR, frame, sizeof(frame));
     worker_full_pixels = test_v3d_hash_frame(frame, sizeof(frame));
+    worker_fractional = test_v3d_fractional_edge_triangles();
     g_assert_cmpstr(worker_varying, ==, serial_varying);
     g_assert_cmpstr(worker_texture, ==, serial_texture);
     g_assert_cmpstr(worker_stk, ==, serial_stk);
     g_assert_cmpstr(worker_full, ==, serial_full);
+    g_assert_cmpstr(worker_fractional, ==, serial_fractional);
     for (unsigned i = 0; i < stress_iterations; i++) {
         g_free(test_v3d_textured_reference_triangles(false, false, true));
         memread(FB_ADDR, frame, sizeof(frame));
@@ -4608,14 +4664,18 @@ static void test_v3d_fragment_worker_equivalence(void)
         g_free(test_v3d_textured_reference_triangles(true, true, true));
         memread(FB_ADDR, frame, sizeof(frame));
         g_autofree gchar *full = test_v3d_hash_frame(frame, sizeof(frame));
+        g_autofree gchar *fractional = test_v3d_fractional_edge_triangles();
 
         g_assert_cmpstr(texture, ==, serial_texture_pixels);
         g_assert_cmpstr(stk, ==, serial_stk_pixels);
         g_assert_cmpstr(full, ==, serial_full_pixels);
+        g_assert_cmpstr(fractional, ==, serial_fractional);
     }
-    g_test_message("fragment hashes: varying=%s texture=%s stk=%s full=%s; "
-                   "%u serial and %u worker stress iterations match",
+    g_test_message("fragment hashes: varying=%s texture=%s stk=%s full=%s "
+                   "fractional=%s; %u serial and %u worker stress iterations "
+                   "match",
                    worker_varying, worker_texture, worker_stk, worker_full,
+                   worker_fractional,
                    stress_iterations, stress_iterations);
 }
 
