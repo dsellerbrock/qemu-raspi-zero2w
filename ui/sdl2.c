@@ -124,6 +124,8 @@ void sdl2_window_create(struct sdl2_console *scon)
         SDL_GL_SetSwapInterval(0);
 
 #ifdef CONFIG_OPENGL
+        qemu_egl_mode = scon->opts->gl == DISPLAY_GL_MODE_ES ?
+                        DISPLAY_GL_MODE_ES : DISPLAY_GL_MODE_CORE;
         qemu_egl_display = eglGetCurrentDisplay();
 #endif
     } else {

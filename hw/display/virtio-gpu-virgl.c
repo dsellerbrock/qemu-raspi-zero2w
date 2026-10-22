@@ -1440,6 +1440,12 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
     uint32_t flags = 0;
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
 
+#ifdef CONFIG_OPENGL
+    if (qemu_egl_mode == DISPLAY_GL_MODE_ES) {
+        flags |= VIRGL_RENDERER_USE_GLES;
+    }
+#endif
+
 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
     if (qemu_egl_display) {
         virtio_gpu_3d_cbs.version = 4;
