@@ -1503,7 +1503,9 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
 #endif
 
 #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
-    if (qemu_egl_display) {
+    /* Venus uses the Vulkan render server, not virgl's EGL winsys. */
+    if (qemu_egl_display &&
+        !virtio_gpu_venus_enabled(g->parent_obj.conf)) {
         virtio_gpu_3d_cbs.version = 4;
         virtio_gpu_3d_cbs.get_egl_display = virgl_get_egl_display;
 #if VIRGL_CHECK_VERSION(1, 1, 2)
