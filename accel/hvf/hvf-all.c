@@ -25,6 +25,7 @@
 bool hvf_allowed;
 bool hvf_kernel_irqchip;
 bool hvf_nested_virt;
+uint64_t hvf_page_size;
 static bool hvf_kernel_irqchip_override;
 
 void hvf_nested_virt_enable(bool nested_virt)
@@ -63,7 +64,7 @@ void assert_hvf_ok_impl(hv_return_t ret, const char *file, unsigned int line,
 static void do_hv_vm_protect(hwaddr start, size_t size,
                              hv_memory_flags_t flags)
 {
-    intptr_t page_mask = qemu_real_host_page_mask();
+    intptr_t page_mask = -(intptr_t)hvf_page_size;
     hv_return_t ret;
 
     trace_hvf_vm_protect(start, size, flags,
@@ -80,7 +81,7 @@ static void do_hv_vm_protect(hwaddr start, size_t size,
 static void hvf_protect_section(MemoryRegionSection *section,
                                 hv_memory_flags_t flags)
 {
-    uint64_t page_size = qemu_real_host_page_size();
+    uint64_t page_size = hvf_page_size;
     hwaddr start = section->offset_within_address_space;
     hwaddr end = start + int128_get64(section->size);
     hwaddr slot_start = start - section->offset_within_region;
@@ -107,7 +108,7 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
     MemoryRegion *area = section->mr;
     bool writable = !area->readonly && !area->rom_device;
     hv_memory_flags_t flags;
-    uint64_t page_size = qemu_real_host_page_size();
+    uint64_t page_size = hvf_page_size;
     uint64_t gpa = section->offset_within_address_space;
     uint64_t size = int128_get64(section->size);
     hv_return_t ret;
@@ -224,6 +225,7 @@ static int hvf_accel_init(AccelState *as, MachineState *ms)
         }
     }
 
+    hvf_page_size = qemu_real_host_page_size();
     ret = hvf_arch_vm_create(ms, (uint32_t)pa_range);
     if (ret == HV_DENIED) {
         error_report("Could not access HVF. Is the executable signed"

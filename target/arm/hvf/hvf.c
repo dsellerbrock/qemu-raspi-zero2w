@@ -1331,6 +1331,23 @@ hv_return_t hvf_arch_vm_create(MachineState *ms, uint32_t pa_range)
     }
     chosen_ipa_bit_size = pa_range;
 
+#if defined(MAC_OS_VERSION_26_0)
+    if (__builtin_available(macOS 26.0, *)) {
+        /*
+         * Guests place RAM-backed regions (e.g. virtio-gpu blobs in the
+         * hostmem window) at 4 KiB granularity; a 16 KiB stage-2 granule
+         * cannot map those, so use 4 KiB when the framework supports it.
+         */
+        if (hv_vm_config_set_ipa_granule(config, HV_IPA_GRANULE_4KB) ==
+            HV_SUCCESS) {
+            hvf_page_size = 4096;
+        } else {
+            warn_report("hvf: 4 KiB IPA granule unavailable, using %" PRIu64,
+                        hvf_page_size);
+        }
+    }
+#endif
+
     if (__builtin_available(macOS 15.0, *)) {
         if (hvf_nested_virt_enabled()) {
             if (!hvf_arm_el2_supported()) {
@@ -2408,7 +2425,7 @@ static int hvf_handle_exception(CPUState *cpu, hv_vcpu_exit_exception_t *excp)
                                                        NULL, true,
                                                        MEMTXATTRS_UNSPECIFIED);
             if (memory_region_is_ram(mr)) {
-                uintptr_t page_size = qemu_real_host_page_size();
+                uintptr_t page_size = hvf_page_size;
                 intptr_t page_mask = -(intptr_t)page_size;
                 uint64_t ipa_page = ipa & page_mask;
 

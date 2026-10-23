@@ -42,6 +42,8 @@ struct HVFState {
     QTAILQ_HEAD(, hvf_sw_breakpoint) hvf_sw_breakpoints;
 };
 extern HVFState *hvf_state;
+/* Stage-2 mapping granule: the host page size unless the arch picks smaller. */
+extern uint64_t hvf_page_size;
 
 struct AccelCPUState {
     hvf_vcpuid fd;
