@@ -23,6 +23,7 @@
 #include "hw/core/registerfields.h"
 #include "hw/core/sysbus.h"
 #include "hw/intc/bcm2835_ic.h"
+#include "hw/ssi/ssi.h"
 #include "hw/virtio/virtio-mmio.h"
 #include "qemu/error-report.h"
 #include "hw/core/boards.h"
@@ -185,6 +186,24 @@ static void raspi3ap_virtio_mmio_init(BCM283XState *soc)
                                                   BCM2835_IC_GPU_IRQ,
                                                   raspi3ap_virtio_mmio_irqs[i]));
     }
+}
+
+/*
+ * An MCP3008 ADC on SPI0 CE0, so guests can read analog values that the
+ * host sets with qom-set /machine/mcp3008 ch0..ch7. Linux drives CE0 as
+ * GPIO8 (cs-gpios), and the BCM2835 SPI model has no CS lines, so the
+ * chip select comes from the GPIO block's output 8.
+ */
+static void raspi3ap_mcp3008_init(MachineState *machine, BCM283XState *soc)
+{
+    BCMSocPeripheralBaseState *ps =
+        BCM_SOC_PERIPHERALS_BASE(&soc->peripherals);
+    DeviceState *adc = qdev_new("mcp3008");
+
+    object_property_add_child(OBJECT(machine), "mcp3008", OBJECT(adc));
+    ssi_realize_and_unref(adc, ps->spi[0].bus, &error_fatal);
+    qdev_connect_gpio_out(DEVICE(&soc->peripherals.gpio), 8,
+                          qdev_get_gpio_in_named(adc, SSI_GPIO_CS, 0));
 }
 
 static const char *board_type(uint32_t board_rev)
@@ -407,6 +426,7 @@ void raspi_machine_init(MachineState *machine)
     raspi_base_machine_init(machine, &soc->parent_obj);
     if (mc->board_rev == RASPI3AP_BOARD_REV) {
         raspi3ap_virtio_mmio_init(soc);
+        raspi3ap_mcp3008_init(machine, soc);
     }
 }
 
