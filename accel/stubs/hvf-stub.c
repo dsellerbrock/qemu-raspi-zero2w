@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "system/hvf.h"
+#include "target/arm/hvf_arm.h"
 
 bool hvf_allowed;
 bool hvf_kernel_irqchip;
@@ -21,4 +22,10 @@ void hvf_nested_virt_enable(bool nested_virt)
      * as that step of initialisation happens later.
      * As such, do nothing here instead of marking as unreachable.
      */
+}
+
+bool hvf_arm_el2_supported(void)
+{
+    /* Called from common raspi board code; this build has no HVF. */
+    return false;
 }
