@@ -4876,6 +4876,23 @@ static void test_v3d_fragment_unlock_irq_ack_immediate(void)
     v3d_assert_guest_errors_match(serial_log, unlock_log);
 }
 
+/*
+ * The BQL-unlock window only opens on the software fragment-worker path;
+ * bcm2835_v3d_fragment_try_workers() never runs workers with a wgpu context.
+ * Run the unlock tests (serial baseline included) without the wgpu library.
+ */
+static void test_v3d_without_wgpu(gconstpointer data)
+{
+    void (*fn)(void) = data;
+    g_autofree gchar *library = g_strdup(g_getenv("QEMU_V3D_WGPU_LIBRARY"));
+
+    g_unsetenv("QEMU_V3D_WGPU_LIBRARY");
+    fn();
+    if (library) {
+        g_setenv("QEMU_V3D_WGPU_LIBRARY", library, true);
+    }
+}
+
 static void test_v3d_ct0_clip_case(const uint32_t clip_space[3][4],
                                    uint8_t expected_tile_head)
 {
@@ -5485,12 +5502,15 @@ int main(int argc, char **argv)
                    test_v3d_ct1_frame_done_requires_eof);
     qtest_add_func("/bcm2835/v3d/fragment_worker_equivalence",
                    test_v3d_fragment_worker_equivalence);
-    qtest_add_func("/bcm2835/v3d/fragment_unlock_defer_replay",
-                   test_v3d_fragment_unlock_defer_replay);
-    qtest_add_func("/bcm2835/v3d/fragment_unlock_fallback_paths",
-                   test_v3d_fragment_unlock_fallback_paths);
-    qtest_add_func("/bcm2835/v3d/fragment_unlock_irq_ack_immediate",
-                   test_v3d_fragment_unlock_irq_ack_immediate);
+    qtest_add_data_func("/bcm2835/v3d/fragment_unlock_defer_replay",
+                        test_v3d_fragment_unlock_defer_replay,
+                        test_v3d_without_wgpu);
+    qtest_add_data_func("/bcm2835/v3d/fragment_unlock_fallback_paths",
+                        test_v3d_fragment_unlock_fallback_paths,
+                        test_v3d_without_wgpu);
+    qtest_add_data_func("/bcm2835/v3d/fragment_unlock_irq_ack_immediate",
+                        test_v3d_fragment_unlock_irq_ack_immediate,
+                        test_v3d_without_wgpu);
     qtest_add_func("/bcm2835/v3d/ct0_clip_stk_behind_eye_offscreen",
                    test_v3d_ct0_clip_stk_behind_eye_offscreen);
     qtest_add_func("/bcm2835/v3d/ct0_array_prim_tile_ref_limit",
