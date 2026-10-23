@@ -1970,6 +1970,9 @@ static void cocoa_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
 static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
 {
     NSAutoreleasePool * pool = [[NSAutoreleasePool alloc] init];
+    QemuConsole *con = qemu_console_lookup_default();
+    QemuConsole *c;
+    unsigned int i;
 
     COCOA_DEBUG("qemu_cocoa: cocoa_display_init\n");
 
@@ -2022,8 +2025,17 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
     add_console_menu_entries();
     addRemovableDevicesMenuItems();
 
-    qemu_console_register_listener(qemu_console_lookup_default(),
-                                   &dcl, &dcl_ops);
+    /*
+     * ponytail: show the last graphic console (raspi3ap: the -device
+     * virtio-gpu head instead of the built-in bcm2835_fb); add a cocoa
+     * display=<id> option if more than one extra head ever matters.
+     */
+    for (i = 0; (c = qemu_console_lookup_by_index(i)); i++) {
+        if (qemu_console_is_graphic(c)) {
+            con = c;
+        }
+    }
+    qemu_console_register_listener(con, &dcl, &dcl_ops);
     kbd = qkbd_state_init(dcl.con);
     qemu_add_mouse_mode_change_notifier(&mouse_mode_change_notifier);
     [cocoaView notifyMouseModeChange];

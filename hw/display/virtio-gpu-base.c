@@ -20,6 +20,7 @@
 #include "hw/display/edid.h"
 #include "trace.h"
 #include "qapi/qapi-types-virtio.h"
+#include "system/system.h"
 
 void
 virtio_gpu_base_reset(VirtIOGPUBase *g)
@@ -158,7 +159,9 @@ virtio_gpu_get_flags(void *opaque)
     VirtIOGPUBase *g = opaque;
     int flags = GRAPHIC_FLAGS_NONE;
 
-    if (virtio_gpu_virgl_enabled(g->conf)) {
+    /* GL-free Venus scans out 2D resources through pixman surfaces. */
+    if (virtio_gpu_virgl_enabled(g->conf) &&
+        (display_opengl || !virtio_gpu_venus_enabled(g->conf))) {
         flags |= GRAPHIC_FLAGS_GL;
     }
 
