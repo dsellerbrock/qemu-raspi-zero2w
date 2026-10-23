@@ -369,6 +369,8 @@ config RASPI
     select BCM2835_SPI
     select BCM2835_I2C
     select MCP3008
+    select HT16K33
+    select LCD1602_I2C
 
 config STM32F100_SOC
     bool

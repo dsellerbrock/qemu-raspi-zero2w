@@ -15,6 +15,8 @@ system_ss.add(when: 'CONFIG_PL110', if_true: files('pl110.c'))
 system_ss.add(when: 'CONFIG_IMX6UL_LCDIF', if_true: files('imx6ul_lcdif.c'))
 system_ss.add(when: 'CONFIG_SII9022', if_true: files('sii9022.c'))
 system_ss.add(when: 'CONFIG_SSD0303', if_true: files('ssd0303.c'))
+system_ss.add(when: 'CONFIG_HT16K33', if_true: files('ht16k33.c'))
+system_ss.add(when: 'CONFIG_LCD1602_I2C', if_true: files('lcd1602_i2c.c'))
 system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
 system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
 

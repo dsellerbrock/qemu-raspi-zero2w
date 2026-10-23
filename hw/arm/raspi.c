@@ -23,6 +23,7 @@
 #include "hw/core/registerfields.h"
 #include "hw/core/sysbus.h"
 #include "hw/intc/bcm2835_ic.h"
+#include "hw/i2c/i2c.h"
 #include "hw/ssi/ssi.h"
 #include "hw/virtio/virtio-mmio.h"
 #include "qemu/error-report.h"
@@ -204,6 +205,29 @@ static void raspi3ap_mcp3008_init(MachineState *machine, BCM283XState *soc)
     ssi_realize_and_unref(adc, ps->spi[0].bus, &error_fatal);
     qdev_connect_gpio_out(DEVICE(&soc->peripherals.gpio), 8,
                           qdev_get_gpio_in_named(adc, SSI_GPIO_CS, 0));
+}
+
+/*
+ * Two I2C displays on I2C1 (GPIO2/3, Linux's i2c-1), state readable with
+ * qom-get: an HT16K33 7-segment backpack at 0x70 (/machine/ht16k33) and a
+ * PCF8574-backed 16x2 LCD at 0x27 (/machine/lcd1602).
+ */
+static void raspi3ap_i2c_displays_init(MachineState *machine,
+                                       BCM283XState *soc)
+{
+    BCMSocPeripheralBaseState *ps =
+        BCM_SOC_PERIPHERALS_BASE(&soc->peripherals);
+    static const struct { const char *type, *name; uint8_t addr; } devs[] = {
+        { "ht16k33", "ht16k33", 0x70 },
+        { "lcd1602-i2c", "lcd1602", 0x27 },
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(devs); i++) {
+        I2CSlave *dev = i2c_slave_new(devs[i].type, devs[i].addr);
+
+        object_property_add_child(OBJECT(machine), devs[i].name, OBJECT(dev));
+        i2c_slave_realize_and_unref(dev, ps->i2c[1].bus, &error_fatal);
+    }
 }
 
 static const char *board_type(uint32_t board_rev)
@@ -427,6 +451,7 @@ void raspi_machine_init(MachineState *machine)
     if (mc->board_rev == RASPI3AP_BOARD_REV) {
         raspi3ap_virtio_mmio_init(soc);
         raspi3ap_mcp3008_init(machine, soc);
+        raspi3ap_i2c_displays_init(machine, soc);
     }
 }
 
