@@ -36,9 +36,17 @@
 OBJECT_DECLARE_SIMPLE_TYPE(RaspiMachineState, RASPI_MACHINE)
 
 #define RASPI3AP_BOARD_REV 0x9020e0
-/* Reserve the unused final page of the BCM peripheral window. */
+/*
+ * Reserve the unused final page of the BCM peripheral window for virtio-mmio
+ * transports, e.g. the GPU (with its hostmem window) and a virtio-blk root
+ * disk. Pin devices with bus=virtio-mmio-bus.N; an unpinned device lands on
+ * the last slot.
+ */
 #define RASPI3AP_VIRTIO_MMIO_OFFSET 0xf00000
-#define RASPI3AP_VIRTIO_MMIO_IRQ INTERRUPT_AVSPMON
+#define RASPI3AP_VIRTIO_MMIO_SIZE 0x200
+static const int raspi3ap_virtio_mmio_irqs[] = {
+    INTERRUPT_AVSPMON, INTERRUPT_SLIMBUS,
+};
 
 #define SMPBOOT_ADDR    0x300 /* this should leave enough space for ATAGS */
 #define MVBAR_ADDR      0x400 /* secure vectors */
@@ -110,8 +118,8 @@ static int cores_count(uint32_t board_rev)
 
 static void raspi3ap_modify_dtb(const struct arm_boot_info *info, void *fdt)
 {
-    const hwaddr base = 0x3f000000 + RASPI3AP_VIRTIO_MMIO_OFFSET;
-    const hwaddr size = 0x200;
+    const hwaddr size = RASPI3AP_VIRTIO_MMIO_SIZE;
+    hwaddr base;
     int intc_offset;
     uint32_t intc, interrupt_parent, interrupts[2];
     uint32_t acells, scells;
@@ -133,20 +141,25 @@ static void raspi3ap_modify_dtb(const struct arm_boot_info *info, void *fdt)
                                    &error_fatal);
     interrupt_parent = cpu_to_be32(intc);
     interrupts[0] = cpu_to_be32(2);
-    interrupts[1] = cpu_to_be32(RASPI3AP_VIRTIO_MMIO_IRQ - 32);
-    nodename = g_strdup_printf("/virtio_mmio@%" PRIx64, base);
-    rc = qemu_fdt_add_subnode(fdt, nodename);
-    rc |= qemu_fdt_setprop_string(fdt, nodename, "compatible", "virtio,mmio");
-    rc |= qemu_fdt_setprop_sized_cells(fdt, nodename, "reg",
-                                       acells, base, scells, size);
-    rc |= qemu_fdt_setprop(fdt, nodename, "interrupt-parent",
-                           &interrupt_parent, sizeof(interrupt_parent));
-    rc |= qemu_fdt_setprop(fdt, nodename, "interrupts", interrupts,
-                           sizeof(interrupts));
-    rc |= qemu_fdt_setprop(fdt, nodename, "dma-coherent", NULL, 0);
-    g_free(nodename);
-    if (rc < 0) {
-        error_report("couldn't add raspi3ap virtio-mmio node to dtb");
+    /* Add in reverse so the nodes appear in address order. */
+    for (int i = ARRAY_SIZE(raspi3ap_virtio_mmio_irqs) - 1; i >= 0; i--) {
+        base = 0x3f000000 + RASPI3AP_VIRTIO_MMIO_OFFSET + i * size;
+        interrupts[1] = cpu_to_be32(raspi3ap_virtio_mmio_irqs[i] - 32);
+        nodename = g_strdup_printf("/virtio_mmio@%" PRIx64, base);
+        rc = qemu_fdt_add_subnode(fdt, nodename);
+        rc |= qemu_fdt_setprop_string(fdt, nodename, "compatible",
+                                      "virtio,mmio");
+        rc |= qemu_fdt_setprop_sized_cells(fdt, nodename, "reg",
+                                           acells, base, scells, size);
+        rc |= qemu_fdt_setprop(fdt, nodename, "interrupt-parent",
+                               &interrupt_parent, sizeof(interrupt_parent));
+        rc |= qemu_fdt_setprop(fdt, nodename, "interrupts", interrupts,
+                               sizeof(interrupts));
+        rc |= qemu_fdt_setprop(fdt, nodename, "dma-coherent", NULL, 0);
+        g_free(nodename);
+        if (rc < 0) {
+            error_report("couldn't add raspi3ap virtio-mmio node to dtb");
+        }
     }
 }
 
@@ -154,19 +167,24 @@ static void raspi3ap_virtio_mmio_init(BCM283XState *soc)
 {
     BCMSocPeripheralBaseState *ps =
         BCM_SOC_PERIPHERALS_BASE(&soc->peripherals);
-    SysBusDevice *vmmio = SYS_BUS_DEVICE(qdev_new(TYPE_VIRTIO_MMIO));
 
-    object_property_set_bool(OBJECT(vmmio), "force-legacy", false,
-                             &error_fatal);
-    object_property_set_uint(OBJECT(vmmio), "shm-base", 0x80000000,
-                             &error_fatal);
-    sysbus_realize_and_unref(vmmio, &error_fatal);
-    memory_region_add_subregion(&ps->peri_mr, RASPI3AP_VIRTIO_MMIO_OFFSET,
-                                sysbus_mmio_get_region(vmmio, 0));
-    sysbus_connect_irq(vmmio, 0,
-                       qdev_get_gpio_in_named(DEVICE(&ps->ic),
-                                              BCM2835_IC_GPU_IRQ,
-                                              RASPI3AP_VIRTIO_MMIO_IRQ));
+    for (int i = 0; i < ARRAY_SIZE(raspi3ap_virtio_mmio_irqs); i++) {
+        SysBusDevice *vmmio = SYS_BUS_DEVICE(qdev_new(TYPE_VIRTIO_MMIO));
+
+        object_property_set_bool(OBJECT(vmmio), "force-legacy", false,
+                                 &error_fatal);
+        /* Only a device with shared memory (the GPU) uses the window. */
+        object_property_set_uint(OBJECT(vmmio), "shm-base", 0x80000000,
+                                 &error_fatal);
+        sysbus_realize_and_unref(vmmio, &error_fatal);
+        memory_region_add_subregion(&ps->peri_mr, RASPI3AP_VIRTIO_MMIO_OFFSET +
+                                    i * RASPI3AP_VIRTIO_MMIO_SIZE,
+                                    sysbus_mmio_get_region(vmmio, 0));
+        sysbus_connect_irq(vmmio, 0,
+                           qdev_get_gpio_in_named(DEVICE(&ps->ic),
+                                                  BCM2835_IC_GPU_IRQ,
+                                                  raspi3ap_virtio_mmio_irqs[i]));
+    }
 }
 
 static const char *board_type(uint32_t board_rev)
