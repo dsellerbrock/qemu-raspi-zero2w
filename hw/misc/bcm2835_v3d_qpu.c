@@ -645,7 +645,7 @@ static BCM2835V3DQPUResult qpu_tmu_fetch(BCM2835V3DQPUState *qpu,
                                          unsigned unit, uint16_t lanes)
 {
     BCM2835V3DQPUTMU *tmu = &qpu->tmu[unit];
-    unsigned s_addr = QPU_W_TMU0_S + unit * 4;
+    unsigned s_reg = QPU_W_TMU0_S + unit * 4;
     uint32_t config1;
 
     if (tmu->pending) {
@@ -699,7 +699,7 @@ static BCM2835V3DQPUResult qpu_tmu_fetch(BCM2835V3DQPUState *qpu,
                     qpu, tmu->config0, config.type, config.memory_format,
                     config.base, config.width, config.height, config.wrap_s,
                     config.wrap_t, config.linear_filter,
-                    qpu_bits_float(qpu->io[s_addr][lane]),
+                    qpu_bits_float(qpu->io[s_reg][lane]),
                     qpu_bits_float(tmu->t[lane]),
                     &tmu->result[lane])) {
                 return BCM2835_V3D_QPU_CODE_FAULT;
@@ -720,7 +720,7 @@ static BCM2835V3DQPUResult qpu_tmu_fetch(BCM2835V3DQPUState *qpu,
                 tmu->result[lane] = 0;
                 continue;
             }
-            address = qpu->io[s_addr][lane] & ~3U;
+            address = qpu->io[s_reg][lane] & ~3U;
             if (!qpu->read_memory(qpu->memory_opaque, address,
                                   &tmu->result[lane])) {
                 return BCM2835_V3D_QPU_CODE_FAULT;

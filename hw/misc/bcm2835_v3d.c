@@ -22,7 +22,6 @@
 #include "system/cpus.h"
 #include "trace.h"
 #include <math.h>
-#include <unistd.h>
 
 #define V3D_IDENT0             0x000
 #define V3D_IDENT1             0x004
@@ -4353,7 +4352,7 @@ static void bcm2835_v3d_reset(DeviceState *dev)
 
 static void bcm2835_v3d_fragment_workers_init(BCM2835V3DState *s)
 {
-    long host_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    long host_cpus = g_get_num_processors();
     unsigned guest_cpus = current_machine ? current_machine->smp.cpus : 1;
     unsigned available = host_cpus > guest_cpus ? host_cpus - guest_cpus : 0;
 
